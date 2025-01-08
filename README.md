@@ -1,6 +1,10 @@
+<img src="./fig4.png" width="400px"></img>
+
+<img src="./fig1.png" width="400px"></img>
+
 ## Titans - Pytorch (wip)
 
-Unofficial implementation of Titans in Pytorch. Will also contains some exploration into architectures beyond their simple 1-4 layer MLP for the neural memory module.
+Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch. Will also contains some exploration into architectures beyond their simple 1-4 layer MLP for the neural memory module.
 
 ## Citations
 
