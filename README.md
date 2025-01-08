@@ -1,4 +1,4 @@
-<img src="./fig4.png" width="400px"></img>
+<img src="./fig2.png" width="400px"></img>
 
 <img src="./fig1.png" width="400px"></img>
 
