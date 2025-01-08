@@ -46,7 +46,7 @@ class NeuralMemory(Module):
         if not exists(model):
             model = MLP(dim, depth = 4)
 
-        self.model = model
+        self.memory_model = model
 
         self.to_queries = LinearNoBias(dim, dim)
         self.to_keys_values = LinearNoBias(dim, dim * 2)
@@ -55,4 +55,8 @@ class NeuralMemory(Module):
         self,
         seq
     ):
-        return seq
+        queries = self.to_queries(seq)
+
+        values = self.memory_model(queries)
+
+        return values
