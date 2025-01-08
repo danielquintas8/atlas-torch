@@ -1,2 +1,14 @@
-# titans-pytorch
-Unofficial implementation of Titans in Pytorch
+## Titans - Pytorch (wip)
+
+Unofficial implementation of Titans in Pytorch. Will also contains some exploration into architectures beyond their simple 1-4 layer MLP for the neural memory module.
+
+## Citations
+
+```bibtex
+@inproceedings{Behrouz2024TitansLT,
+    title   = {Titans: Learning to Memorize at Test Time},
+    author  = {Ali Behrouz and Peilin Zhong and Vahab S. Mirrokni},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:275212078}
+}
+```
