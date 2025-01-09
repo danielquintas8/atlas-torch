@@ -79,6 +79,12 @@ class NeuralMemory(Module):
         self.to_keys_values = LinearNoBias(dim, dim * 2)
         self.store_memory_loss_fn = store_memory_loss_fn
 
+        # learned adaptive learning rate and momentum
+        # todo - explore mlp layerwise learned lr / momentum
+
+        self.to_adaptive_step = LinearNoBias(dim, 1)
+        self.to_momentum = LinearNoBias(dim, 1)
+
     def init_memories(self):
         init_memories = {param_name: param.clone().zero_() for param_name, param in self.memory.named_parameters()}
         return init_memories
