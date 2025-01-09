@@ -8,6 +8,7 @@ from torch.nn import Linear, Module
 from torch.func import functional_call, vmap, grad_and_value
 
 from einops import rearrange
+from einops.layers.torch import Rearrange
 
 # constants
 
@@ -20,6 +21,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def round_down_multiple(seq, mult):
+    return seq // mult * mult
 
 # classes
 
@@ -70,6 +74,15 @@ class NeuralMemory(Module):
 
         self.memory = model
 
+        # prepare function for per sample gradients from model above, using torch.func
+
+        def forward_and_loss(params, inputs, target):
+            pred = functional_call(self.memory, params, inputs)
+            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) == v|²
+            return loss
+
+        self.per_sample_grad_and_value_fn = vmap(grad_and_value(forward_and_loss), in_dims = (None, 0, 0))
+
         # queries for retrieving from the model
 
         self.to_queries = LinearNoBias(dim, dim)
@@ -82,8 +95,8 @@ class NeuralMemory(Module):
         # learned adaptive learning rate and momentum
         # todo - explore mlp layerwise learned lr / momentum
 
-        self.to_adaptive_step = LinearNoBias(dim, 1)
-        self.to_momentum = LinearNoBias(dim, 1)
+        self.to_adaptive_step = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
+        self.to_momentum = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
 
     def init_memories(self):
         init_memories = {param_name: param.clone().zero_() for param_name, param in self.memory.named_parameters()}
@@ -105,24 +118,18 @@ class NeuralMemory(Module):
         # pack batch and sequence dimension
 
         batch = seq.shape[0]
-        seq = rearrange(seq, 'b n d -> (b n) d')
+
+        adaptive_lr = self.to_adaptive_step(seq)
+        adaptive_momentum = self.to_momentum(seq)
 
         # keys and values
 
+        seq = rearrange(seq, 'b n d -> (b n) d')
         keys, values = self.to_keys_values(seq).chunk(2, dim = -1)
-
-        # forward with loss, then use torch func for per sample gradients
-
-        def forward_and_loss(params, inputs, target):
-            pred = functional_call(self.memory, params, inputs)
-            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) == v|²
-            return loss
-
-        per_sample_grad_and_value_fn = vmap(grad_and_value(forward_and_loss), in_dims = (None, 0, 0))
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_store_loss = per_sample_grad_and_value_fn(curr_memories, keys, values)
+        grads, aux_store_loss = self.per_sample_grad_and_value_fn(curr_memories, keys, values)
 
         # restore batch and sequence dimension
 
