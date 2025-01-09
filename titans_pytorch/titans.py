@@ -23,18 +23,29 @@ def default(v, d):
 
 # classes
 
-def MLP(dim, depth):
-    layers = []
+class MLP(Module):
+    def __init__(
+        self,
+        dim,
+        depth
+    ):
+        super().__init__()
+        self.weights = nn.ParameterList([nn.Parameter(torch.randn(dim, dim)) for _ in range(depth)])
 
-    for i in range(depth):
-        is_first = i == 0
+    def forward(
+        self,
+        x
+    ):
 
-        if not is_first:
-            layers.append(nn.SiLU())
+        for ind, weight in enumerate(self.weights):
+            is_first = ind == 0
 
-        layers.append(LinearNoBias(dim, dim))
+            if not is_first:
+                x = F.silu(x)
 
-    return nn.Sequential(*layers)
+            x = x @ weight
+
+        return x
 
 # main neural memory
 
