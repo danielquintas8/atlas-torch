@@ -119,7 +119,7 @@ class NeuralMemory(Module):
 
         next_memories = {name: param + grad[:, -1] for (name, param), (_, grad) in zip(curr_memories.items(), grads.items())}
 
-        return grads, next_memories, aux_store_loss
+        return grads, next_memories, aux_store_loss.sum()
 
     def retrieve_memories(
         self,
