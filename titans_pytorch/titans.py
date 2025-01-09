@@ -115,7 +115,7 @@ class NeuralMemory(Module):
 
         def forward_and_loss(params, inputs, target):
             pred = functional_call(self.memory, params, inputs)
-            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper
+            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) == v|²
             return loss
 
         per_sample_grad_and_value_fn = vmap(grad_and_value(forward_and_loss), in_dims = (None, 0, 0))
