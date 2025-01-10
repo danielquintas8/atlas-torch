@@ -13,6 +13,11 @@ import einx
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
+from titans_pytorch.associative_scan import (
+    associative_scan,
+    binary_operator
+)
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
