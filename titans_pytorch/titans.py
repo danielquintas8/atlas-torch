@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from torch.nn import Linear, Module
 from torch.func import functional_call, vmap, grad_and_value
 
+from tensordict import TensorDict
+
+import einx
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
@@ -72,12 +75,12 @@ class NeuralMemory(Module):
 
         # the memory is the weights of the model
 
-        self.memory = model
+        self.memory_model = model
 
         # prepare function for per sample gradients from model above, using torch.func
 
         def forward_and_loss(params, inputs, target):
-            pred = functional_call(self.memory, params, inputs)
+            pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) == v|²
             return loss
 
@@ -99,7 +102,7 @@ class NeuralMemory(Module):
         self.to_momentum = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
 
     def init_memories(self):
-        init_memories = {param_name: param.clone().zero_() for param_name, param in self.memory.named_parameters()}
+        init_memories = TensorDict(dict(self.memory_model.named_parameters())).clone().zero_()
         return init_memories
 
     def store_memories(
@@ -108,12 +111,13 @@ class NeuralMemory(Module):
         past_memories: dict[str, Tensor] | None = None
     ):
 
-        curr_memories = dict(self.memory.named_parameters())
+        curr_memories = TensorDict(dict(self.memory_model.named_parameters()))
 
         if exists(past_memories):
             assert past_memories.keys() == curr_memories.keys()
 
-            curr_memories = {param_name: (curr_memory + past_memory) for (param_name, curr_memory), (_, past_memory) in zip(curr_memories.items(), past_memories.items())}
+            past_memories = TensorDict(past_memories)
+            curr_memories = curr_memories + past_memories
 
         # pack batch and sequence dimension
 
@@ -129,21 +133,29 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_store_loss = self.per_sample_grad_and_value_fn(curr_memories, keys, values)
+        grads, aux_store_loss = self.per_sample_grad_and_value_fn(dict(curr_memories), keys, values)
+
+        grads = TensorDict(grads)
 
         # restore batch and sequence dimension
 
-        grads = {name: rearrange(grad, '(b n) ... -> b n ...', b = batch) for name, grad in grads.items()}
+        grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch))
+
+        # multiply gradients with learned adaptive step size
+
+        grads = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
 
         # accumulate gradients across time, without momentum and weight decay for starters
 
-        grads = {name: grad.cumsum(dim = 1) for name, grad in grads.items()}
+        grads = grads.apply(lambda t: t.cumsum(dim = 1))
 
         # compute the next weight per batch
 
-        next_memories = {name: param + grad[:, -1] for (name, param), (_, grad) in zip(curr_memories.items(), grads.items())}
+        last_grad = grads.apply(lambda grad: grad[:, -1])
 
-        return grads, next_memories, aux_store_loss.sum()
+        next_memories = curr_memories + last_grad
+
+        return grads, next_memories, aux_store_loss.mean()
 
     def retrieve_memories(
         self,
@@ -153,12 +165,13 @@ class NeuralMemory(Module):
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
-        curr_memories = dict(self.memory.named_parameters())
+        curr_memories = TensorDict(dict(self.memory_model.named_parameters()))
 
         if exists(past_memories):
+            past_memories = TensorDict(past_memories)
             assert past_memories.keys() == curr_memories.keys()
 
-            curr_memories = {param_name: (curr_memory + past_memory) for (param_name, curr_memory), (_, past_memory) in zip(curr_memories.items(), past_memories.items())}
+            curr_memories = curr_memories + past_memories
 
         # sequence Float['b n d'] to queries
 
@@ -166,6 +179,6 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
-        values = functional_call(self.memory, curr_memories, queries)
+        values = functional_call(self.memory_model, dict(curr_memories), queries)
 
         return values
