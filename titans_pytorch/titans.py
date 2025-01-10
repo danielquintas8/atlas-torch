@@ -15,7 +15,7 @@ from titans_pytorch.associative_scan import (
 )
 
 import einx
-from einops import rearrange
+from einops import rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 
 """
@@ -40,6 +40,15 @@ def default(v, d):
 
 def round_down_multiple(seq, mult):
     return seq // mult * mult
+
+def pack_one_with_inverse(t, pattern):
+    packed, packed_shape = pack([t], pattern)
+
+    def inverse(out, inv_pattern = None):
+        inv_pattern = default(inv_pattern, pattern)
+        return unpack(out, packed_shape, inv_pattern)[0]
+
+    return packed, inverse
 
 # classes
 
@@ -110,27 +119,30 @@ class NeuralMemory(Module):
         # learned adaptive learning rate and momentum
         # todo - explore mlp layerwise learned lr / momentum
 
+        self.to_momentum = LinearNoBias(dim, 1)
         self.to_adaptive_step = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
-        self.to_momentum = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
-        self.to_decay_factor = nn.Sequential(LinearNoBias(dim, 1), nn.Sigmoid(), Rearrange('... 1 -> ...')) # weight decay factor
+        self.to_decay_factor = nn.Sequential(LinearNoBias(dim, 1), nn.Sigmoid()) # weight decay factor
 
-    def init_memories(self):
-        init_memories = TensorDict(dict(self.memory_model.named_parameters())).clone().zero_()
-        return init_memories
+    def init_weights_and_momentum(self):
+        params = TensorDict(dict(self.memory_model.named_parameters()))
+
+        init_weights = params.clone().zero_()
+        init_momentum = params.clone().zero_()
+
+        return init_weights, init_momentum
 
     def store_memories(
         self,
         seq,
-        past_memories: dict[str, Tensor] | None = None
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]]
     ):
 
-        curr_memories = TensorDict(dict(self.memory_model.named_parameters()))
+        curr_weights = TensorDict(dict(self.memory_model.named_parameters()))
 
-        if exists(past_memories):
-            assert past_memories.keys() == curr_memories.keys()
+        past_state = tuple(TensorDict(d) for d in past_state)
+        past_weights, past_momentum = past_state
 
-            past_memories = TensorDict(past_memories)
-            curr_memories = curr_memories + past_memories
+        curr_weights = curr_weights + past_weights
 
         # pack batch and sequence dimension
 
@@ -148,7 +160,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_store_loss = self.per_sample_grad_and_value_fn(dict(curr_memories), keys, values)
+        grads, aux_store_loss = self.per_sample_grad_and_value_fn(dict(curr_weights), keys, values)
 
         grads = TensorDict(grads)
 
@@ -158,37 +170,59 @@ class NeuralMemory(Module):
 
         # multiply gradients with learned adaptive step size
 
-        updates = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
+        surprises = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
 
-        # accumulate gradients across time, without momentum and weight decay for starters
+        # derive momentum with associative scan - eq (10)
 
-        updates = updates.apply(lambda t: t.cumsum(dim = 1))
+        next_momentum = TensorDict()
+
+        for param_name, surprise in surprises.items():
+            surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
+
+            _, momentum = associative_scan(binary_operator, (adaptive_momentum, surprise)) # momentum is S / surprise in the paper
+
+            momentum = inverse_pack(momentum)
+
+            next_momentum[param_name] = momentum
+
+        # use associative scan again for learned forgetting (weight decay) - eq (13)
+
+        updates = TensorDict()
+
+        for param_name, momentum in next_momentum.items():
+            momentum, inverse_pack = pack_one_with_inverse(momentum, 'b n *')
+
+            _, update = associative_scan(binary_operator, (1. - decay_factor, momentum)) # momentum is S / surprise in the paper
+
+            update = inverse_pack(update)
+
+            updates[param_name] = update
 
         # compute the next weight per batch
 
         last_update = updates.apply(lambda t: t[:, -1])
 
-        next_memories = curr_memories + last_update
+        next_state = (curr_weights + last_update, next_momentum)
 
-        return updates, next_memories, aux_store_loss.mean()
+        return updates, next_state, aux_store_loss.mean()
 
     def retrieve_memories(
         self,
         seq,
-        past_memories: dict[str, Tensor] | None = None,
+        past_weights: dict[str, Tensor] | None = None,
     ):
         batch = seq.shape[0]
 
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
-        curr_memories = TensorDict(dict(self.memory_model.named_parameters()))
+        curr_weights = TensorDict(dict(self.memory_model.named_parameters()))
 
-        if exists(past_memories):
-            past_memories = TensorDict(past_memories)
-            assert past_memories.keys() == curr_memories.keys()
+        if exists(past_weights):
+            past_weights = TensorDict(past_weights)
+            assert past_weights.keys() == curr_weights.keys()
 
-            curr_memories = curr_memories + past_memories
+            curr_weights = curr_weights + past_weights
 
         # sequence Float['b n d'] to queries
 
@@ -196,10 +230,14 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
-        curr_memories = curr_memories.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+        curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
         queries = rearrange(queries, 'b n d -> (b n) 1 d')
 
-        values = functional_call(self.memory_model, dict(curr_memories), queries)
+        # forward functional call
+
+        values = functional_call(self.memory_model, dict(curr_weights), queries)
+
+        # reconstitute batch dimension
 
         values = rearrange(values, '(b n) 1 d -> b n d', b = batch)
 
@@ -208,20 +246,22 @@ class NeuralMemory(Module):
     def forward(
         self,
         seq,
-        past_memories: dict[str, Tensor] | None = None,
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_next_memories = False
     ):
         batch = seq.shape[0]
 
-        if exists(past_memories):
-            past_memories = TensorDict(past_memories)
+        if exists(past_state):
+            past_state = tuple(TensorDict(d) for d in past_state)
 
-        if not exists(past_memories):
-            past_memories = self.init_memories()
+        if not exists(past_state):
+            past_state = self.init_weights_and_momentum()
 
-        updates, next_memories, aux_kv_mse_loss = self.store_memories(seq, past_memories)
+        updates, next_memories, aux_kv_mse_loss = self.store_memories(seq, past_state)
 
-        retrieved = self.retrieve_memories(seq, past_memories + updates)
+        past_weights, _ = past_state
+
+        retrieved = self.retrieve_memories(seq, past_weights + updates)
 
         if not return_next_memories:
             return retrieved

@@ -6,6 +6,27 @@
 
 Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch. Will also contain some explorations into architectures beyond their simple 1-4 layer MLP for the neural memory module.
 
+## Install
+
+```bash
+$ pip install titans-pytorch
+```
+
+## Usage
+
+```python
+import torch
+from titans_pytorch import NeuralMemory
+
+x = torch.randn(2, 64, 32)
+
+mem = NeuralMemory(32)
+
+out = mem(x)
+
+assert x.shape == out.shape
+```
+
 ## Citations
 
 ```bibtex
