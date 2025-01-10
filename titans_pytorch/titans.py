@@ -9,14 +9,22 @@ from torch.func import functional_call, vmap, grad_and_value
 
 from tensordict import TensorDict
 
-import einx
-from einops import rearrange
-from einops.layers.torch import Rearrange
-
 from titans_pytorch.associative_scan import (
     associative_scan,
     binary_operator
 )
+
+import einx
+from einops import rearrange
+from einops.layers.torch import Rearrange
+
+"""
+ein notation:
+b - batch
+n - sequence
+d - feature dimension
+c - intra-chunk
+"""
 
 # constants
 
@@ -105,6 +113,7 @@ class NeuralMemory(Module):
 
         self.to_adaptive_step = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
         self.to_momentum = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
+        self.to_decay_factor = nn.Sequential(LinearNoBias(dim, 1), nn.Sigmoid(), Rearrange('... 1 -> ...')) # weight decay factor
 
     def init_memories(self):
         init_memories = TensorDict(dict(self.memory_model.named_parameters())).clone().zero_()
@@ -130,6 +139,8 @@ class NeuralMemory(Module):
 
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_momentum = self.to_momentum(seq)
+
+        decay_factor = self.to_decay_factor(seq)
 
         # keys and values
 
