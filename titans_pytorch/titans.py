@@ -56,7 +56,6 @@ class MLP(Module):
         self,
         x
     ):
-
         for ind, weight in enumerate(self.weights):
             is_first = ind == 0
 
@@ -159,25 +158,27 @@ class NeuralMemory(Module):
 
         # multiply gradients with learned adaptive step size
 
-        grads = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
+        updates = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
 
         # accumulate gradients across time, without momentum and weight decay for starters
 
-        grads = grads.apply(lambda t: t.cumsum(dim = 1))
+        updates = updates.apply(lambda t: t.cumsum(dim = 1))
 
         # compute the next weight per batch
 
-        last_grad = grads.apply(lambda grad: grad[:, -1])
+        last_update = updates.apply(lambda t: t[:, -1])
 
-        next_memories = curr_memories + last_grad
+        next_memories = curr_memories + last_update
 
-        return grads, next_memories, aux_store_loss.mean()
+        return updates, next_memories, aux_store_loss.mean()
 
     def retrieve_memories(
         self,
         seq,
-        past_memories: dict[str, Tensor] | None = None
+        past_memories: dict[str, Tensor] | None = None,
     ):
+        batch = seq.shape[0]
+
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
@@ -195,6 +196,34 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
+        curr_memories = curr_memories.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+        queries = rearrange(queries, 'b n d -> (b n) 1 d')
+
         values = functional_call(self.memory_model, dict(curr_memories), queries)
 
+        values = rearrange(values, '(b n) 1 d -> b n d', b = batch)
+
         return values
+
+    def forward(
+        self,
+        seq,
+        past_memories: dict[str, Tensor] | None = None,
+        return_next_memories = False
+    ):
+        batch = seq.shape[0]
+
+        if exists(past_memories):
+            past_memories = TensorDict(past_memories)
+
+        if not exists(past_memories):
+            past_memories = self.init_memories()
+
+        updates, next_memories, aux_kv_mse_loss = self.store_memories(seq, past_memories)
+
+        retrieved = self.retrieve_memories(seq, past_memories + updates)
+
+        if not return_next_memories:
+            return retrieved
+
+        return retrieved, next_memories, aux_kv_mse_loss
