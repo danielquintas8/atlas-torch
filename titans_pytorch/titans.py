@@ -164,7 +164,7 @@ class NeuralMemory(Module):
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
 
-        seq_len = seq.shape[-2]
+        seq_len, chunk_size = seq.shape[-2], self.chunk_size
         round_down_seq_len = round_down_multiple(seq_len, self.chunk_size)
 
         seq = seq[:, :round_down_seq_len]
@@ -234,7 +234,7 @@ class NeuralMemory(Module):
 
         next_state = (curr_weights + last_update, next_momentum)
 
-        return updates, next_state, aux_store_loss.mean()
+        return updates, next_state, aux_store_loss.mean() / chunk_size
 
     def retrieve_memories(
         self,
