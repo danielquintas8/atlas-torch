@@ -16,7 +16,7 @@ from titans_pytorch.associative_scan import (
 
 import einx
 from einops import rearrange, pack, unpack
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 
 """
 ein notation:
@@ -84,6 +84,7 @@ class NeuralMemory(Module):
     def __init__(
         self,
         dim,
+        chunk_size = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn
     ):
@@ -97,6 +98,10 @@ class NeuralMemory(Module):
         # the memory is the weights of the model
 
         self.memory_model = model
+
+        # the chunk size within the paper where adaptive step, momentum, weight decay are shared
+
+        self.chunk_size = chunk_size
 
         # prepare function for per sample gradients from model above, using torch.func
 
@@ -119,9 +124,23 @@ class NeuralMemory(Module):
         # learned adaptive learning rate and momentum
         # todo - explore mlp layerwise learned lr / momentum
 
-        self.to_momentum = LinearNoBias(dim, 1)
-        self.to_adaptive_step = nn.Sequential(LinearNoBias(dim, 1), Rearrange('... 1 -> ...'))
-        self.to_decay_factor = LinearNoBias(dim, 1) # weight decay factor
+        self.to_momentum = nn.Sequential(
+            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            LinearNoBias(dim, 1)
+        )
+
+        self.to_adaptive_step = nn.Sequential(
+            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            LinearNoBias(dim, 1),
+            Rearrange('... 1 -> ...')
+        )
+
+        # weight decay factor
+
+        self.to_decay_factor = nn.Sequential(
+            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            LinearNoBias(dim, 1)
+        )
 
     def init_weights_and_momentum(self):
         params = TensorDict(dict(self.memory_model.named_parameters()))
@@ -136,6 +155,16 @@ class NeuralMemory(Module):
         seq,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]]
     ):
+
+        # curtail sequence by multiple of the chunk size
+        # only a complete chunk of the sequence provides the memory for the next chunk
+
+        seq_len = seq.shape[-2]
+        round_down_seq_len = round_down_multiple(seq_len, self.chunk_size)
+
+        seq = seq[:, :round_down_seq_len]
+
+        # curr weights + past weights, in the case that the initial weights are learned
 
         curr_weights = TensorDict(dict(self.memory_model.named_parameters()))
 
@@ -155,8 +184,11 @@ class NeuralMemory(Module):
 
         # keys and values
 
-        seq = rearrange(seq, 'b n d -> (b n) d')
         keys, values = self.to_keys_values(seq).chunk(2, dim = -1)
+
+        # take care of chunking
+
+        keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = self.chunk_size) for t in (keys, values))
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
