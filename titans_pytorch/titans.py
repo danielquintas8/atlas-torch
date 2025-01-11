@@ -148,7 +148,7 @@ class NeuralMemory(Module):
 
         batch = seq.shape[0]
 
-        adaptive_lr = self.to_adaptive_step(seq).tanh() * 0.5 + 0.5.
+        adaptive_lr = self.to_adaptive_step(seq).tanh() * 0.5 + 0.5
 
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
@@ -172,31 +172,24 @@ class NeuralMemory(Module):
 
         surprises = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
 
-        # derive momentum with associative scan - eq (10)
+        # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
         next_momentum = TensorDict()
+        updates = TensorDict()
 
         for param_name, surprise in surprises.items():
             surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
 
+            # derive momentum with associative scan - eq (10)
+
             _, momentum = associative_scan(binary_operator, (adaptive_momentum, surprise)) # momentum is S / surprise in the paper
 
-            momentum = inverse_pack(momentum)
-
-            next_momentum[param_name] = momentum
-
-        # use associative scan again for learned forgetting (weight decay) - eq (13)
-
-        updates = TensorDict()
-
-        for param_name, momentum in next_momentum.items():
-            momentum, inverse_pack = pack_one_with_inverse(momentum, 'b n *')
+            # use associative scan again for learned forgetting (weight decay) - eq (13)
 
             _, update = associative_scan(binary_operator, (1. - decay_factor, momentum)) # momentum is S / surprise in the paper
 
-            update = inverse_pack(update)
-
-            updates[param_name] = update
+            updates[param_name] = inverse_pack(update)
+            next_momentum[param_name] = inverse_pack(momentum)
 
         # compute the next weight per batch
 
