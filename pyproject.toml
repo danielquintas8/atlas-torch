@@ -36,7 +36,9 @@ Homepage = "https://pypi.org/project/titans-pytorch/"
 Repository = "https://github.com/lucidrains/titans-pytorch"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "local-attention>=1.9.15"
+]
 test = [
     "pytest"
 ]
