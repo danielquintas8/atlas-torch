@@ -20,7 +20,10 @@ from titans_pytorch import NeuralMemory
 
 x = torch.randn(2, 64, 32)
 
-mem = NeuralMemory(32)
+mem = NeuralMemory(
+    dim = 32,
+    chunk_size = 2
+)
 
 out = mem(x)
 

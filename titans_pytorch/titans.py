@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from functools import partial
 
 import torch
@@ -11,7 +12,8 @@ from tensordict import TensorDict
 
 from titans_pytorch.associative_scan import (
     associative_scan,
-    binary_operator
+    binary_operator,
+    pad_at_dim
 )
 
 import einx
@@ -40,6 +42,9 @@ def default(v, d):
 
 def round_down_multiple(seq, mult):
     return seq // mult * mult
+
+def round_up_multiple(seq, mult):
+    return math.ceil(seq / mult) * mult
 
 def pack_one_with_inverse(t, pattern):
     packed, packed_shape = pack([t], pattern)
@@ -236,7 +241,19 @@ class NeuralMemory(Module):
         seq,
         past_weights: dict[str, Tensor] | None = None,
     ):
-        batch = seq.shape[0]
+        chunk_size = self.chunk_size
+        batch, seq_len = seq.shape[:2]
+
+        assert seq_len >= chunk_size
+
+        seq = seq[:, (chunk_size - 1):]
+        curtailed_seq_len = seq.shape[-2]
+
+        next_seq_len = round_up_multiple(curtailed_seq_len, chunk_size)
+
+        padding = next_seq_len - curtailed_seq_len
+
+        seq = pad_at_dim(seq, (0, padding), dim = 1)
 
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
@@ -256,7 +273,7 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
-        queries = rearrange(queries, 'b n d -> (b n) 1 d')
+        queries = rearrange(queries, 'b (n c) d -> (b n) c d', c = chunk_size)
 
         # forward functional call
 
@@ -264,7 +281,12 @@ class NeuralMemory(Module):
 
         # reconstitute batch dimension
 
-        values = rearrange(values, '(b n) 1 d -> b n d', b = batch)
+        values = rearrange(values, '(b n) c d -> b (n c) d', b = batch)
+
+        # restore
+
+        values = pad_at_dim(values, (chunk_size - 1, 0), dim = 1, value = 0.) # todo, used a learned null memory embedding instead of 0s for retrieving from empty neural memory
+        values = values[:, :-padding]
 
         return values
 
