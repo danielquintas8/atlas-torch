@@ -44,7 +44,13 @@ model = LocalTransformer(
     depth = 8,
     causal = True,
     local_attn_window_size = 64,
-    max_seq_len = SEQ_LEN
+    max_seq_len = SEQ_LEN,
+    global_attn_layer = NeuralMemory(
+        dim = 384,
+        chunk_size = 64,
+        pre_rmsnorm = True
+    ),
+    layers_insert_global_attn = ()
 ).cuda()
 
 # prepare enwik8 data
