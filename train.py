@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from local_attention import LocalTransformer
 
+from taylor_series_linear_attention import TaylorSeriesLinearAttn
+
 from titans_pytorch.titans import NeuralMemory
 
 # constants
@@ -45,12 +47,13 @@ model = LocalTransformer(
     causal = True,
     local_attn_window_size = 64,
     max_seq_len = SEQ_LEN,
-    global_attn_layer = NeuralMemory(
+    global_attn_layer = TaylorSeriesLinearAttn(
         dim = 384,
-        chunk_size = 64,
-        pre_rmsnorm = True
+        dim_head = 16,
+        heads = 16,
+        causal = True
     ),
-    layers_insert_global_attn = ()
+    layers_insert_global_attn = (4,)
 ).cuda()
 
 # prepare enwik8 data
