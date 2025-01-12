@@ -4,6 +4,7 @@ import gzip
 import numpy as np
 
 import torch
+from torch import nn
 from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -23,6 +24,7 @@ LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
+SHOULD_GENERATE = False
 SEQ_LEN = 512
 
 # helpers
@@ -40,6 +42,24 @@ def decode_tokens(tokens):
 
 # instantiate GPT-like decoder model
 
+titans_neural_memory = NeuralMemory(
+    dim = 384,
+    chunk_size = 64,
+    pre_rmsnorm = True
+)
+
+titans_neural_memory = nn.Sequential(
+    titans_neural_memory,
+    nn.RMSNorm(384)
+)
+
+linear_attn = TaylorSeriesLinearAttn(
+    dim = 384,
+    dim_head = 16,
+    heads = 16,
+    causal = True
+)
+
 model = LocalTransformer(
     num_tokens = 256,
     dim = 384,
@@ -47,12 +67,7 @@ model = LocalTransformer(
     causal = True,
     local_attn_window_size = 64,
     max_seq_len = SEQ_LEN,
-    global_attn_layer = TaylorSeriesLinearAttn(
-        dim = 384,
-        dim_head = 16,
-        heads = 16,
-        causal = True
-    ),
+    global_attn_layer = titans_neural_memory,
     layers_insert_global_attn = (4,)
 ).cuda()
 
@@ -106,7 +121,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             loss = model(next(val_loader), return_loss = True)
             print(f'validation loss: {loss.item()}')
 
-    if i % GENERATE_EVERY == 0:
+    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()
         inp = random.choice(val_dataset)[:-1]
         prime = decode_tokens(inp)

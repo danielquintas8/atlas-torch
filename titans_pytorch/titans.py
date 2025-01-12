@@ -55,6 +55,10 @@ def pack_one_with_inverse(t, pattern):
 
     return packed, inverse
 
+def softclamp_max(t, max_value):
+    range_value = max_value / 2
+    return ((t / range_value).tanh() * range_value) + range_value
+
 # classes
 
 class MLP(Module):
@@ -92,7 +96,8 @@ class NeuralMemory(Module):
         chunk_size = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
-        pre_rmsnorm = False
+        pre_rmsnorm = False,
+        max_adaptive_step_size = 1e-5
     ):
         super().__init__()
 
@@ -144,6 +149,8 @@ class NeuralMemory(Module):
             Rearrange('... 1 -> ...')
         )
 
+        self.max_adaptive_step_size = max_adaptive_step_size
+
         # weight decay factor
 
         self.to_decay_factor = nn.Sequential(
@@ -188,7 +195,7 @@ class NeuralMemory(Module):
 
         batch = seq.shape[0]
 
-        adaptive_lr = self.to_adaptive_step(seq).tanh() * 0.5 + 0.5
+        adaptive_lr = softclamp_max(self.to_adaptive_step(seq), self.max_adaptive_step_size)
 
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
