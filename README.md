@@ -18,16 +18,16 @@ $ pip install titans-pytorch
 import torch
 from titans_pytorch import NeuralMemory
 
-x = torch.randn(2, 64, 32)
-
 mem = NeuralMemory(
-    dim = 32,
-    chunk_size = 2
-)
+    dim = 384,
+    chunk_size = 64,
+    pre_rmsnorm = True
+).cuda()
 
-out = mem(x)
+seq = torch.randn(2, 1024, 384).cuda()
+retrieved = mem(seq)
 
-assert x.shape == out.shape
+assert seq.shape == retrieved.shape
 ```
 
 ## Citations

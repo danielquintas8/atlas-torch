@@ -40,7 +40,7 @@ def decode_tokens(tokens):
 
 model = LocalTransformer(
     num_tokens = 256,
-    dim = 512,
+    dim = 384,
     depth = 8,
     causal = True,
     local_attn_window_size = 64,
