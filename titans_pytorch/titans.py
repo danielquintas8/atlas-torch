@@ -91,9 +91,13 @@ class NeuralMemory(Module):
         dim,
         chunk_size = 1,
         model: Module | None = None,
-        store_memory_loss_fn: Callable = default_loss_fn
+        store_memory_loss_fn: Callable = default_loss_fn,
+        pre_rmsnorm = False
     ):
         super().__init__()
+
+        self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
+        self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
         if not exists(model):
             model = MLP(dim, depth = 4)
@@ -160,6 +164,8 @@ class NeuralMemory(Module):
         seq,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]]
     ):
+
+        seq = self.store_norm(seq)
 
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
@@ -243,6 +249,8 @@ class NeuralMemory(Module):
     ):
         chunk_size = self.chunk_size
         batch, seq_len = seq.shape[:2]
+
+        seq = self.retrieve_norm(seq)
 
         assert seq_len >= chunk_size
 
