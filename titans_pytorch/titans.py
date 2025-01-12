@@ -311,7 +311,10 @@ class NeuralMemory(Module):
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_next_memories = False
     ):
-        batch = seq.shape[0]
+        batch, seq_len = seq.shape[:2]
+
+        if seq_len < self.chunk_size:
+            return torch.zeros_like(seq)
 
         if exists(past_state):
             past_state = tuple(TensorDict(d) for d in past_state)

@@ -30,6 +30,18 @@ retrieved = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
+## Experiments
+
+```bash
+$ pip install .[examples]
+```
+
+Then
+
+```bash
+$ python train.py
+```
+
 ## Citations
 
 ```bibtex
