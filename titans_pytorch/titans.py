@@ -97,7 +97,10 @@ class NeuralMemory(Module):
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
         pre_rmsnorm = False,
-        max_adaptive_step_size = 1e-5
+        max_adaptive_step_size = 1e-5,
+        default_mlp_kwargs: dict = dict(
+            depth = 4
+        )
     ):
         super().__init__()
 
@@ -105,7 +108,7 @@ class NeuralMemory(Module):
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
         if not exists(model):
-            model = MLP(dim, depth = 4)
+            model = MLP(dim, **default_mlp_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 

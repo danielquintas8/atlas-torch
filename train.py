@@ -24,14 +24,16 @@ LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
-SHOULD_GENERATE = False
+SHOULD_GENERATE = True
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-neural-memory'
-RUN_NAME = 'baseline'
 WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 GLOBAL_LAYERS = (4, 5)
 USE_TITANS_MEMORY = False
+NEURAL_MEMORY_DEPTH = 4
+WINDOW_SIZE = 64
+RUN_NAME = 'baseline'
 
 # wandb experiment tracker
 
@@ -57,8 +59,11 @@ def decode_tokens(tokens):
 
 titans_neural_memory = NeuralMemory(
     dim = 384,
-    chunk_size = 64,
-    pre_rmsnorm = True
+    chunk_size = WINDOW_SIZE,
+    pre_rmsnorm = True,
+    default_mlp_kwargs = dict(
+        depth = NEURAL_MEMORY_DEPTH
+    )
 )
 
 titans_neural_memory = nn.Sequential(
@@ -79,7 +84,7 @@ model = LocalTransformer(
     dim = 384,
     depth = 8,
     causal = True,
-    local_attn_window_size = 64,
+    local_attn_window_size = WINDOW_SIZE,
     max_seq_len = SEQ_LEN,
     global_attn_layer = linear_attn if not USE_TITANS_MEMORY else titans_neural_memory,
     layers_insert_global_attn = GLOBAL_LAYERS
