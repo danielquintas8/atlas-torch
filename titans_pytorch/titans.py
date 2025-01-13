@@ -96,6 +96,7 @@ class NeuralMemory(Module):
         store_memory_loss_fn: Callable = default_loss_fn,
         pre_rmsnorm = True,
         post_rmsnorm = True,
+        use_accelerated_scan = False,
         default_mlp_kwargs: dict = dict(
             depth = 4
         )
@@ -174,6 +175,10 @@ class NeuralMemory(Module):
             Rearrange('b n h -> (b h) n 1')
         )
 
+        # maybe use accelerated scan
+
+        self.use_accelerated_scan = use_accelerated_scan
+
     def init_weights_and_momentum(self):
         params = TensorDict(dict(self.memory_model.named_parameters()))
 
@@ -242,21 +247,54 @@ class NeuralMemory(Module):
 
         surprises = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
 
+        # determine scan function
+
+        def default_associative_scan(gates, inputs):
+            _, outputs = associative_scan(binary_operator, (gates, inputs))
+            return outputs
+
+        if self.use_accelerated_scan:
+            from accelerated_scan.triton import scan as triton_scan
+            from accelerated_scan.warp import scan as warp_scan
+
+            scan = triton_scan if seq.is_cuda else warp_scan
+
+            def accelerate_scan_fn(gates, inputs):
+                gates = gates.expand_as(inputs)
+                gates, inputs = tuple(rearrange(t, 'b n d -> b d n') for t in (gates, inputs))
+
+                seq_len = gates.shape[-1]
+                next_power_two_seq_len = 2 ** max(5, int(math.ceil(math.log2(seq_len))))
+
+                gates = F.pad(gates, (0, next_power_two_seq_len - seq_len))
+                inputs = F.pad(inputs, (0, next_power_two_seq_len - seq_len))
+
+                outputs = scan(gates, inputs)
+
+                outputs = outputs[..., :seq_len]
+                outputs = rearrange(outputs, 'b d n -> b n d')
+                return outputs
+
+            scan_fn = accelerate_scan_fn
+        else:
+            scan_fn = default_associative_scan
+
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
         next_momentum = TensorDict()
         updates = TensorDict()
 
         for param_name, surprise in surprises.items():
+
             surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
 
             # derive momentum with associative scan - eq (10)
 
-            _, momentum = associative_scan(binary_operator, (adaptive_momentum, surprise)) # momentum is S / surprise in the paper
+            momentum = scan_fn(adaptive_momentum, surprise) # momentum is S / surprise in the paper
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            _, update = associative_scan(binary_operator, (1. - decay_factor, momentum)) # momentum is S / surprise in the paper
+            update = scan_fn(1. - decay_factor, momentum) # momentum is S / surprise in the paper
 
             updates[param_name] = inverse_pack(update)
             next_momentum[param_name] = inverse_pack(momentum)

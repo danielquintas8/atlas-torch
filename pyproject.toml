@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.0.12"
+version = "0.0.14"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,6 +28,7 @@ dependencies = [
     "accelerated-scan>=0.2.0",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "Ninja",
     "tensordict",
     "torch>=2.2",
 ]
@@ -41,6 +42,7 @@ Repository = "https://github.com/lucidrains/titans-pytorch"
 examples = [
     "local-attention>=1.10.1",
     "taylor-series-linear-attention",
+    "tqdm",
     "wandb"
 ]
 

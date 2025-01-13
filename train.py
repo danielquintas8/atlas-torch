@@ -24,11 +24,11 @@ LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
-SHOULD_GENERATE = True
+SHOULD_GENERATE = False
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-neural-memory'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 GLOBAL_LAYERS = (4, 5)
 USE_TITANS_MEMORY = True
 NEURAL_MEMORY_DEPTH = 2
@@ -38,7 +38,7 @@ RUN_NAME = 'neural memory'
 # wandb experiment tracker
 
 import wandb
-wandb.init(project = PROJECT_NAME, mode = 'offline' if not WANDB_ONLINE else 'online')
+wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
 wandb.run.name = RUN_NAME
 wandb.run.save()
 
@@ -62,6 +62,9 @@ titans_neural_memory = NeuralMemory(
     chunk_size = WINDOW_SIZE,
     pre_rmsnorm = True,
     post_rmsnorm = True,
+    dim_head = 32,
+    heads = 8,
+    use_accelerated_scan = True,
     default_mlp_kwargs = dict(
         depth = NEURAL_MEMORY_DEPTH
     )
