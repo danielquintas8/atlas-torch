@@ -70,7 +70,8 @@ linear_attn = TaylorSeriesLinearAttn(
     dim = 384,
     dim_head = 16,
     heads = 16,
-    causal = True
+    causal = True,
+    prenorm = True
 )
 
 model = LocalTransformer(
