@@ -55,10 +55,6 @@ def pack_one_with_inverse(t, pattern):
 
     return packed, inverse
 
-def softclamp_max(t, max_value):
-    range_value = max_value / 2
-    return ((t / range_value).tanh() * range_value) + range_value
-
 # classes
 
 class MLP(Module):
@@ -96,8 +92,8 @@ class NeuralMemory(Module):
         chunk_size = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
-        pre_rmsnorm = False,
-        max_adaptive_step_size = 1e-5,
+        pre_rmsnorm = True,
+        post_rmsnorm = True,
         default_mlp_kwargs: dict = dict(
             depth = 4
         )
@@ -106,6 +102,8 @@ class NeuralMemory(Module):
 
         self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
+
+        self.post_rmsnorm = nn.RMSNorm(dim) if post_rmsnorm else nn.Identity()
 
         if not exists(model):
             model = MLP(dim, **default_mlp_kwargs)
@@ -152,8 +150,6 @@ class NeuralMemory(Module):
             Rearrange('... 1 -> ...')
         )
 
-        self.max_adaptive_step_size = max_adaptive_step_size
-
         # weight decay factor
 
         self.to_decay_factor = nn.Sequential(
@@ -198,7 +194,7 @@ class NeuralMemory(Module):
 
         batch = seq.shape[0]
 
-        adaptive_lr = softclamp_max(self.to_adaptive_step(seq), self.max_adaptive_step_size)
+        adaptive_lr = self.to_adaptive_step(seq).sigmoid()
 
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
@@ -300,6 +296,8 @@ class NeuralMemory(Module):
         # reconstitute batch dimension
 
         values = rearrange(values, '(b n) c d -> b (n c) d', b = batch)
+
+        values = self.post_rmsnorm(values)
 
         # restore
 

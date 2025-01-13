@@ -30,10 +30,10 @@ SEQ_LEN = 512
 PROJECT_NAME = 'titans-neural-memory'
 WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 GLOBAL_LAYERS = (4, 5)
-USE_TITANS_MEMORY = False
-NEURAL_MEMORY_DEPTH = 4
+USE_TITANS_MEMORY = True
+NEURAL_MEMORY_DEPTH = 2
 WINDOW_SIZE = 64
-RUN_NAME = 'baseline'
+RUN_NAME = 'neural memory'
 
 # wandb experiment tracker
 
@@ -61,14 +61,10 @@ titans_neural_memory = NeuralMemory(
     dim = 384,
     chunk_size = WINDOW_SIZE,
     pre_rmsnorm = True,
+    post_rmsnorm = True,
     default_mlp_kwargs = dict(
         depth = NEURAL_MEMORY_DEPTH
     )
-)
-
-titans_neural_memory = nn.Sequential(
-    titans_neural_memory,
-    nn.RMSNorm(384)
 )
 
 linear_attn = TaylorSeriesLinearAttn(
