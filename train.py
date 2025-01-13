@@ -27,6 +27,19 @@ GENERATE_LENGTH = 512
 SHOULD_GENERATE = False
 SEQ_LEN = 512
 
+PROJECT_NAME = 'titans-neural-memory'
+RUN_NAME = 'baseline'
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+GLOBAL_LAYERS = (4, 5)
+USE_TITANS_MEMORY = False
+
+# wandb experiment tracker
+
+import wandb
+wandb.init(project = PROJECT_NAME, mode = 'offline' if not WANDB_ONLINE else 'online')
+wandb.run.name = RUN_NAME
+wandb.run.save()
+
 # helpers
 
 def cycle(loader):
@@ -67,8 +80,8 @@ model = LocalTransformer(
     causal = True,
     local_attn_window_size = 64,
     max_seq_len = SEQ_LEN,
-    global_attn_layer = titans_neural_memory,
-    layers_insert_global_attn = (4,)
+    global_attn_layer = linear_attn if not USE_TITANS_MEMORY else titans_neural_memory,
+    layers_insert_global_attn = GLOBAL_LAYERS
 ).cuda()
 
 # prepare enwik8 data
@@ -114,6 +127,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
+    wandb.log(dict(loss = loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()

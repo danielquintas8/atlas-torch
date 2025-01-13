@@ -27,8 +27,8 @@ classifiers=[
 dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.0",
-    "tensordict>=0.6.2",
-    "torch>=2.3",
+    "tensordict",
+    "torch>=2.2",
 ]
 
 [project.urls]
@@ -36,10 +36,13 @@ Homepage = "https://pypi.org/project/titans-pytorch/"
 Repository = "https://github.com/lucidrains/titans-pytorch"
 
 [project.optional-dependencies]
+
 examples = [
     "local-attention>=1.10.1",
-    "taylor-series-linear-attention"
+    "taylor-series-linear-attention",
+    "wandb"
 ]
+
 test = [
     "pytest"
 ]
