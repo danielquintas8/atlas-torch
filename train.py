@@ -13,7 +13,11 @@ from local_attention import LocalTransformer
 
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
-from titans_pytorch.titans import NeuralMemory
+from titans_pytorch.titans import (
+    NeuralMemory,
+    MemoryAttention,
+    MemoryMLP
+)
 
 # constants
 
