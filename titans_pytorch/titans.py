@@ -40,6 +40,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
 def round_down_multiple(seq, mult):
     return seq // mult * mult
 
@@ -97,6 +100,9 @@ class MemoryMLP(Module):
 
 # main neural memory
 
+def default_adaptive_step_transform(adaptive_step):
+    return torch.exp(adaptive_step.sigmoid() * -15) # from 1. - 1e-7
+
 def default_loss_fn(pred, target):
     return (pred - target).pow(2).mean(dim = -1).sum()
 
@@ -109,6 +115,7 @@ class NeuralMemory(Module):
         heads = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
+        adaptive_step_transform: Callable = default_adaptive_step_transform,
         pre_rmsnorm = True,
         post_rmsnorm = True,
         max_grad_norm: float | None = None,
@@ -188,6 +195,8 @@ class NeuralMemory(Module):
             Rearrange('b n h -> (b h) n')
         )
 
+        self.adaptive_step_transform = adaptive_step_transform
+
         # allow for softclamp the gradient norms for storing memories
 
         self.max_grad_norm = max_grad_norm
@@ -242,7 +251,8 @@ class NeuralMemory(Module):
 
         # pack batch and sequence dimension
 
-        adaptive_lr = (self.to_adaptive_step(seq).sigmoid() * -15).exp() # from 1. - 1e-7
+        adaptive_lr = self.to_adaptive_step(seq)
+        adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
