@@ -55,6 +55,21 @@ def pack_one_with_inverse(t, pattern):
 
     return packed, inverse
 
+# softclamping gradients
+
+def softclamp_max(t, max_value):
+    half_max_value = max_value / 2
+    return ((t / half_max_value).tanh() * half_max_value) + half_max_value
+
+def softclamp_grad_norm(t, max_value):
+    t, inverse = pack_one_with_inverse(t, 'bn *')
+
+    norm = t.norm(dim = -1, keepdim = True)
+    clamped_norm = softclamp_max(norm, max_value)
+
+    t = t * (clamped_norm / norm)
+    return inverse(t)
+
 # classes
 
 class MemoryMLP(Module):
@@ -96,6 +111,7 @@ class NeuralMemory(Module):
         store_memory_loss_fn: Callable = default_loss_fn,
         pre_rmsnorm = True,
         post_rmsnorm = True,
+        max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         default_mlp_kwargs: dict = dict(
             depth = 4
@@ -172,6 +188,10 @@ class NeuralMemory(Module):
             Rearrange('b n h -> (b h) n')
         )
 
+        # allow for softclamp the gradient norms for storing memories
+
+        self.max_grad_norm = max_grad_norm
+
         # weight decay factor
 
         self.to_decay_factor = nn.Sequential(
@@ -246,6 +266,11 @@ class NeuralMemory(Module):
         grads = self.per_sample_grad_fn(dict(curr_weights), keys, values)
 
         grads = TensorDict(grads)
+
+        # maybe softclamp grad norm
+
+        if exists(self.max_grad_norm):
+            grads = grads.apply(lambda t: softclamp_grad_norm(t, self.max_grad_norm))
 
         # restore batch and sequence dimension
 
