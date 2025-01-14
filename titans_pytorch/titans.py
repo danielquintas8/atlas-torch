@@ -269,7 +269,7 @@ class NeuralMemory(Module):
                 gates = F.pad(gates, (0, next_power_two_seq_len - seq_len))
                 inputs = F.pad(inputs, (0, next_power_two_seq_len - seq_len))
 
-                outputs = scan(gates, inputs)
+                outputs = scan(gates.contiguous(), inputs.contiguous())
 
                 outputs = outputs[..., :seq_len]
                 outputs = rearrange(outputs, 'b d n -> b n d')
