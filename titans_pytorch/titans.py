@@ -80,6 +80,35 @@ class MemoryMLP(Module):
 
         return x
 
+# improvised attention as memory module
+# todo - expand if see signal in experiments
+
+class MemoryAttention(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.randn(dim, dim)), # queries
+            nn.Parameter(torch.randn(dim, dim)), # keys
+            nn.Parameter(torch.randn(dim, dim)), # values
+        ])
+
+    def forward(self, x):
+        wq, wk, wv = self.weights
+
+        q = x @ wq
+        k = x @ wk
+        v = x @ wv
+
+        sim = q @ k.transpose(-1, -2)
+
+        attn = sim.softmax(dim = -1)
+
+        out = attn @ v
+        return out
+
 # main neural memory
 
 def default_loss_fn(pred, target):
