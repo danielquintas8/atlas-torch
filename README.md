@@ -58,3 +58,13 @@ $ python train.py
     url     = {https://api.semanticscholar.org/CorpusID:275212078}
 }
 ```
+
+```bibtex
+@software{Kyrylov_Accelerated_Scan_2024,
+    author  = {Kyrylov, Volodymyr},
+    doi     = {10.5281/zenodo.10600962},
+    title   = {Accelerated Scan},
+    version = {0.1.2},
+    year    = {2024}
+}
+```
