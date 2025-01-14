@@ -382,6 +382,7 @@ class NeuralMemory(Module):
     def forward(
         self,
         seq,
+        store_seq = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_next_memories = False
     ):
@@ -396,7 +397,9 @@ class NeuralMemory(Module):
         if not exists(past_state):
             past_state = self.init_weights_and_momentum()
 
-        updates, next_memories, aux_kv_mse_loss = self.store_memories(seq, past_state)
+        store_seq = default(store_seq, seq)
+
+        updates, next_memories, aux_kv_mse_loss = self.store_memories(store_seq, past_state)
 
         past_weights, _ = past_state
 
