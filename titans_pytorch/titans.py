@@ -92,22 +92,26 @@ class MemoryAttention(Module):
         self.weights = nn.ParameterList([
             nn.Parameter(torch.randn(dim, dim)), # queries
             nn.Parameter(torch.randn(dim, dim)), # keys
-            nn.Parameter(torch.randn(dim, dim)), # values
+            nn.Parameter(torch.randn(dim, dim)), # values weight 1
+            nn.Parameter(torch.randn(dim, dim)), # values weight 2
         ])
 
     def forward(self, x):
-        wq, wk, wv = self.weights
+
+        assert x.shape[-2] > 1, 'chunk size needs to be greater than 1 for using attention as memory'
+
+        wq, wk, wv1, wv2 = self.weights
 
         q = x @ wq
         k = x @ wk
-        v = x @ wv
+        v1 = x @ wv1
 
         sim = q @ k.transpose(-1, -2)
 
         attn = sim.softmax(dim = -1)
 
-        out = attn @ v
-        return out
+        v1 = F.silu(attn @ v1)
+        return v1 @ wv2
 
 # main neural memory
 
