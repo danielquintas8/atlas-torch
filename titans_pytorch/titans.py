@@ -17,7 +17,7 @@ from titans_pytorch.associative_scan import (
 )
 
 import einx
-from einops import rearrange, pack, unpack
+from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
 """
@@ -152,6 +152,11 @@ class NeuralMemory(Module):
         self.to_keys_values = LinearNoBias(dim, dim_inner * 2)
         self.store_memory_loss_fn = store_memory_loss_fn
 
+        # empty memory embed
+
+        self.empty_memory_embed = nn.Parameter(torch.zeros(dim))
+        nn.init.normal_(self.empty_memory_embed, std = 0.02)
+
         # learned adaptive learning rate and momentum
         # todo - explore mlp layerwise learned lr / momentum
 
@@ -186,6 +191,9 @@ class NeuralMemory(Module):
         init_momentum = params.clone().zero_()
 
         return init_weights, init_momentum
+
+    def init_empty_memory_embed(self, batch, seq_len):
+        return repeat(self.empty_memory_embed, 'd -> b n d', b = batch, n = seq_len)
 
     def store_memories(
         self,
@@ -372,11 +380,12 @@ class NeuralMemory(Module):
 
         values = self.post_rmsnorm(values)
 
-        # restore
+        # restore, pad with empty memory embed
 
-        values = pad_at_dim(values, (chunk_size - 1, 0), dim = 1, value = 0.) # todo, used a learned null memory embedding instead of 0s for retrieving from empty neural memory
+        empty_memory_embeds = self.init_empty_memory_embed(values.shape[0], chunk_size - 1)
+        values = torch.cat((empty_memory_embeds, values), dim = -2)
+
         values = values[:, :-padding]
-
         return values
 
     def forward(
@@ -389,7 +398,7 @@ class NeuralMemory(Module):
         batch, seq_len = seq.shape[:2]
 
         if seq_len < self.chunk_size:
-            return torch.zeros_like(seq)
+            return self.init_empty_memory_embed(batch, seq_len)
 
         if exists(past_state):
             past_state = tuple(TensorDict(d) for d in past_state)
