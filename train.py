@@ -15,7 +15,6 @@ from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
 from titans_pytorch.titans import (
     NeuralMemory,
-    MemoryAttention,
     MemoryMLP
 )
 
