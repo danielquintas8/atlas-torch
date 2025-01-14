@@ -62,11 +62,11 @@ def decode_tokens(tokens):
 
 titans_neural_memory = NeuralMemory(
     dim = 384,
-    chunk_size = WINDOW_SIZE,
+    chunk_size = 4,
     pre_rmsnorm = True,
     post_rmsnorm = True,
-    dim_head = 32,
-    heads = 8,
+    dim_head = 64,
+    heads = 4,
     use_accelerated_scan = True,
     default_mlp_kwargs = dict(
         depth = NEURAL_MEMORY_DEPTH
