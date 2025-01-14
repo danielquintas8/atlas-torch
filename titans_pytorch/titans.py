@@ -6,7 +6,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module
-from torch.func import functional_call, vmap, grad_and_value
+from torch.func import functional_call, vmap, grad
 
 from tensordict import TensorDict
 
@@ -57,7 +57,7 @@ def pack_one_with_inverse(t, pattern):
 
 # classes
 
-class MLP(Module):
+class MemoryMLP(Module):
     def __init__(
         self,
         dim,
@@ -122,7 +122,7 @@ class NeuralMemory(Module):
         # memory mlp
 
         if not exists(model):
-            model = MLP(dim_head, **default_mlp_kwargs)
+            model = MemoryMLP(dim_head, **default_mlp_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 
@@ -141,7 +141,7 @@ class NeuralMemory(Module):
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
             return loss
 
-        self.per_sample_grad_and_value_fn = vmap(grad_and_value(forward_and_loss), in_dims = (None, 0, 0))
+        self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims = (None, 0, 0))
 
         # queries for retrieving from the model
 
@@ -235,7 +235,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_store_loss = self.per_sample_grad_and_value_fn(dict(curr_weights), keys, values)
+        grads = self.per_sample_grad_fn(dict(curr_weights), keys, values)
 
         grads = TensorDict(grads)
 
@@ -305,7 +305,7 @@ class NeuralMemory(Module):
 
         next_state = (curr_weights + last_update, next_momentum)
 
-        return updates, next_state, aux_store_loss.mean() / chunk_size
+        return updates, next_state
 
     def retrieve_memories(
         self,
@@ -399,7 +399,7 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        updates, next_memories, aux_kv_mse_loss = self.store_memories(store_seq, past_state)
+        updates, next_memories = self.store_memories(store_seq, past_state)
 
         past_weights, _ = past_state
 
@@ -408,4 +408,4 @@ class NeuralMemory(Module):
         if not return_next_memories:
             return retrieved
 
-        return retrieved, next_memories, aux_kv_mse_loss
+        return retrieved, next_memories
