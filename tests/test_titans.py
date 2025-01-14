@@ -2,8 +2,10 @@ import torch
 import pytest
 
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
+@pytest.mark.parametrize('max_grad_norm', (None, 2.))
 def test_titans(
-    seq_len
+    seq_len,
+    max_grad_norm
 ):
 
     from titans_pytorch import NeuralMemory
@@ -11,6 +13,7 @@ def test_titans(
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
+        max_grad_norm = max_grad_norm
     )
 
     seq = torch.randn(2, seq_len, 384)

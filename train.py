@@ -67,6 +67,7 @@ titans_neural_memory = NeuralMemory(
     post_rmsnorm = True,
     dim_head = 64,
     heads = 4,
+    max_grad_norm = 1.,
     use_accelerated_scan = True,
     default_mlp_kwargs = dict(
         depth = NEURAL_MEMORY_DEPTH

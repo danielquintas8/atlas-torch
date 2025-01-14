@@ -100,8 +100,8 @@ class MemoryMLP(Module):
 
 # main neural memory
 
-def default_adaptive_step_transform(adaptive_step):
-    return torch.exp(adaptive_step.sigmoid() * -15) # from 1. - 1e-7
+def default_adaptive_step_transform(adaptive_step, max_lr = 1e-1):
+    return adaptive_step.sigmoid() * max_lr
 
 def default_loss_fn(pred, target):
     return (pred - target).pow(2).mean(dim = -1).sum()
