@@ -1,14 +1,19 @@
 from __future__ import annotations
 import math
+from functools import partial
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, Linear
 
 from einops.layers.torch import Rearrange
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
+
+# constants
+
+LinearNoBias = partial(Linear, bias = False)
 
 # helpers
 
@@ -17,6 +22,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def round_up_multiple(seq, mult):
+    return math.ceil(seq / mult) * mult
 
 # feedforward and attention
 
@@ -48,25 +56,52 @@ class SegmentedAttention(Module):
 
         dim_inner = dim_head * heads
 
-        self.to_qkv = nn.Linear(dim, dim_inner * 3, bias = False)
-        self.to_out = nn.Linear(dim_inner, dim, bias = False)
+        self.to_qkv = LinearNoBias(dim, dim_inner * 3)
+        self.to_out = LinearNoBias(dim_inner, dim)
+
+        self.segment_len = segment_len
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-    def forward(self, x):
-        batch, seq_len = x.shape[:2]
+        self.segment_seq = Rearrange('b (n w) d -> (b n) w d', n = segment_len)
+        self.merge_seq_back = Rearrange('(b n) w d -> b (n w) d', n = segment_len)
 
-        x = self.norm(x)
 
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
+    def forward(self, seq):
+        batch, seq_len = seq.shape[:2]
+
+        # auto pad to multiple
+        # todo - get rid of logic with flex attention
+
+        need_segment = seq_len >= self.segment_len
+
+        if need_segment:
+            next_seq_len = round_up_multiple(seq_len, self.segment_len)
+            padding = next_seq_len - seq_len
+
+            if padding > 0:
+                seq = F.pad(seq, (0, 0, 0, padding))
+
+            seq = self.segment_seq(seq)
+
+        # attention
+
+        seq = self.norm(seq)
+
+        q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal = True)
 
         out = self.merge_heads(out)
 
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if need_segment:
+            out = self.merge_seq_back(out)
+
+        return out[:, :seq_len]
 
 # MAC transformer
 
@@ -102,7 +137,7 @@ class MemoryAsContextTransformer(Module):
 
         self.norm = nn.RMSNorm(dim)
 
-        self.to_logits = nn.Linear(dim, num_tokens, bias = False)
+        self.to_logits = LinearNoBias(dim, num_tokens)
 
     def forward(self, x):
 
