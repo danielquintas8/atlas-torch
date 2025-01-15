@@ -17,6 +17,10 @@ from hyper_connections import get_init_and_expand_reduce_stream_functions
 from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 from rotary_embedding_torch import RotaryEmbedding
 
+# proposed neural memory
+
+from titans_pytorch.titans import NeuralMemory
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -161,7 +165,9 @@ class MemoryAsContextTransformer(Module):
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
-        num_residual_streams = 4
+        num_residual_streams = 4,
+        neural_memory_kwargs: dict = dict(),
+        neural_memory_layers: tuple[int, ...] | None = None,
     ):
         super().__init__()
 
@@ -181,8 +187,25 @@ class MemoryAsContextTransformer(Module):
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         self.layers = ModuleList([])
+        self.neural_mem_layers = ModuleList([])
 
-        for _ in range(depth):
+        layers = tuple(range(1, depth + 1))
+        neural_memory_layers = set(default(neural_memory_layers, layers))
+
+        for layer in layers:
+
+            # neural memory
+
+            mem = None
+
+            if num_longterm_mem_tokens > 0 and layer in neural_memory_layers:
+                mem = NeuralMemory(dim = dim, chunk_size = num_longterm_mem_tokens)
+                mem = init_hyper_conn(dim = dim, branch = mem)
+
+            self.neural_mem_layers.append(mem)
+
+            # attention and feedforward
+
             attn = SegmentedAttention(
                 dim = dim,
                 dim_head = dim_head,
@@ -221,7 +244,7 @@ class MemoryAsContextTransformer(Module):
         x, inverse_segment = pad_and_segment_with_inverse(x, segment_len)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
-        x = torch.cat((mems, x), dim = -2)
+        x = cat((mems, x), dim = -2)
 
         x = inverse_segment(x)
 
@@ -235,7 +258,24 @@ class MemoryAsContextTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for attn, ff in self.layers:
+        for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
+
+            if exists(maybe_neural_mem):
+                batch_streams = x.shape[0]
+                x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
+
+                longterm_mems, x = x[:, :num_longterm_mem_tokens], x[:, num_longterm_mem_tokens:]
+
+                longterm_mems = rearrange(longterm_mems, '(b w) n d -> b (w n) d', b = batch_streams)
+
+                longterm_mems = maybe_neural_mem(longterm_mems)
+
+                longterm_mems = rearrange(longterm_mems, 'b (w n) d -> (b w) n d', n = num_longterm_mem_tokens)
+
+                x = cat((longterm_mems, x), dim = -2)
+
+                x = inverse_segment(x)
+
             x = attn(x)
             x = ff(x)
 
@@ -245,7 +285,7 @@ class MemoryAsContextTransformer(Module):
 
         x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
 
-        x = x[:, self.num_longterm_mem_tokens:]
+        x = x[:, num_longterm_mem_tokens:]
 
         x = inverse_segment(x)
 
