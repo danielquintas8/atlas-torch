@@ -100,11 +100,11 @@ class MemoryMLP(Module):
 
 # main neural memory
 
-def default_adaptive_step_transform(adaptive_step, max_lr = 1e-1):
+def default_adaptive_step_transform(adaptive_step, max_lr = 1e-2):
     return adaptive_step.sigmoid() * max_lr
 
 def default_loss_fn(pred, target):
-    return (pred - target).pow(2).mean(dim = -1).sum()
+    return (pred - target).pow(2).mean(dim = -1)
 
 class NeuralMemory(Module):
     def __init__(
@@ -142,6 +142,12 @@ class NeuralMemory(Module):
         self.merge_heads = Rearrange('(b h) n d -> b n (h d)', h = heads)
         self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
 
+        self.retrieve_gate = nn.Sequential(
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> (b h) n 1'),
+            nn.Sigmoid()
+        ) if heads > 1 else None
+
         # memory mlp
 
         if not exists(model):
@@ -159,12 +165,13 @@ class NeuralMemory(Module):
 
         # prepare function for per sample gradients from model above, using torch.func
 
-        def forward_and_loss(params, inputs, target):
+        def forward_and_loss(params, inputs, loss_weights, target):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
-            return loss
+            loss = loss * loss_weights
+            return loss.sum()
 
-        self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims = (None, 0, 0))
+        self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims = (None, 0, 0, 0))
 
         # queries for retrieving from the model
 
@@ -190,7 +197,6 @@ class NeuralMemory(Module):
         )
 
         self.to_adaptive_step = nn.Sequential(
-            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n')
         )
@@ -271,9 +277,11 @@ class NeuralMemory(Module):
 
         keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = self.chunk_size) for t in (keys, values))
 
+        adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = self.chunk_size)
+
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads = self.per_sample_grad_fn(dict(curr_weights), keys, values)
+        grads = self.per_sample_grad_fn(dict(curr_weights), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
@@ -286,9 +294,9 @@ class NeuralMemory(Module):
 
         grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch))
 
-        # multiply gradients with learned adaptive step size
+        # negative gradients, adaptive lr already applied as loss weight
 
-        surprises = grads.apply(lambda t: einx.multiply('b n ..., b n -> b n ...', t, -adaptive_lr))
+        surprises = grads.apply(lambda t: -t)
 
         # determine scan function
 
@@ -404,6 +412,11 @@ class NeuralMemory(Module):
         # reconstitute batch dimension
 
         values = rearrange(values, '(b n) c d -> b (n c) d', b = batch)
+
+        # maybe gate
+
+        if exists(self.retrieve_gate):
+            values = values * self.retrieve_gate(seq)
 
         # maybe merge heads and combine
 
