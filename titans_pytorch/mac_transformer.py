@@ -7,7 +7,7 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
-from einops import repeat, rearrange
+from einops import repeat, rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
@@ -214,7 +214,12 @@ class MemoryAsContextTransformer(Module):
             if layer in neural_memory_layers:
                 assert has_longterm_mems, '`num_longterm_mem_tokens` must be greater than 0'
 
-                mem = NeuralMemory(dim = dim, chunk_size = num_longterm_mem_tokens)
+                mem = NeuralMemory(
+                    dim = dim,
+                    chunk_size = num_longterm_mem_tokens + segment_len,
+                    **neural_memory_kwargs
+                )
+
                 mem = init_hyper_conn(dim = dim, branch = mem)
 
             self.neural_mem_layers.append(mem)
@@ -266,7 +271,7 @@ class MemoryAsContextTransformer(Module):
         x, inverse_segment = pad_and_segment_with_inverse(x, segment_len)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
-        x = cat((mems, x), dim = -2)
+        x, mem_ps = pack((x, mems), 'b * d')
 
         x = inverse_segment(x)
 
@@ -283,21 +288,7 @@ class MemoryAsContextTransformer(Module):
         for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
 
             if exists(maybe_neural_mem):
-                batch_streams = x.shape[0]
-
-                x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
-
-                longterm_mems, x = x[:, :num_longterm_mem_tokens], x[:, num_longterm_mem_tokens:]
-
-                longterm_mems = rearrange(longterm_mems, '(b w) n d -> b (w n) d', b = batch_streams)
-
-                longterm_mems = maybe_neural_mem(longterm_mems)
-
-                longterm_mems = rearrange(longterm_mems, 'b (w n) d -> (b w) n d', n = num_longterm_mem_tokens)
-
-                x = cat((longterm_mems, x), dim = -2)
-
-                x = inverse_segment(x)
+                mems = maybe_neural_mem(mems)
 
             x = attn(x)
 
@@ -309,7 +300,7 @@ class MemoryAsContextTransformer(Module):
 
         x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
 
-        x = x[:, num_longterm_mem_tokens:]
+        x, mem = unpack(x, mem_ps, 'b * d')
 
         x = inverse_segment(x)
 

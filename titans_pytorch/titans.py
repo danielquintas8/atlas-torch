@@ -132,7 +132,7 @@ class NeuralMemory(Module):
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         default_mlp_kwargs: dict = dict(
-            depth = 4
+            depth = 2
         )
     ):
         super().__init__()
