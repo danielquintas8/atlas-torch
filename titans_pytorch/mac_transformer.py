@@ -29,8 +29,32 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
 def round_up_multiple(seq, mult):
     return ceil(seq / mult) * mult
+
+def pad_and_segment_with_inverse(seq, segment_len):
+    batch, seq_len = seq.shape[:2]
+
+    need_segment = seq_len >= segment_len
+
+    if not need_segment:
+        return seq, identity
+
+    next_seq_len_mult = round_up_multiple(seq_len, segment_len)
+
+    padding = next_seq_len_mult - seq_len
+    seq = F.pad(seq, (0, 0, 0, padding))
+
+    seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
+
+    def inverse(out):
+        out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
+        return out[:, :-padding]
+
+    return seq, inverse
 
 # feedforward and attention
 
@@ -77,9 +101,6 @@ class SegmentedAttention(Module):
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.segment_seq = Rearrange('b (n w) d -> (b n) w d', n = total_segment_len)
-        self.merge_seq_back = Rearrange('(b n) w d -> b (n w) d', n = total_segment_len)
-
         self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
 
     def forward(self, seq):
@@ -91,16 +112,7 @@ class SegmentedAttention(Module):
         # auto pad to multiple
         # todo - get rid of logic with flex attention
 
-        need_segment = seq_len >= total_segment_len
-
-        if need_segment:
-            next_seq_len = round_up_multiple(seq_len, total_segment_len)
-            padding = next_seq_len - seq_len
-
-            if padding > 0:
-                seq = F.pad(seq, (0, 0, 0, padding))
-
-            seq = self.segment_seq(seq)
+        seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len)
 
         # attention
 
@@ -130,10 +142,9 @@ class SegmentedAttention(Module):
 
         out = self.to_out(out)
 
-        if need_segment:
-            out = self.merge_seq_back(out)
+        out = inverse_segment(out)
 
-        return out[:, :seq_len]
+        return out
 
 # MAC transformer
 
@@ -207,29 +218,18 @@ class MemoryAsContextTransformer(Module):
 
         # intersperse longterm memory
 
-        need_segment = seq_len >= segment_len
-
-        if need_segment:
-            next_seq_len = round_up_multiple(seq_len, segment_len)
-            padding = next_seq_len - seq_len
-
-            if padding > 0:
-                x = F.pad(x, (0, 0, 0, padding))
-
-            x = rearrange(x, 'b (w n) d -> (b w) n d', n = segment_len)
+        x, inverse_segment = pad_and_segment_with_inverse(x, segment_len)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
         x = torch.cat((mems, x), dim = -2)
 
-        if need_segment:
-            x = rearrange(x, '(b w) n d -> b (w n) d', b = batch)
-            x = x[:, :seq_len]
+        x = inverse_segment(x)
 
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
 
         pos_emb = self.axial_pos_emb((windows, total_segment_len), flatten = True)
-        x = x + pos_emb[:seq_len]
+        x = x + pos_emb[:x.shape[-2]]
 
         # expand and reduce streams for hyper connections
 
@@ -240,6 +240,14 @@ class MemoryAsContextTransformer(Module):
             x = ff(x)
 
         x = self.reduce_streams(x)
+
+        # excise out the memories
+
+        x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
+
+        x = x[:, self.num_longterm_mem_tokens:]
+
+        x = inverse_segment(x)
 
         # to logits
 
