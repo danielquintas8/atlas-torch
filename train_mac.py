@@ -25,10 +25,12 @@ SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
-GLOBAL_LAYERS = (2, 4)
 NEURAL_MEMORY_DEPTH = 2
-WINDOW_SIZE = 64
-RUN_NAME = 'mac'
+NUM_PERSIST_MEM = 4
+NUM_LONGTERM_MEM = 4
+NEURAL_MEM_LAYERS = (2, 4, 6)
+WINDOW_SIZE = 32
+RUN_NAME = 'mac - 4 longterm mems, layers (2, 4, 6)'
 
 # wandb experiment tracker
 
@@ -57,12 +59,14 @@ model = MemoryAsContextTransformer(
     dim = 384,
     depth = 8,
     segment_len = WINDOW_SIZE,
-    num_persist_mem_tokens = 16,
-    num_longterm_mem_tokens = 16,
-    neural_memory_layers = (3, 4),
+    num_persist_mem_tokens = NUM_PERSIST_MEM,
+    num_longterm_mem_tokens = NUM_LONGTERM_MEM,
+    neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_kwargs = dict(
         default_mlp_kwargs = dict(
-            depth = NEURAL_MEMORY_DEPTH
+            depth = NEURAL_MEMORY_DEPTH,
+            dim_head = 64,
+            heads = 4
         )
     )
 ).cuda()

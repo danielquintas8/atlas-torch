@@ -185,7 +185,9 @@ class MemoryAsContextTransformer(Module):
         # long term mem tokens
 
         self.segment_len = segment_len
+
         self.num_longterm_mem_tokens = num_longterm_mem_tokens
+        has_longterm_mems = num_longterm_mem_tokens > 0
 
         self.longterm_mems = nn.Parameter(torch.randn(num_longterm_mem_tokens, dim) * 0.02)
 
@@ -197,7 +199,11 @@ class MemoryAsContextTransformer(Module):
         self.neural_mem_layers = ModuleList([])
 
         layers = tuple(range(1, depth + 1))
-        neural_memory_layers = set(default(neural_memory_layers, layers))
+
+        if not exists(neural_memory_layers):
+            neural_memory_layers = layers if has_longterm_mems else ()
+
+        assert not (num_longterm_mem_tokens > 0 and len(neural_memory_layers) == 0), 'empty `neural_memory_layers` when longterm memory tokens are present'
 
         for layer in layers:
 
@@ -205,7 +211,9 @@ class MemoryAsContextTransformer(Module):
 
             mem = None
 
-            if num_longterm_mem_tokens > 0 and layer in neural_memory_layers:
+            if layer in neural_memory_layers:
+                assert has_longterm_mems, '`num_longterm_mem_tokens` must be greater than 0'
+
                 mem = NeuralMemory(dim = dim, chunk_size = num_longterm_mem_tokens)
                 mem = init_hyper_conn(dim = dim, branch = mem)
 
