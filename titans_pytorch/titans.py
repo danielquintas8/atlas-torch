@@ -136,6 +136,7 @@ class NeuralMemory(Module):
         )
     ):
         super().__init__()
+        dim_head = default(dim_head, dim)
 
         # norms
 
@@ -146,7 +147,6 @@ class NeuralMemory(Module):
 
         # maybe multi-headed
 
-        dim_head = default(dim_head, dim)
         dim_inner = dim_head * heads
 
         self.heads = heads
