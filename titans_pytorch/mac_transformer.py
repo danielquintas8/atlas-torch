@@ -3,10 +3,11 @@ import math
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
+from einops import repeat
 from einops.layers.torch import Rearrange
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
@@ -48,6 +49,7 @@ class SegmentedAttention(Module):
         self,
         dim,
         segment_len,
+        num_persist_mem_tokens,
         dim_head = 64,
         heads = 8,
     ):
@@ -67,6 +69,7 @@ class SegmentedAttention(Module):
         self.segment_seq = Rearrange('b (n w) d -> (b n) w d', n = segment_len)
         self.merge_seq_back = Rearrange('(b n) w d -> b (n w) d', n = segment_len)
 
+        self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
 
     def forward(self, seq):
         batch, seq_len = seq.shape[:2]
@@ -92,6 +95,15 @@ class SegmentedAttention(Module):
         q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
 
+        # take care of persistent memory key / values
+
+        pmk, pmv = tuple(repeat(t, 'h n d -> b h n d', b = seq.shape[0]) for t in self.persistent_memory)
+
+        k = cat((pmk, k), dim = -2)
+        v = cat((pmv, v), dim = -2)
+
+        # sdpa
+
         out = F.scaled_dot_product_attention(q, k, v, is_causal = True)
 
         out = self.merge_heads(out)
@@ -113,6 +125,7 @@ class MemoryAsContextTransformer(Module):
         dim,
         depth,
         segment_len,
+        num_persist_mem_tokens,
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
@@ -127,7 +140,14 @@ class MemoryAsContextTransformer(Module):
         self.layers = ModuleList([])
 
         for _ in range(depth):
-            attn = SegmentedAttention(dim = dim, dim_head = dim_head, heads = heads, segment_len = segment_len)
+            attn = SegmentedAttention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads,
+                segment_len = segment_len,
+                num_persist_mem_tokens = num_persist_mem_tokens
+            )
+
             ff = FeedForward(dim = dim, mult = ff_mult)
 
             self.layers.append(ModuleList([
@@ -162,6 +182,7 @@ if __name__ == '__main__':
         num_tokens = 256,
         dim = 256,
         depth = 2,
+        num_persist_mem_tokens = 16,
         segment_len = 128,
     )
 
