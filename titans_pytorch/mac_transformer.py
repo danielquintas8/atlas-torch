@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math
+from math import ceil
 from functools import partial
 
 import torch
@@ -10,7 +10,13 @@ from torch.nn import Module, ModuleList, Linear
 from einops import repeat
 from einops.layers.torch import Rearrange
 
+
 from hyper_connections import get_init_and_expand_reduce_stream_functions
+
+# absolute and relative positions
+
+from axial_positional_embedding import ContinuousAxialPositionalEmbedding
+from rotary_embedding_torch import RotaryEmbedding
 
 # constants
 
@@ -25,7 +31,7 @@ def default(v, d):
     return v if exists(v) else d
 
 def round_up_multiple(seq, mult):
-    return math.ceil(seq / mult) * mult
+    return ceil(seq / mult) * mult
 
 # feedforward and attention
 
@@ -57,6 +63,8 @@ class SegmentedAttention(Module):
         self.norm = nn.RMSNorm(dim)
 
         dim_inner = dim_head * heads
+
+        self.rotary_emb = RotaryEmbedding(dim_head)
 
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
@@ -99,6 +107,12 @@ class SegmentedAttention(Module):
 
         pmk, pmv = tuple(repeat(t, 'h n d -> b h n d', b = seq.shape[0]) for t in self.persistent_memory)
 
+        # relative positions
+
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # persistent memory
+
         k = cat((pmk, k), dim = -2)
         v = cat((pmv, v), dim = -2)
 
@@ -133,6 +147,9 @@ class MemoryAsContextTransformer(Module):
     ):
         super().__init__()
 
+        self.segment_len = segment_len
+        self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
+
         self.token_emb = nn.Embedding(num_tokens, dim)
 
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
@@ -160,8 +177,18 @@ class MemoryAsContextTransformer(Module):
         self.to_logits = LinearNoBias(dim, num_tokens)
 
     def forward(self, x):
+        seq_len, segment_len = x.shape[-1], self.segment_len
+        windows = ceil(seq_len / segment_len)
 
         x = self.token_emb(x)
+
+        # apply axial positional embedding
+        # so intra and inter segment can be more easily discerned by the network
+
+        pos_emb = self.axial_pos_emb((windows, segment_len), flatten = True)
+        x = x + pos_emb[:seq_len]
+
+        # expand and reduce streams for hyper connections
 
         x = self.expand_streams(x)
 

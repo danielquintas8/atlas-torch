@@ -33,3 +33,19 @@ def test_titans_attn_memory():
     retrieved = mem(seq)
 
     assert seq.shape == retrieved.shape
+
+def test_mac():
+    from titans_pytorch.mac_transformer import MemoryAsContextTransformer
+
+    transformer = MemoryAsContextTransformer(
+        num_tokens = 256,
+        dim = 256,
+        depth = 2,
+        num_persist_mem_tokens = 16,
+        segment_len = 128,
+    )
+
+    x = torch.randint(0, 256, (1, 1023))
+
+    logits = transformer(x)
+    assert logits.shape == (1, 1023, 256)
