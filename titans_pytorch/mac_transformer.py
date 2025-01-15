@@ -7,9 +7,8 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
-from einops import repeat
+from einops import repeat, rearrange
 from einops.layers.torch import Rearrange
-
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
@@ -55,7 +54,8 @@ class SegmentedAttention(Module):
         self,
         dim,
         segment_len,
-        num_persist_mem_tokens,
+        num_persist_mem_tokens = 0,
+        num_longterm_mem_tokens = 0,
         dim_head = 64,
         heads = 8,
     ):
@@ -70,25 +70,31 @@ class SegmentedAttention(Module):
         self.to_out = LinearNoBias(dim_inner, dim)
 
         self.segment_len = segment_len
+        self.num_longterm_mem_tokens = num_longterm_mem_tokens
+
+        total_segment_len = segment_len + num_longterm_mem_tokens
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.segment_seq = Rearrange('b (n w) d -> (b n) w d', n = segment_len)
-        self.merge_seq_back = Rearrange('(b n) w d -> b (n w) d', n = segment_len)
+        self.segment_seq = Rearrange('b (n w) d -> (b n) w d', n = total_segment_len)
+        self.merge_seq_back = Rearrange('(b n) w d -> b (n w) d', n = total_segment_len)
 
         self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
 
     def forward(self, seq):
+        segment_len, num_longterm_mem_tokens = self.segment_len, self.num_longterm_mem_tokens
+        total_segment_len = segment_len + num_longterm_mem_tokens
+
         batch, seq_len = seq.shape[:2]
 
         # auto pad to multiple
         # todo - get rid of logic with flex attention
 
-        need_segment = seq_len >= self.segment_len
+        need_segment = seq_len >= total_segment_len
 
         if need_segment:
-            next_seq_len = round_up_multiple(seq_len, self.segment_len)
+            next_seq_len = round_up_multiple(seq_len, total_segment_len)
             padding = next_seq_len - seq_len
 
             if padding > 0:
@@ -139,7 +145,8 @@ class MemoryAsContextTransformer(Module):
         dim,
         depth,
         segment_len,
-        num_persist_mem_tokens,
+        num_longterm_mem_tokens = 0,
+        num_persist_mem_tokens = 0,
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
@@ -147,10 +154,18 @@ class MemoryAsContextTransformer(Module):
     ):
         super().__init__()
 
-        self.segment_len = segment_len
+        self.token_emb = nn.Embedding(num_tokens, dim)
+
         self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
 
-        self.token_emb = nn.Embedding(num_tokens, dim)
+        # long term mem tokens
+
+        self.segment_len = segment_len
+        self.num_longterm_mem_tokens = num_longterm_mem_tokens
+
+        self.longterm_mems = nn.Parameter(torch.randn(num_longterm_mem_tokens, dim) * 0.02)
+
+        # hyper conection
 
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
@@ -162,6 +177,7 @@ class MemoryAsContextTransformer(Module):
                 dim_head = dim_head,
                 heads = heads,
                 segment_len = segment_len,
+                num_longterm_mem_tokens = num_longterm_mem_tokens,
                 num_persist_mem_tokens = num_persist_mem_tokens
             )
 
@@ -177,15 +193,42 @@ class MemoryAsContextTransformer(Module):
         self.to_logits = LinearNoBias(dim, num_tokens)
 
     def forward(self, x):
-        seq_len, segment_len = x.shape[-1], self.segment_len
+
+        # math
+
+        batch, seq_len, segment_len, num_longterm_mem_tokens= *x.shape, self.segment_len, self.num_longterm_mem_tokens
+
         windows = ceil(seq_len / segment_len)
+        total_segment_len = segment_len + num_longterm_mem_tokens
+
+        # token embedding
 
         x = self.token_emb(x)
+
+        # intersperse longterm memory
+
+        need_segment = seq_len >= segment_len
+
+        if need_segment:
+            next_seq_len = round_up_multiple(seq_len, segment_len)
+            padding = next_seq_len - seq_len
+
+            if padding > 0:
+                x = F.pad(x, (0, 0, 0, padding))
+
+            x = rearrange(x, 'b (w n) d -> (b w) n d', n = segment_len)
+
+        mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
+        x = torch.cat((mems, x), dim = -2)
+
+        if need_segment:
+            x = rearrange(x, '(b w) n d -> b (w n) d', b = batch)
+            x = x[:, :seq_len]
 
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
 
-        pos_emb = self.axial_pos_emb((windows, segment_len), flatten = True)
+        pos_emb = self.axial_pos_emb((windows, total_segment_len), flatten = True)
         x = x + pos_emb[:seq_len]
 
         # expand and reduce streams for hyper connections
@@ -198,21 +241,8 @@ class MemoryAsContextTransformer(Module):
 
         x = self.reduce_streams(x)
 
+        # to logits
+
         x = self.norm(x)
 
         return self.to_logits(x)
-
-# main
-
-if __name__ == '__main__':
-    transformer = MemoryAsContextTransformer(
-        num_tokens = 256,
-        dim = 256,
-        depth = 2,
-        num_persist_mem_tokens = 16,
-        segment_len = 128,
-    )
-
-    x = torch.randint(0, 256, (1, 1023))
-
-    logits = transformer(x)

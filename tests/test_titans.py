@@ -34,14 +34,20 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
-def test_mac():
+@pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
+@pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
+def test_mac(
+    num_persist_mem_tokens,
+    num_longterm_mem_tokens
+):
     from titans_pytorch.mac_transformer import MemoryAsContextTransformer
 
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
         dim = 256,
         depth = 2,
-        num_persist_mem_tokens = 16,
+        num_persist_mem_tokens = num_persist_mem_tokens,
+        num_longterm_mem_tokens = num_longterm_mem_tokens,
         segment_len = 128,
     )
 
