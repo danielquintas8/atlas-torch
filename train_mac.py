@@ -9,14 +9,7 @@ from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from local_attention import LocalTransformer
-
-from taylor_series_linear_attention import TaylorSeriesLinearAttn
-
-from titans_pytorch.titans import (
-    NeuralMemory,
-    MemoryMLP
-)
+from titans_pytorch.mac_transformer import MemoryAsContextTransformer
 
 # constants
 
@@ -27,16 +20,15 @@ LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
-SHOULD_GENERATE = True
+SHOULD_GENERATE = False
 SEQ_LEN = 512
 
-PROJECT_NAME = 'titans-neural-memory'
+PROJECT_NAME = 'titans-mac-transformer'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 GLOBAL_LAYERS = (2, 4)
-USE_TITANS_MEMORY = True
 NEURAL_MEMORY_DEPTH = 2
 WINDOW_SIZE = 64
-RUN_NAME = 'neural memory'
+RUN_NAME = 'mac'
 
 # wandb experiment tracker
 
@@ -58,36 +50,21 @@ def decode_token(token):
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
-# instantiate GPT-like decoder model
+# instantiate memory-as-context transformer
 
-titans_neural_memory = NeuralMemory(
-    dim = 384,
-    chunk_size = 4,
-    dim_head = 64,
-    heads = 4,
-    use_accelerated_scan = True,
-    default_mlp_kwargs = dict(
-        depth = NEURAL_MEMORY_DEPTH
-    )
-)
-
-linear_attn = TaylorSeriesLinearAttn(
-    dim = 384,
-    dim_head = 16,
-    heads = 16,
-    causal = True,
-    prenorm = True
-)
-
-model = LocalTransformer(
+model = MemoryAsContextTransformer(
     num_tokens = 256,
     dim = 384,
     depth = 8,
-    causal = True,
-    local_attn_window_size = WINDOW_SIZE,
-    max_seq_len = SEQ_LEN,
-    global_attn_layer = linear_attn if not USE_TITANS_MEMORY else titans_neural_memory,
-    layers_insert_global_attn = GLOBAL_LAYERS
+    segment_len = WINDOW_SIZE,
+    num_persist_mem_tokens = 16,
+    num_longterm_mem_tokens = 16,
+    neural_memory_layers = (3, 4),
+    neural_memory_kwargs = dict(
+        default_mlp_kwargs = dict(
+            depth = NEURAL_MEMORY_DEPTH
+        )
+    )
 ).cuda()
 
 # prepare enwik8 data

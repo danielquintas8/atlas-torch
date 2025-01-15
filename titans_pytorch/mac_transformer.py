@@ -50,13 +50,20 @@ def pad_and_segment_with_inverse(seq, segment_len):
     next_seq_len_mult = round_up_multiple(seq_len, segment_len)
 
     padding = next_seq_len_mult - seq_len
-    seq = F.pad(seq, (0, 0, 0, padding))
+    needs_pad = padding > 0
+
+    if needs_pad:
+        seq = F.pad(seq, (0, 0, 0, padding))
 
     seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
     def inverse(out):
         out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
-        return out[:, :-padding]
+
+        if needs_pad:
+            out = out[:, :-padding]
+
+        return out
 
     return seq, inverse
 
@@ -226,7 +233,14 @@ class MemoryAsContextTransformer(Module):
 
         self.to_logits = LinearNoBias(dim, num_tokens)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        return_loss = False
+    ):
+
+        if return_loss:
+            x, labels = x[:, :-1], x[:, 1:]
 
         # math
 
@@ -262,6 +276,7 @@ class MemoryAsContextTransformer(Module):
 
             if exists(maybe_neural_mem):
                 batch_streams = x.shape[0]
+
                 x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
 
                 longterm_mems, x = x[:, :num_longterm_mem_tokens], x[:, num_longterm_mem_tokens:]
@@ -277,6 +292,7 @@ class MemoryAsContextTransformer(Module):
                 x = inverse_segment(x)
 
             x = attn(x)
+
             x = ff(x)
 
         x = self.reduce_streams(x)
@@ -293,4 +309,9 @@ class MemoryAsContextTransformer(Module):
 
         x = self.norm(x)
 
-        return self.to_logits(x)
+        logits = self.to_logits(x)
+
+        if not return_loss:
+            return logits
+
+        return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
