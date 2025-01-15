@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.0.38"
+version = "0.0.39"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -34,6 +34,7 @@ dependencies = [
     "rotary-embedding-torch",
     "tensordict",
     "torch>=2.2",
+    "x-transformers"
 ]
 
 [project.urls]

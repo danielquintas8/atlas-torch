@@ -7,7 +7,7 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
-from einops import repeat, rearrange, pack, unpack
+from einops import einsum, repeat, rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
@@ -16,6 +16,7 @@ from hyper_connections import get_init_and_expand_reduce_stream_functions
 
 from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 from rotary_embedding_torch import RotaryEmbedding
+from x_transformers.attend import Attend
 
 # proposed neural memory
 
@@ -93,6 +94,7 @@ class SegmentedAttention(Module):
         num_longterm_mem_tokens = 0,
         dim_head = 64,
         heads = 8,
+        attend_kwargs: dict = dict()
     ):
         super().__init__()
         self.norm = nn.RMSNorm(dim)
@@ -100,6 +102,8 @@ class SegmentedAttention(Module):
         dim_inner = dim_head * heads
 
         self.rotary_emb = RotaryEmbedding(dim_head)
+
+        self.attend = Attend(causal = True, **attend_kwargs)
 
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
@@ -145,9 +149,9 @@ class SegmentedAttention(Module):
         k = cat((pmk, k), dim = -2)
         v = cat((pmv, v), dim = -2)
 
-        # sdpa
+        # attention
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal = True)
+        out, _ = self.attend(q, k, v)
 
         out = self.merge_heads(out)
 
