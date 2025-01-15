@@ -32,7 +32,7 @@ SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-neural-memory'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
-GLOBAL_LAYERS = (4, 5)
+GLOBAL_LAYERS = (2, 4)
 USE_TITANS_MEMORY = True
 NEURAL_MEMORY_DEPTH = 2
 WINDOW_SIZE = 64

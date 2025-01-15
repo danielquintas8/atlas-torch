@@ -73,6 +73,17 @@ def softclamp_grad_norm(t, max_value):
     t = t * (clamped_norm / norm)
     return inverse(t)
 
+# multi head rmsnorm
+
+class MultiheadRMSNorm(Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.rmsnorm = nn.RMSNorm(dim, elementwise_affine = False)
+        self.gamma = nn.Parameter(torch.zeros(heads, 1, dim))
+
+    def forward(self, x):
+        return self.rmsnorm(x) * (self.gamma + 1.)
+
 # classes
 
 class MemoryMLP(Module):
@@ -131,20 +142,22 @@ class NeuralMemory(Module):
         self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
-        self.post_rmsnorm = nn.RMSNorm(dim) if post_rmsnorm else nn.Identity()
+        self.multihead_rmsnorm = MultiheadRMSNorm(dim_head, heads) if post_rmsnorm else nn.Identity()
 
         # maybe multi-headed
 
         dim_head = default(dim_head, dim)
         dim_inner = dim_head * heads
 
+        self.heads = heads
+
         self.split_heads = Rearrange('b n (h d) -> (b h) n d', h = heads)
-        self.merge_heads = Rearrange('(b h) n d -> b n (h d)', h = heads)
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
         self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
 
         self.retrieve_gate = nn.Sequential(
             LinearNoBias(dim, heads),
-            Rearrange('b n h -> (b h) n 1'),
+            Rearrange('b n h -> b h n 1'),
             nn.Sigmoid()
         ) if heads > 1 else None
 
@@ -364,7 +377,7 @@ class NeuralMemory(Module):
         past_weights: dict[str, Tensor] | None = None,
     ):
         chunk_size = self.chunk_size
-        seq_len = seq.shape[1]
+        batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
 
@@ -398,8 +411,6 @@ class NeuralMemory(Module):
 
         queries = self.split_heads(queries)
 
-        batch = queries.shape[0]
-
         # fetch values from memory model
 
         curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
@@ -411,7 +422,9 @@ class NeuralMemory(Module):
 
         # reconstitute batch dimension
 
-        values = rearrange(values, '(b n) c d -> b (n c) d', b = batch)
+        values = rearrange(values, '(b h n) c d -> b h (n c) d', b = batch, h = self.heads)
+
+        values = self.multihead_rmsnorm(values)
 
         # maybe gate
 
@@ -423,10 +436,6 @@ class NeuralMemory(Module):
         values = self.merge_heads(values)
 
         values = self.combine_heads(values)
-
-        # post norm, somehow could not stabilize this without it, not in paper
-
-        values = self.post_rmsnorm(values)
 
         # restore, pad with empty memory embed
 
