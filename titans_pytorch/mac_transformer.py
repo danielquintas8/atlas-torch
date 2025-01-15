@@ -94,6 +94,7 @@ class SegmentedAttention(Module):
         num_longterm_mem_tokens = 0,
         dim_head = 64,
         heads = 8,
+        accept_value_residual = False,
         attend_kwargs: dict = dict()
     ):
         super().__init__()
@@ -108,6 +109,12 @@ class SegmentedAttention(Module):
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
 
+        self.to_learned_v_mix = nn.Sequential(
+            nn.Linear(dim, heads),
+            Rearrange('b n h -> b h n 1'),
+            nn.Sigmoid()
+        ) if accept_value_residual else None
+
         self.segment_len = segment_len
         self.num_longterm_mem_tokens = num_longterm_mem_tokens
 
@@ -118,7 +125,13 @@ class SegmentedAttention(Module):
 
         self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
 
-    def forward(self, seq):
+    def forward(
+        self,
+        seq,
+        value_residual = None
+    ):
+        assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
+
         segment_len, num_longterm_mem_tokens = self.segment_len, self.num_longterm_mem_tokens
         total_segment_len = segment_len + num_longterm_mem_tokens
 
@@ -135,6 +148,14 @@ class SegmentedAttention(Module):
 
         q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
         q, k, v = map(self.split_heads, (q, k, v))
+
+        # value residual
+
+        orig_v = v
+
+        if exists(self.to_learned_v_mix):
+            mix = self.to_learned_v_mix(seq)
+            v = v.lerp(value_residual, mix)
 
         # take care of persistent memory key / values
 
@@ -159,7 +180,7 @@ class SegmentedAttention(Module):
 
         out = inverse_segment(out)
 
-        return out
+        return out, orig_v
 
 # MAC transformer
 
@@ -210,6 +231,7 @@ class MemoryAsContextTransformer(Module):
         assert not (num_longterm_mem_tokens > 0 and len(neural_memory_layers) == 0), 'empty `neural_memory_layers` when longterm memory tokens are present'
 
         for layer in layers:
+            is_first = layer == 1
 
             # neural memory
 
@@ -235,6 +257,7 @@ class MemoryAsContextTransformer(Module):
                 dim_head = dim_head,
                 heads = heads,
                 segment_len = segment_len,
+                accept_value_residual = not is_first,
                 num_longterm_mem_tokens = num_longterm_mem_tokens,
                 num_persist_mem_tokens = num_persist_mem_tokens
             )
@@ -285,6 +308,10 @@ class MemoryAsContextTransformer(Module):
         pos_emb = self.axial_pos_emb((windows, total_segment_len), flatten = True)
         x = x + pos_emb[:x.shape[-2]]
 
+        # value residual
+
+        value_residual = None
+
         # expand and reduce streams for hyper connections
 
         x = self.expand_streams(x)
@@ -295,7 +322,9 @@ class MemoryAsContextTransformer(Module):
                 x = maybe_neural_mem(x)
 
 
-            x = attn(x)
+            x, values = attn(x, value_residual = value_residual)
+
+            value_residual = default(value_residual, values)
 
             x = ff(x)
 

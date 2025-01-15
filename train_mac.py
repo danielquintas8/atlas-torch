@@ -24,7 +24,7 @@ SHOULD_GENERATE = False
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
