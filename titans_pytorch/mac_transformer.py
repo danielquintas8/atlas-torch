@@ -288,7 +288,8 @@ class MemoryAsContextTransformer(Module):
         for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
 
             if exists(maybe_neural_mem):
-                mems = maybe_neural_mem(mems)
+                x = maybe_neural_mem(x)
+
 
             x = attn(x)
 
@@ -300,7 +301,7 @@ class MemoryAsContextTransformer(Module):
 
         x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
 
-        x, mem = unpack(x, mem_ps, 'b * d')
+        x, _ = unpack(x, mem_ps, 'b * d')
 
         x = inverse_segment(x)
 
