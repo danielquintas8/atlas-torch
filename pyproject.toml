@@ -28,6 +28,7 @@ dependencies = [
     "accelerated-scan>=0.2.0",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "hyper-connections>=0.1.8",
     "Ninja",
     "tensordict",
     "torch>=2.2",

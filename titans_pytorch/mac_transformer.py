@@ -8,6 +8,8 @@ from torch.nn import Module, ModuleList
 
 from einops.layers.torch import Rearrange
 
+from hyper_connections import get_init_and_expand_reduce_stream_functions
+
 # helpers
 
 def exists(v):
@@ -78,18 +80,24 @@ class MemoryAsContextTransformer(Module):
         segment_len,
         dim_head = 64,
         heads = 8,
-        ff_mult = 4
+        ff_mult = 4,
+        num_residual_streams = 4
     ):
         super().__init__()
 
         self.token_emb = nn.Embedding(num_tokens, dim)
 
+        init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
+
         self.layers = ModuleList([])
 
         for _ in range(depth):
+            attn = SegmentedAttention(dim = dim, dim_head = dim_head, heads = heads, segment_len = segment_len)
+            ff = FeedForward(dim = dim, mult = ff_mult)
+
             self.layers.append(ModuleList([
-                SegmentedAttention(dim = dim, dim_head = dim_head, heads = heads, segment_len = segment_len),
-                FeedForward(dim = dim, mult = ff_mult)
+                init_hyper_conn(dim = dim, branch = attn),
+                init_hyper_conn(dim = dim, branch = ff)
             ]))
 
         self.norm = nn.RMSNorm(dim)
@@ -100,9 +108,13 @@ class MemoryAsContextTransformer(Module):
 
         x = self.token_emb(x)
 
+        x = self.expand_streams(x)
+
         for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
+            x = attn(x)
+            x = ff(x)
+
+        x = self.reduce_streams(x)
 
         x = self.norm(x)
 
