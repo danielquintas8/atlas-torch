@@ -311,7 +311,7 @@ class MemoryAsContextTransformer(Module):
 
         pos_emb = self.axial_pos_emb((neural_mem_windows, neural_mem_segment_len), flatten = True)
 
-        x = x + pos_emb[:seq_len_with_mem]
+        pos_emb = pos_emb[:seq_len_with_mem]
 
         # value residual
 
@@ -324,7 +324,7 @@ class MemoryAsContextTransformer(Module):
         for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
 
             if exists(maybe_neural_mem):
-                x = maybe_neural_mem(x)
+                x = maybe_neural_mem(x, pos_emb = pos_emb)
 
             x, values = attn(x, value_residual = value_residual)
 

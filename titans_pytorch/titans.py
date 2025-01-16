@@ -484,9 +484,13 @@ class NeuralMemory(Module):
         seq,
         store_seq = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        return_next_memories = False
+        return_next_memories = False,
+        pos_emb: Tensor | None = None
     ):
         batch, seq_len = seq.shape[:2]
+
+        if exists(pos_emb):
+            seq = seq + pos_emb
 
         if seq_len < self.chunk_size:
             return self.init_empty_memory_embed(batch, seq_len)
