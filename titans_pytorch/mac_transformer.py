@@ -324,7 +324,6 @@ class MemoryAsContextTransformer(Module):
             if exists(maybe_neural_mem):
                 x = maybe_neural_mem(x)
 
-
             x, values = attn(x, value_residual = value_residual)
 
             value_residual = default(value_residual, values)

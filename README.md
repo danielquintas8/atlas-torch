@@ -36,16 +36,10 @@ assert seq.shape == retrieved.shape
 $ pip install .[examples]
 ```
 
-For the SOTA linear attention, you will also need to run
+Then modify `train_mac.py` and run it to query nature
 
 ```bash
-$ pip install -r requirements.txt
-```
-
-Then modify `train.py` and run it to query nature
-
-```bash
-$ python train.py
+$ python train_mac.py
 ```
 
 ## Citations

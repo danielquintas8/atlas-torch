@@ -44,8 +44,6 @@ Repository = "https://github.com/lucidrains/titans-pytorch"
 [project.optional-dependencies]
 
 examples = [
-    "local-attention>=1.10.1",
-    "taylor-series-linear-attention",
     "tqdm",
     "wandb"
 ]

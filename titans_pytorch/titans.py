@@ -27,7 +27,7 @@ n - sequence
 d - feature dimension
 c - intra-chunk
 """
-7
+
 LinearNoBias = partial(Linear, bias = False)
 
 # functions
@@ -107,6 +107,44 @@ class MemoryMLP(Module):
 
         return x
 
+# improvised attention as memory module
+
+class MemoryAttention(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.randn(dim, dim)), # queries
+            nn.Parameter(torch.randn(dim, dim)), # keys
+            nn.Parameter(torch.randn(dim, dim)), # values
+            nn.Parameter(torch.randn(dim, dim * 2)), # ff w1
+            nn.Parameter(torch.randn(dim * 2, dim)), # ff w2
+        ])
+
+    def forward(self, x):
+
+        assert x.shape[-2] > 1, 'chunk size needs to be greater than 1 for using attention as memory'
+
+        wq, wk, wv, ffw1, ffw2 = self.weights
+
+        q = F.normalize(x @ wq, dim = -1)
+        k = F.normalize(x @ wk, dim = -1)
+        v = x @ wv
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal = True
+        )
+
+        x = x + attn_out
+
+        h = F.silu(x @ ffw1)
+        out = h @ ffw2
+
+        return out
+
 # main neural memory
 
 def default_adaptive_step_transform(adaptive_step, max_lr = 1e-2):
@@ -129,7 +167,7 @@ class NeuralMemory(Module):
         post_rmsnorm = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
-        default_mlp_kwargs: dict = dict(
+        default_model_kwargs: dict = dict(
             depth = 2
         )
     ):
@@ -162,7 +200,7 @@ class NeuralMemory(Module):
         # memory mlp
 
         if not exists(model):
-            model = MemoryMLP(dim_head, **default_mlp_kwargs)
+            model = MemoryMLP(dim_head, **default_model_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 

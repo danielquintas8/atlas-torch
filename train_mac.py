@@ -28,9 +28,9 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
-NEURAL_MEM_LAYERS = (4,)
+NEURAL_MEM_LAYERS = (2, 4)
 WINDOW_SIZE = 32
-RUN_NAME = 'mac - 4 longterm mems, layers (4,)'
+RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 
 # wandb experiment tracker
 
@@ -65,7 +65,7 @@ model = MemoryAsContextTransformer(
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
-        default_mlp_kwargs = dict(
+        default_model_kwargs = dict(
             depth = NEURAL_MEMORY_DEPTH,
         )
     )
