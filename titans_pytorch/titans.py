@@ -162,7 +162,8 @@ class NeuralMemory(Module):
         heads = 1,
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
-        adaptive_step_transform: Callable = default_adaptive_step_transform,
+        adaptive_step_transform: Callable | None = None,
+        default_step_transform_max_lr = 1e-2,
         pre_rmsnorm = True,
         post_rmsnorm = True,
         max_grad_norm: float | None = None,
@@ -249,6 +250,9 @@ class NeuralMemory(Module):
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n')
         )
+
+        if not exists(adaptive_step_transform):
+            adaptive_step_transform = partial(default_adaptive_step_transform, max_lr = default_step_transform_max_lr)
 
         self.adaptive_step_transform = adaptive_step_transform
 
