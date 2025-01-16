@@ -63,8 +63,11 @@ def gumbel_noise(t):
     noise = torch.zeros_like(t).uniform_(0, 1)
     return -log(-log(noise))
 
-def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
-    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
+def gumbel_sample(t, temperature = 1., keepdim = True):
+    if temperature <= 0.:
+        return t.argmax(dim = dim, keepdim = keepdim)
+
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = -1, keepdim = keepdim)
 
 # min_p
 # https://arxiv.org/abs/2407.01082
@@ -91,7 +94,7 @@ def base_decoding(
         logits = logits[:, -1]
 
         logits = min_p_filter(logits, min_p = min_p)
-        sample = gumbel_sample(logits, temperature = temperature, dim = -1)
+        sample = gumbel_sample(logits, temperature = temperature)
 
         out = torch.cat((out, sample), dim = -1)
 
