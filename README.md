@@ -82,3 +82,12 @@ $ python train_mac.py
     year    = {2024}
 }
 ```
+
+```bibtex
+@inproceedings{Yang2024GatedDN,
+    title   = {Gated Delta Networks: Improving Mamba2 with Delta Rule},
+    author  = {Songlin Yang and Jan Kautz and Ali Hatamizadeh},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:274598177}
+}
+```

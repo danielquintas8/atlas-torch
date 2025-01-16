@@ -56,6 +56,17 @@ def pack_one_with_inverse(t, pattern):
 
     return packed, inverse
 
+def Sequential(*modules):
+    modules = [*filter(exists, modules)]
+
+    if len(modules) == 0:
+        return nn.Identity()
+
+    if len(modules) == 1:
+        return modules[0]
+
+    return nn.Sequential(*modules)
+
 # softclamping gradients
 
 def softclamp_max(t, max_value):
@@ -165,6 +176,7 @@ class NeuralMemory(Module):
         post_rmsnorm = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
+        activation: Module | None = None,
         default_model_kwargs: dict = dict(
             depth = 2
         )
@@ -222,11 +234,11 @@ class NeuralMemory(Module):
 
         # queries for retrieving from the model
 
-        self.to_queries = LinearNoBias(dim, dim_inner)
+        self.to_queries = Sequential(LinearNoBias(dim, dim_inner), activation)
 
         # keys and values for storing to the model
 
-        self.to_keys_values = LinearNoBias(dim, dim_inner * 2)
+        self.to_keys_values = Sequential(LinearNoBias(dim, dim_inner * 2), activation)
         self.store_memory_loss_fn = store_memory_loss_fn
 
         # empty memory embed

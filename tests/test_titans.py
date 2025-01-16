@@ -1,16 +1,21 @@
 import torch
+from torch import nn
+
 import pytest
 from titans_pytorch import NeuralMemory
 
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
+@pytest.mark.parametrize('silu', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
 def test_titans(
     seq_len,
-    max_grad_norm
+    silu,
+    max_grad_norm,
 ):
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
+        activation = nn.SiLU() if silu else None,
         max_grad_norm = max_grad_norm
     )
 
