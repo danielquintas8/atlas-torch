@@ -1,5 +1,6 @@
 import torch
 import pytest
+from titans_pytorch import NeuralMemory
 
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
@@ -7,9 +8,6 @@ def test_titans(
     seq_len,
     max_grad_norm
 ):
-
-    from titans_pytorch import NeuralMemory
-
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
@@ -22,11 +20,14 @@ def test_titans(
     assert seq.shape == retrieved.shape
 
 def test_titans_attn_memory():
-    from titans_pytorch.titans_attn_memory import NeuralMemory
+    from titans_pytorch.titans import MemoryAttention
 
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
+        model = MemoryAttention(
+            dim = 384
+        )
     )
 
     seq = torch.randn(2, 1024, 384)
