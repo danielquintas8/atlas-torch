@@ -425,11 +425,7 @@ class NeuralMemory(Module):
         next_seq_len = round_up_multiple(curtailed_seq_len, chunk_size)
 
         padding = next_seq_len - curtailed_seq_len
-
-        needs_pad = padding > 0
-
-        if needs_pad:
-            seq = pad_at_dim(seq, (0, padding), dim = 1)
+        seq = pad_at_dim(seq, (0, padding), dim = 1)
 
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
@@ -481,10 +477,7 @@ class NeuralMemory(Module):
         empty_memory_embeds = self.init_empty_memory_embed(values.shape[0], chunk_size - 1)
         values = torch.cat((empty_memory_embeds, values), dim = -2)
 
-        if needs_pad:
-            values = values[:, :-padding]
-
-        return values
+        return values[:, :seq_len]
 
     def forward(
         self,

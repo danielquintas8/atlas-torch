@@ -3,4 +3,6 @@ from titans_pytorch.titans import (
     MemoryMLP,
 )
 
-from titans_pytorch.mac_transformer import MemoryAsContextTransformer
+from titans_pytorch.mac_transformer import (
+    MemoryAsContextTransformer
+)

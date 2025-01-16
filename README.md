@@ -30,6 +30,26 @@ retrieved = mem(seq)
 assert seq.shape == retrieved.shape
 ```
 
+A transformer with the `MAC` configuration can be used as
+
+```python
+import torch
+from titans_pytorch import MemoryAsContextTransformer
+
+transformer = MemoryAsContextTransformer(
+    num_tokens = 256,
+    dim = 256,
+    depth = 2,
+    segment_len = 128,              # local attention window size
+    num_persist_mem_tokens = 4,
+    num_longterm_mem_tokens = 16,
+)
+
+token_ids = torch.randint(0, 256, (1, 1023))
+
+logits = transformer(token_ids) # (1, 1023, 256)
+```
+
 ## Experiments
 
 ```bash
