@@ -128,6 +128,7 @@ class SegmentedAttention(Module):
         heads = 8,
         accept_value_residual = False,
         attend_kwargs: dict = dict(),
+        use_flex_attn = False
     ):
         super().__init__()
         self.norm = nn.RMSNorm(dim)
@@ -157,11 +158,79 @@ class SegmentedAttention(Module):
 
         self.persistent_memory = nn.Parameter(torch.zeros(2, heads, num_persist_mem_tokens, dim_head))
 
+        # flex attn related
+
+        assert not (use_flex_attn and not exists(flex_attention)), 'you need to be on the latest pytorch with a cuda device available'
+        self.use_flex_attn = use_flex_attn
+
+        self.segment_len = segment_len
+        self.num_persist_mem_tokens = num_persist_mem_tokens
+
+    def forward_flex(
+        self,
+        seq,
+        value_residual = None,
+        flex_attn_fn: Callable | None = None
+    ):
+
+        assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
+
+        batch, seq_len = seq.shape[:2]
+
+        # attention
+
+        seq = self.norm(seq)
+
+        q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        # value residual
+
+        orig_v = v
+
+        if exists(self.to_learned_v_mix):
+            mix = self.to_learned_v_mix(seq)
+            v = v.lerp(value_residual, mix)
+
+        # take care of persistent memory key / values
+
+        pmk, pmv = repeat(self.persistent_memory, 'kv h n d -> kv b h n d', b = batch)
+
+        # relative positions
+
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # persistent memory
+
+        k = cat((pmk, k), dim = -2)
+        v = cat((pmv, v), dim = -2)
+
+        # prep flex attention
+
+        if not exists(flex_attn_fn):
+            block_mask = create_mac_block_mask(seq_len, self.segment_len, self.num_persist_mem_tokens)
+
+            flex_attn_fn = partial(flex_attention, block_mask = block_mask)
+
+        # attention
+
+        out = flex_attn_fn(q, k, v)
+
+        out = self.merge_heads(out)
+
+        out = self.to_out(out)
+
+        return out, orig_v
+
     def forward(
         self,
         seq,
-        value_residual = None
+        value_residual = None,
+        flex_attn_fn: Callable | None = None
     ):
+        if seq.is_cuda and self.use_flex_attn:
+            return self.forward_flex(seq, value_residual, flex_attn_fn)
+
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
         segment_len, num_longterm_mem_tokens = self.segment_len, self.num_longterm_mem_tokens
@@ -191,7 +260,7 @@ class SegmentedAttention(Module):
 
         # take care of persistent memory key / values
 
-        pmk, pmv = tuple(repeat(t, 'h n d -> b h n d', b = seq.shape[0]) for t in self.persistent_memory)
+        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = seq.shape[0])
 
         # relative positions
 
