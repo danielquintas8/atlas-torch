@@ -7,8 +7,38 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
+# flex attention
+# https://pytorch.org/blog/flexattention/
+
+flex_attention = None
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    if torch.cuda.is_available():
+        flex_attention = torch.compile(flex_attention)
+except ImportError:
+    pass
+
+def create_mac_block_mask(seq_len, window_size, persist_mem_len):
+
+    def create_mac_mask(b, h, q_idx, kv_idx):
+        is_persist_mem = kv_idx < persist_mem_len
+        causal_mask = q_idx >= (kv_idx - is_persist_mem)
+        block_diagonal = (q_idx // window_size) == ((kv_idx - is_persist_mem) // window_size)
+        return is_persist_mem | (~is_persist_mem & (causal_mask & block_diagonal))
+
+    block_mask = create_block_mask(create_mac_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len + persist_mem_len, _compile = True)
+    return block_mask
+
+# einstein notation related
+
 from einops import einsum, repeat, rearrange, pack, unpack
 from einops.layers.torch import Rearrange
+
+# b - batch
+# n - sequence
+# h - heads
+# d - feature dimension
 
 # absolute and relative positions
 
