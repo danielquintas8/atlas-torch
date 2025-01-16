@@ -62,6 +62,7 @@ model = MemoryAsContextTransformer(
     num_persist_mem_tokens = NUM_PERSIST_MEM,
     num_longterm_mem_tokens = NUM_LONGTERM_MEM,
     neural_memory_layers = NEURAL_MEM_LAYERS,
+    neural_memory_segment_len = WINDOW_SIZE // 2,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,

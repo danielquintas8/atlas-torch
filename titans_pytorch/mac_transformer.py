@@ -224,7 +224,7 @@ class MemoryAsContextTransformer(Module):
         self.layers = ModuleList([])
 
         self.neural_mem_layers = ModuleList([])
-        neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
+        self.neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
 
         layers = tuple(range(1, depth + 1))
 
@@ -245,7 +245,7 @@ class MemoryAsContextTransformer(Module):
 
                 mem = NeuralMemory(
                     dim = dim,
-                    chunk_size = neural_memory_segment_len,
+                    chunk_size = self.neural_memory_segment_len,
                     **neural_memory_kwargs
                 )
 
@@ -287,10 +287,7 @@ class MemoryAsContextTransformer(Module):
 
         # math
 
-        batch, seq_len, segment_len, num_longterm_mem_tokens= *x.shape, self.segment_len, self.num_longterm_mem_tokens
-
-        windows = ceil(seq_len / segment_len)
-        total_segment_len = segment_len + num_longterm_mem_tokens
+        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens
 
         # token embedding
 
@@ -305,11 +302,16 @@ class MemoryAsContextTransformer(Module):
 
         x = inverse_segment(x)
 
+        seq_len_with_mem = x.shape[-2]
+
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
 
-        pos_emb = self.axial_pos_emb((windows, total_segment_len), flatten = True)
-        x = x + pos_emb[:x.shape[-2]]
+        neural_mem_windows = ceil(seq_len_with_mem / neural_mem_segment_len)
+
+        pos_emb = self.axial_pos_emb((neural_mem_windows, neural_mem_segment_len), flatten = True)
+
+        x = x + pos_emb[:seq_len_with_mem]
 
         # value residual
 
@@ -334,7 +336,7 @@ class MemoryAsContextTransformer(Module):
 
         # excise out the memories
 
-        x, inverse_segment = pad_and_segment_with_inverse(x, total_segment_len)
+        x, inverse_segment = pad_and_segment_with_inverse(x, segment_len + num_longterm_mem_tokens)
 
         x, _ = unpack(x, mem_ps, 'b * d')
 
