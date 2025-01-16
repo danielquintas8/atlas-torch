@@ -124,9 +124,6 @@ class MemoryAttention(Module):
         ])
 
     def forward(self, x):
-
-        assert x.shape[-2] > 1, 'chunk size needs to be greater than 1 for using attention as memory'
-
         wq, wk, wv, ffw1, ffw2 = self.weights
 
         q = F.normalize(x @ wq, dim = -1)
