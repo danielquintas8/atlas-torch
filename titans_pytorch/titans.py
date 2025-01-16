@@ -217,10 +217,10 @@ class NeuralMemory(Module):
         def forward_and_loss(params, inputs, loss_weights, target):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
-            loss = loss * loss_weights
-            return loss.sum()
+            weighted_loss = loss * loss_weights
+            return weighted_loss.sum(), loss.mean()
 
-        self.per_sample_grad_fn = vmap(grad(forward_and_loss), in_dims = (None, 0, 0, 0))
+        self.per_sample_grad_fn = vmap(grad(forward_and_loss, has_aux = True), in_dims = (None, 0, 0, 0))
 
         # queries for retrieving from the model
 
@@ -282,7 +282,8 @@ class NeuralMemory(Module):
     def store_memories(
         self,
         seq,
-        past_state: tuple[dict[str, Tensor], dict[str, Tensor]]
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
+        return_aux_kv_loss = False
     ):
 
         seq = self.store_norm(seq)
@@ -330,7 +331,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads = self.per_sample_grad_fn(dict(curr_weights), keys, adaptive_lr, values)
+        grads, aux_kv_recon_loss = self.per_sample_grad_fn(dict(curr_weights), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
@@ -405,7 +406,10 @@ class NeuralMemory(Module):
 
         next_state = (curr_weights + last_update, next_momentum)
 
-        return updates, next_state
+        if not return_aux_kv_loss:
+            return updates, next_state
+
+        return updates, next_state, aux_kv_recon_loss
 
     def retrieve_memories(
         self,
@@ -484,7 +488,7 @@ class NeuralMemory(Module):
         seq,
         store_seq = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        return_next_memories = False
+        return_aux_kv_loss = False
     ):
         batch, seq_len = seq.shape[:2]
 
@@ -499,13 +503,13 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        updates, next_memories = self.store_memories(store_seq, past_state)
+        updates, next_memories, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
 
         retrieved = self.retrieve_memories(seq, past_weights + updates)
 
-        if not return_next_memories:
+        if not return_aux_kv_loss:
             return retrieved
 
-        return retrieved, next_memories
+        return retrieved, aux_kv_recon_loss
