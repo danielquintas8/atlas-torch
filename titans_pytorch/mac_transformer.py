@@ -192,6 +192,7 @@ class MemoryAsContextTransformer(Module):
         dim,
         depth,
         segment_len,
+        neural_memory_segment_len = None,
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
         dim_head = 64,
@@ -221,7 +222,9 @@ class MemoryAsContextTransformer(Module):
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         self.layers = ModuleList([])
+
         self.neural_mem_layers = ModuleList([])
+        neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
 
         layers = tuple(range(1, depth + 1))
 
@@ -242,7 +245,7 @@ class MemoryAsContextTransformer(Module):
 
                 mem = NeuralMemory(
                     dim = dim,
-                    chunk_size = num_longterm_mem_tokens + segment_len,
+                    chunk_size = neural_memory_segment_len,
                     **neural_memory_kwargs
                 )
 
