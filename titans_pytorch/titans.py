@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Callable
 import math
 from functools import partial
 
@@ -16,7 +17,6 @@ from titans_pytorch.associative_scan import (
     pad_at_dim
 )
 
-import einx
 from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
@@ -338,9 +338,9 @@ class NeuralMemory(Module):
 
         # take care of chunking
 
-        keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = self.chunk_size) for t in (keys, values))
+        keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = chunk_size) for t in (keys, values))
 
-        adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = self.chunk_size)
+        adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = chunk_size)
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 

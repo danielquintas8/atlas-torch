@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Callable
 from math import ceil
 from functools import partial
 
@@ -32,7 +33,7 @@ def create_mac_block_mask(seq_len, window_size, persist_mem_len):
 
 # einstein notation related
 
-from einops import einsum, repeat, rearrange, pack, unpack
+from einops import repeat, rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 
 # b - batch
