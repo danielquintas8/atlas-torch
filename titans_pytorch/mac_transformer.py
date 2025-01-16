@@ -10,13 +10,15 @@ from torch.nn import Module, ModuleList, Linear
 from einops import einsum, repeat, rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 
-from hyper_connections import get_init_and_expand_reduce_stream_functions
-
 # absolute and relative positions
 
 from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 from rotary_embedding_torch import RotaryEmbedding
+
+# hyper connections / attend from x-transformers, which handles different queries and key lengths better
+
 from x_transformers.attend import Attend
+from hyper_connections import get_init_and_expand_reduce_stream_functions
 
 # proposed neural memory
 

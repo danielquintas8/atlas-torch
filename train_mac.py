@@ -4,7 +4,7 @@ import gzip
 import numpy as np
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -19,12 +19,13 @@ GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
+PRIME_LENGTH = 100
 GENERATE_LENGTH = 512
-SHOULD_GENERATE = False
+SHOULD_GENERATE = True
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
@@ -52,6 +53,49 @@ def decode_token(token):
 
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
+
+# sampling helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
+
+# min_p
+# https://arxiv.org/abs/2407.01082
+
+def min_p_filter(logits, min_p = 0.1):
+    probs = logits.softmax(dim = -1)
+    max_probs = probs.amax(dim = -1, keepdim = True)
+    limit = min_p * max_probs
+    return torch.where(probs < limit, float('-inf'), logits)
+
+def base_decoding(
+    net,
+    prompt: Tensor,
+    seq_len: int,
+    temperature = 1.5,
+    min_p = 1e-1,
+    filter_thres = 0.9,
+):
+    prompt_seq_len, out = prompt.shape[-1], prompt.clone()
+    sample_num_times = max(0, seq_len - prompt_seq_len)
+
+    for _ in tqdm.tqdm(range(sample_num_times)):
+        logits = net(out)
+        logits = logits[:, -1]
+
+        logits = min_p_filter(logits, min_p = min_p)
+        sample = gumbel_sample(logits, temperature = temperature, dim = -1)
+
+        out = torch.cat((out, sample), dim = -1)
+
+    return out[..., prompt_seq_len:]
 
 # instantiate memory-as-context transformer
 
@@ -127,10 +171,10 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
     if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()
-        inp = random.choice(val_dataset)[:-1]
+        inp = random.choice(val_dataset)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
         print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.generate(inp[None, ...], GENERATE_LENGTH, use_kv_cache = False)
+        sample = base_decoding(model, inp[None, ...], GENERATE_LENGTH)
         output_str = decode_tokens(sample[0])
         print(output_str)
