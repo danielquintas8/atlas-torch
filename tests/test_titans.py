@@ -45,9 +45,11 @@ def test_titans_attn_memory():
 
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
+@pytest.mark.parametrize('neural_mem_gate_attn_output', (False, True))
 def test_mac(
     num_persist_mem_tokens,
-    num_longterm_mem_tokens
+    num_longterm_mem_tokens,
+    neural_mem_gate_attn_output
 ):
     from titans_pytorch.mac_transformer import MemoryAsContextTransformer
 
@@ -58,6 +60,7 @@ def test_mac(
         num_persist_mem_tokens = num_persist_mem_tokens,
         num_longterm_mem_tokens = num_longterm_mem_tokens,
         segment_len = 128,
+        neural_mem_gate_attn_output = neural_mem_gate_attn_output
     )
 
     x = torch.randint(0, 256, (1, 1023))
