@@ -285,6 +285,50 @@ class SegmentedAttention(Module):
 
         return out, orig_v
 
+# Attention + Neural Memory gating configuration, as depicted in Figure 2
+
+class NeuralMemoryGatingWrapper(Module):
+    def __init__(
+        self,
+        dim,
+        attn: SegmentedAttention,
+        neural_mem: NeuralMemory | None = None
+    ):
+        super().__init__()
+        self.attn = attn
+        self.neural_mem = neural_mem
+        self.to_gates = nn.Linear(dim, dim) if exists(neural_mem) else None
+
+    def forward(
+        self,
+        seq,
+        *args,
+        **kwargs
+    ):
+        batch, seq_len = seq.shape[:2]
+        mem = self.neural_mem
+
+        if not exists(mem):
+            return self.attn(seq, *args, **kwargs), 0.
+
+        # initial retrieve, still should store first, it doesn't make sense not to, unless if all layers share the same neural memory
+
+        retrieved, first_kv_aux_loss = mem(seq, return_aux_kv_loss = True)
+
+        seq = seq + retrieved
+
+        # attention
+
+        attn_out, values = self.attn(seq, *args, **kwargs)
+
+        # another retrieve, but this time gate the attention output
+
+        retrieved, second_kv_aux_loss = mem(attn_out, return_aux_kv_loss = True)
+
+        attn_out = attn_out * self.to_gates(retrieved).sigmoid()
+
+        return (attn_out, values), (first_kv_aux_loss + second_kv_aux_loss)
+
 # MAC transformer
 
 class MemoryAsContextTransformer(Module):
@@ -328,7 +372,6 @@ class MemoryAsContextTransformer(Module):
 
         self.layers = ModuleList([])
 
-        self.neural_mem_layers = ModuleList([])
         self.neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
 
         layers = tuple(range(1, depth + 1))
@@ -343,7 +386,18 @@ class MemoryAsContextTransformer(Module):
         for layer in layers:
             is_first = layer == 1
 
-            # neural memory
+            # attention and feedforward
+
+            attn = SegmentedAttention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads,
+                segment_len = segment_len,
+                use_flex_attn = use_flex_attn,
+                accept_value_residual = not is_first,
+                num_longterm_mem_tokens = num_longterm_mem_tokens,
+                num_persist_mem_tokens = num_persist_mem_tokens
+            )
 
             mem = None
 
@@ -356,21 +410,10 @@ class MemoryAsContextTransformer(Module):
                     **neural_memory_kwargs
                 )
 
-                mem = init_hyper_conn(dim = dim, branch = mem)
-
-            self.neural_mem_layers.append(mem)
-
-            # attention and feedforward
-
-            attn = SegmentedAttention(
-                dim = dim,
-                dim_head = dim_head,
-                heads = heads,
-                segment_len = segment_len,
-                use_flex_attn = use_flex_attn,
-                accept_value_residual = not is_first,
-                num_longterm_mem_tokens = num_longterm_mem_tokens,
-                num_persist_mem_tokens = num_persist_mem_tokens
+            attn = NeuralMemoryGatingWrapper(
+                dim,
+                attn = attn,
+                neural_mem = mem,
             )
 
             ff = FeedForward(dim = dim, mult = ff_mult)
@@ -460,18 +503,16 @@ class MemoryAsContextTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for (attn, ff), maybe_neural_mem in zip(self.layers, self.neural_mem_layers):
+        for attn, ff in self.layers:
 
-            if exists(maybe_neural_mem):
-                x, aux_kv_loss = maybe_neural_mem(x, return_aux_kv_loss = True)
-                kv_recon_losses = kv_recon_losses + aux_kv_loss
-
-            x, values = attn(
+            (x, values), maybe_mem_kv_aux_loss = attn(
                 x,
                 value_residual = value_residual,
                 disable_flex_attn = disable_flex_attn,
                 flex_attn_fn = flex_attn_fn
             )
+
+            kv_recon_losses = kv_recon_losses + maybe_mem_kv_aux_loss
 
             value_residual = default(value_residual, values)
 
