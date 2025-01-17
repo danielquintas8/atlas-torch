@@ -227,9 +227,10 @@ class SegmentedAttention(Module):
         self,
         seq,
         value_residual = None,
-        flex_attn_fn: Callable | None = None
+        flex_attn_fn: Callable | None = None,
+        disable_flex_attn = False
     ):
-        if seq.is_cuda and self.use_flex_attn:
+        if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
             return self.forward_flex(seq, value_residual, flex_attn_fn)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -303,7 +304,8 @@ class MemoryAsContextTransformer(Module):
         num_residual_streams = 4,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
-        aux_kv_recon_loss_weight = 0.
+        aux_kv_recon_loss_weight = 0.,
+        use_flex_attn = False
     ):
         super().__init__()
 
@@ -336,6 +338,8 @@ class MemoryAsContextTransformer(Module):
 
         assert not (num_longterm_mem_tokens > 0 and len(neural_memory_layers) == 0), 'empty `neural_memory_layers` when longterm memory tokens are present'
 
+        # mem, attn, and feedforward layers
+
         for layer in layers:
             is_first = layer == 1
 
@@ -363,6 +367,7 @@ class MemoryAsContextTransformer(Module):
                 dim_head = dim_head,
                 heads = heads,
                 segment_len = segment_len,
+                use_flex_attn = use_flex_attn,
                 accept_value_residual = not is_first,
                 num_longterm_mem_tokens = num_longterm_mem_tokens,
                 num_persist_mem_tokens = num_persist_mem_tokens
@@ -386,11 +391,20 @@ class MemoryAsContextTransformer(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+        # flex attn related
+
+        assert not (use_flex_attn and not exists(flex_attention)), 'you need to be on the latest pytorch with a cuda device available'
+        self.use_flex_attn = use_flex_attn
+
+        self.segment_len = segment_len
+        self.num_persist_mem_tokens = num_persist_mem_tokens
+
     def forward(
         self,
         x,
         return_loss = False,
-        return_loss_breakdown = False
+        return_loss_breakdown = False,
+        disable_flex_attn = False
     ):
 
         if return_loss:
@@ -424,6 +438,17 @@ class MemoryAsContextTransformer(Module):
 
         x = x + pos_emb[:seq_len_with_mem]
 
+        # prep flex attention
+
+        use_flex_attn = x.is_cuda and self.use_flex_attn and not disable_flex_attn
+
+        flex_attn_fn = None
+
+        if use_flex_attn:
+            block_mask = create_mac_block_mask(seq_len, self.segment_len, self.num_persist_mem_tokens)
+
+            flex_attn_fn = partial(flex_attention, block_mask = block_mask)
+
         # value residual
 
         value_residual = None
@@ -442,7 +467,7 @@ class MemoryAsContextTransformer(Module):
                 x, aux_kv_loss = maybe_neural_mem(x, return_aux_kv_loss = True)
                 kv_recon_losses = kv_recon_losses + aux_kv_loss
 
-            x, values = attn(x, value_residual = value_residual)
+            x, values = attn(x, value_residual = value_residual, disable_flex_attn = disable_flex_attn, flex_attn_fn = flex_attn_fn)
 
             value_residual = default(value_residual, values)
 

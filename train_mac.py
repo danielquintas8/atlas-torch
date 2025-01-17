@@ -25,7 +25,7 @@ SHOULD_GENERATE = True
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
@@ -91,7 +91,7 @@ def base_decoding(
     sample_num_times = max(0, seq_len - prompt_seq_len)
 
     for _ in tqdm.tqdm(range(sample_num_times)):
-        logits = net(out)
+        logits = net(out, disable_flex_attn = True)
         logits = logits[:, -1]
 
         logits = min_p_filter(logits, min_p = min_p)
@@ -113,6 +113,7 @@ model = MemoryAsContextTransformer(
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_segment_len = WINDOW_SIZE // 2,
     aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
+    use_flex_attn = True,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
