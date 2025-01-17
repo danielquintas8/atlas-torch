@@ -24,8 +24,8 @@ def create_mac_block_mask(seq_len, window_size, persist_mem_len):
 
     def create_mac_mask(b, h, q_idx, kv_idx):
         is_persist_mem = kv_idx < persist_mem_len
-        causal_mask = q_idx >= (kv_idx - is_persist_mem)
-        block_diagonal = (q_idx // window_size) == ((kv_idx - is_persist_mem) // window_size)
+        causal_mask = q_idx >= (kv_idx - persist_mem_len)
+        block_diagonal = (q_idx // window_size) == ((kv_idx - persist_mem_len) // window_size)
         return is_persist_mem | (~is_persist_mem & (causal_mask & block_diagonal))
 
     block_mask = create_block_mask(create_mac_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len + persist_mem_len, _compile = True)
@@ -489,7 +489,7 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len_with_mem, self.segment_len, self.num_persist_mem_tokens)
+            block_mask = create_mac_block_mask(seq_len_with_mem, segment_len + num_longterm_mem_tokens, self.num_persist_mem_tokens)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # value residual

@@ -289,6 +289,8 @@ class NeuralMemory(Module):
 
         self.use_accelerated_scan = use_accelerated_scan
 
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
     def init_weights_and_momentum(self):
         params = TensorDict(dict(self.memory_model.named_parameters()))
 
@@ -306,6 +308,13 @@ class NeuralMemory(Module):
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
         return_aux_kv_loss = False
     ):
+        seq_len = seq.shape[-2]
+
+        # handle edge case
+
+        if seq_len < self.chunk_size:
+            past_weight, _ = past_state
+            return TensorDict(past_weight).clone().zero_(), self.zero
 
         seq = self.store_norm(seq)
 
@@ -425,12 +434,10 @@ class NeuralMemory(Module):
 
         last_update = updates.apply(lambda t: t[:, -1])
 
-        next_state = (curr_weights + last_update, next_momentum)
-
         if not return_aux_kv_loss:
-            return updates, next_state
+            return updates
 
-        return updates, next_state, aux_kv_recon_loss.mean()
+        return updates, aux_kv_recon_loss.mean()
 
     def retrieve_memories(
         self,
@@ -442,7 +449,8 @@ class NeuralMemory(Module):
 
         seq = self.retrieve_norm(seq)
 
-        assert seq_len >= chunk_size
+        if seq_len < self.chunk_size:
+            return self.init_empty_memory_embed(batch, seq_len)
 
         seq = seq[:, (chunk_size - 1):]
         curtailed_seq_len = seq.shape[-2]
@@ -524,7 +532,7 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        updates, next_memories, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
+        updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
 

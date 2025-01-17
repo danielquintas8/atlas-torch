@@ -24,18 +24,27 @@ GENERATE_LENGTH = 512
 SHOULD_GENERATE = True
 SEQ_LEN = 512
 
-PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+# neural memory related
+
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
 NEURAL_MEM_LAYERS = (2, 4)
 NEURAL_MEM_GATE_ATTN_OUTPUT = True
-USE_ACCELERATED_SCAN = True
 WINDOW_SIZE = 32
 KV_RECON_LOSS_WEIGHT = 0.
 LEARNED_MEM_MODEL_WEIGHTS = True
+
+# experiment related
+
+PROJECT_NAME = 'titans-mac-transformer'
 RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+
+# perf related
+
+USE_ACCELERATED_SCAN = True
+USE_FLEX_ATTN = True
 
 # wandb experiment tracker
 
@@ -116,6 +125,7 @@ model = MemoryAsContextTransformer(
     neural_memory_segment_len = WINDOW_SIZE // 2,
     neural_mem_gate_attn_output = NEURAL_MEM_GATE_ATTN_OUTPUT,
     aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
+    use_flex_attn = USE_FLEX_ATTN,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
