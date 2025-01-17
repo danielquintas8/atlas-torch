@@ -445,8 +445,7 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len, self.segment_len, self.num_persist_mem_tokens)
-
+            block_mask = create_mac_block_mask(seq_len_with_mem, self.segment_len, self.num_persist_mem_tokens)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # value residual
@@ -467,7 +466,12 @@ class MemoryAsContextTransformer(Module):
                 x, aux_kv_loss = maybe_neural_mem(x, return_aux_kv_loss = True)
                 kv_recon_losses = kv_recon_losses + aux_kv_loss
 
-            x, values = attn(x, value_residual = value_residual, disable_flex_attn = disable_flex_attn, flex_attn_fn = flex_attn_fn)
+            x, values = attn(
+                x,
+                value_residual = value_residual,
+                disable_flex_attn = disable_flex_attn,
+                flex_attn_fn = flex_attn_fn
+            )
 
             value_residual = default(value_residual, values)
 

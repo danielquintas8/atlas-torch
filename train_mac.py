@@ -113,7 +113,6 @@ model = MemoryAsContextTransformer(
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_segment_len = WINDOW_SIZE // 2,
     aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
-    use_flex_attn = True,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
