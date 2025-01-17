@@ -123,9 +123,12 @@ class MemoryMLP(Module):
 class MemoryAttention(Module):
     def __init__(
         self,
-        dim
+        dim,
+        scale = 8.
     ):
         super().__init__()
+        self.scale = scale
+
         self.weights = nn.ParameterList([
             nn.Parameter(torch.randn(dim, dim)), # queries
             nn.Parameter(torch.randn(dim, dim)), # keys
@@ -143,6 +146,7 @@ class MemoryAttention(Module):
 
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
+            scale = self.scale,
             is_causal = True
         )
 
@@ -174,6 +178,7 @@ class NeuralMemory(Module):
         default_step_transform_max_lr = 1e-2,
         pre_rmsnorm = True,
         post_rmsnorm = True,
+        learned_mem_model_weights = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         activation: Module | None = None,
@@ -211,6 +216,9 @@ class NeuralMemory(Module):
 
         if not exists(model):
             model = MemoryMLP(dim_head, **default_model_kwargs)
+
+        if not learned_mem_model_weights:
+            model.requires_grad_(False)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 

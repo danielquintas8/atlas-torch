@@ -9,7 +9,7 @@ from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from titans_pytorch.mac_transformer import MemoryAsContextTransformer
+from titans_pytorch import MemoryAsContextTransformer
 
 # constants
 
@@ -25,13 +25,14 @@ SHOULD_GENERATE = True
 SEQ_LEN = 512
 
 PROJECT_NAME = 'titans-mac-transformer'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
 NEURAL_MEM_LAYERS = (2, 4)
 WINDOW_SIZE = 32
 KV_RECON_LOSS_WEIGHT = 0.
+LEARNED_MEM_MODEL_WEIGHTS = True
 RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 
 # wandb experiment tracker
@@ -115,6 +116,7 @@ model = MemoryAsContextTransformer(
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
+        learned_mem_model_weights = LEARNED_MEM_MODEL_WEIGHTS,
         default_model_kwargs = dict(
             depth = NEURAL_MEMORY_DEPTH,
         )
