@@ -241,7 +241,6 @@ class SegmentedAttention(Module):
         batch, seq_len = seq.shape[:2]
 
         # auto pad to multiple
-        # todo - get rid of logic with flex attention
 
         seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len)
 
