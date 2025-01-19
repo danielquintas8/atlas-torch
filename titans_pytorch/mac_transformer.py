@@ -153,6 +153,7 @@ class SegmentedAttention(Module):
         self.num_longterm_mem_tokens = num_longterm_mem_tokens
 
         total_segment_len = segment_len + num_longterm_mem_tokens
+        self.total_segment_len = total_segment_len
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -209,7 +210,7 @@ class SegmentedAttention(Module):
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.segment_len, self.num_persist_mem_tokens)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
