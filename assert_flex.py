@@ -6,7 +6,8 @@ attn = SegmentedAttention(
     segment_len = 32,
     num_persist_mem_tokens = 1,
     num_longterm_mem_tokens = 1,
-    use_flex_attn = True
+    use_flex_attn = True,
+    sliding = False
 ).cuda()
 
 seq = torch.randn(1, 1019, 512).cuda()

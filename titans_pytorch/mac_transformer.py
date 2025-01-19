@@ -20,13 +20,21 @@ try:
 except ImportError:
     pass
 
-def create_mac_block_mask(seq_len, window_size, persist_mem_len):
+def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False):
 
-    def create_mac_mask(b, h, q_idx, kv_idx):
+    def create_mac_mask(_, __, q_idx, kv_idx):
         is_persist_mem = kv_idx < persist_mem_len
-        causal_mask = q_idx >= (kv_idx - persist_mem_len)
-        block_diagonal = (q_idx // window_size) == ((kv_idx - persist_mem_len) // window_size)
-        return is_persist_mem | (~is_persist_mem & (causal_mask & block_diagonal))
+        kv_without_mem = kv_idx - persist_mem_len
+        causal_mask = q_idx >= kv_without_mem
+
+        if not sliding:
+            block_diagonal = (q_idx // window_size) == (kv_without_mem // window_size)
+            causal_mask = causal_mask & block_diagonal
+        else:
+            sliding_mask = (q_idx - kv_without_mem) <= window_size
+            causal_mask = causal_mask & sliding_mask
+
+        return is_persist_mem | (~is_persist_mem & causal_mask)
 
     block_mask = create_block_mask(create_mac_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len + persist_mem_len, _compile = True)
     return block_mask
@@ -73,7 +81,12 @@ def identity(t):
 def round_up_multiple(seq, mult):
     return ceil(seq / mult) * mult
 
-def pad_and_segment_with_inverse(seq, segment_len):
+def pad_at_dim(t, pad, dim = -1, value = 0.):
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
+def pad_and_segment_with_inverse(seq, segment_len, fold_into_batch = True):
     batch, seq_len = seq.shape[:2]
 
     need_segment = seq_len >= segment_len
@@ -89,13 +102,15 @@ def pad_and_segment_with_inverse(seq, segment_len):
     if needs_pad:
         seq = F.pad(seq, (0, 0, 0, padding))
 
-    seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
+    if fold_into_batch:
+        seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
     def inverse(out):
-        out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
+        if fold_into_batch:
+            out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
 
         if needs_pad:
-            out = out[:, :-padding]
+            out = out[..., :-padding, :]
 
         return out
 
@@ -127,6 +142,7 @@ class SegmentedAttention(Module):
         num_longterm_mem_tokens = 0,
         dim_head = 64,
         heads = 8,
+        sliding = False,
         accept_value_residual = False,
         attend_kwargs: dict = dict(),
         use_flex_attn = False
@@ -154,6 +170,8 @@ class SegmentedAttention(Module):
 
         total_segment_len = segment_len + num_longterm_mem_tokens
         self.total_segment_len = total_segment_len
+
+        self.sliding = sliding # sliding window attn - doubt their non-sliding results being the best. local attention with overlapping windows is very strong
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -210,7 +228,7 @@ class SegmentedAttention(Module):
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
@@ -243,7 +261,7 @@ class SegmentedAttention(Module):
 
         # auto pad to multiple
 
-        seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len)
+        seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len, fold_into_batch = False)
 
         # attention
 
@@ -260,13 +278,44 @@ class SegmentedAttention(Module):
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
 
-        # take care of persistent memory key / values
-
-        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = seq.shape[0])
-
         # relative positions
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # fold
+
+        q, k, v = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = total_segment_len) for t in (q, k, v))
+
+        # maybe sliding for cpu
+
+        attend_kwargs = dict()
+
+        if self.sliding:
+            k, v = tuple(rearrange(t, '(b w) ... -> b w ...', b = batch) for t in (k, v))
+            k, v = tuple(pad_at_dim(t, (1, 0), value = 0., dim = 1) for t in (k, v))
+            k = cat((k[:, :-1], k[:, 1:]), dim = -2)
+            v = cat((v[:, :-1], v[:, 1:]), dim = -2)
+            k, v = tuple(rearrange(t, 'b w ... -> (b w) ...') for t in (k, v))
+
+            # take care of masking
+
+            idx = torch.arange(seq.shape[-2], device = seq.device)
+            q_idx = rearrange(idx, '(w n) -> w n', n = total_segment_len)
+            k_idx = pad_at_dim(q_idx, (1, 0), dim = 0, value = -1e4)
+            k_idx = cat((k_idx[:-1], k_idx[1:]), dim = -1)
+
+            q_idx = rearrange(q_idx, 'w i -> w i 1')
+            k_idx = rearrange(k_idx, 'w j -> w 1 j')
+
+            sliding_mask = (q_idx - k_idx) <= total_segment_len
+            sliding_mask = F.pad(sliding_mask, (self.num_persist_mem_tokens, 0), value = True)
+
+            sliding_mask = repeat(sliding_mask, 'w i j -> (b w) 1 i j', b = batch)
+            attend_kwargs.update(mask = sliding_mask)
+
+        # take care of persistent memory key / values
+
+        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
 
         # persistent memory
 
@@ -275,11 +324,13 @@ class SegmentedAttention(Module):
 
         # attention
 
-        out, _ = self.attend(q, k, v)
+        out, _ = self.attend(q, k, v, **attend_kwargs)
 
         out = self.merge_heads(out)
 
         out = self.to_out(out)
+
+        out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
 
         out = inverse_segment(out)
 
@@ -349,7 +400,8 @@ class MemoryAsContextTransformer(Module):
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
         aux_kv_recon_loss_weight = 0.,
-        use_flex_attn = False
+        use_flex_attn = False,
+        sliding_window_attn = False
     ):
         super().__init__()
 
@@ -365,6 +417,10 @@ class MemoryAsContextTransformer(Module):
         has_longterm_mems = num_longterm_mem_tokens > 0
 
         self.longterm_mems = nn.Parameter(torch.randn(num_longterm_mem_tokens, dim) * 0.02)
+
+        # maybe sliding window attn
+
+        self.sliding_window_attn = sliding_window_attn
 
         # hyper conection
 
@@ -396,7 +452,8 @@ class MemoryAsContextTransformer(Module):
                 use_flex_attn = use_flex_attn,
                 accept_value_residual = not is_first,
                 num_longterm_mem_tokens = num_longterm_mem_tokens,
-                num_persist_mem_tokens = num_persist_mem_tokens
+                num_persist_mem_tokens = num_persist_mem_tokens,
+                sliding = sliding_window_attn
             )
 
             mem = None
@@ -489,7 +546,7 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len_with_mem, segment_len + num_longterm_mem_tokens, self.num_persist_mem_tokens)
+            block_mask = create_mac_block_mask(seq_len_with_mem, segment_len + num_longterm_mem_tokens, self.num_persist_mem_tokens, self.sliding_window_attn)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # value residual
