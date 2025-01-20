@@ -6,6 +6,10 @@
 
 Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytorch. Will also contain some explorations into architectures beyond their simple 1-4 layer MLP for the neural memory module, if it works well to any degree.
 
+## Appreciation
+
+- [@sentialx](https://github.com/sentialx) for sharing his early experimental results with me
+
 ## Install
 
 ```bash
