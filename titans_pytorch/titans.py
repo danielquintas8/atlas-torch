@@ -18,7 +18,7 @@ from titans_pytorch.associative_scan import (
 )
 
 import einx
-from einops import rearrange, repeat, pack, unpack
+from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
 """
@@ -94,6 +94,37 @@ class MultiheadRMSNorm(Module):
 
     def forward(self, x):
         return self.rmsnorm(x) * (self.gamma + 1.)
+
+# attention pool
+
+class AttentionPool(Module):
+    def __init__(
+        self,
+        dim,
+        chunk_size
+    ):
+        """
+        taken from Enformer https://www.nature.com/articles/s41592-021-01252-x , in turn taken from somewhere else
+        """
+        super().__init__()
+        self.split_chunks = Rearrange('b (n c) d -> b n c d', c = chunk_size)
+        self.to_attn_logits = nn.Linear(dim, dim)
+
+        # default to average pool
+
+        nn.init.zeros_(self.to_attn_logits.weight)
+        nn.init.zeros_(self.to_attn_logits.bias)
+
+    def forward(
+        self,
+        x
+    ):
+        x = self.split_chunks(x)
+        attn_logits = self.to_attn_logits(x)
+
+        attn = attn_logits.softmax(dim = -2)
+
+        return reduce(x * attn, 'b n c d -> b n d', 'sum')
 
 # classes
 
@@ -224,6 +255,7 @@ class NeuralMemory(Module):
         default_step_transform_max_lr = 1e-2,
         per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
         max_mem_layer_modulation = 1e1, # max of 10.
+        attn_pool_chunks = False,
         pre_rmsnorm = True,
         post_rmsnorm = True,
         learned_mem_model_weights = True,
@@ -304,10 +336,17 @@ class NeuralMemory(Module):
         self.empty_memory_embed = nn.Parameter(torch.zeros(dim))
         nn.init.normal_(self.empty_memory_embed, std = 0.02)
 
+        # whether to use averaging of chunks, or attention pooling
+
+        if not attn_pool_chunks:
+            chunk_reduce_module = Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size)
+        else:
+            chunk_reduce_module = AttentionPool(dim, chunk_size = chunk_size)
+
         # learned adaptive learning rate and momentum
 
         self.to_momentum = Sequential(
-            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            chunk_reduce_module,
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
@@ -325,7 +364,7 @@ class NeuralMemory(Module):
         # per layer learning rate modulation
 
         self.to_layer_modulation = Sequential(
-            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            chunk_reduce_module,
             LinearNoBias(dim, heads * self.num_memory_parameter_tensors),
             Rearrange('b n (h w) -> w (b h) n', h = heads),
             nn.Sigmoid()
@@ -340,7 +379,7 @@ class NeuralMemory(Module):
         # weight decay factor
 
         self.to_decay_factor = Sequential(
-            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            chunk_reduce_module,
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )

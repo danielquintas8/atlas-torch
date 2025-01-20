@@ -11,12 +11,14 @@ def exists(v):
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
 @pytest.mark.parametrize('silu', (False, True))
 @pytest.mark.parametrize('learned_mem_model_weights', (False, True))
+@pytest.mark.parametrize('attn_pool_chunks', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 def test_titans(
     seq_len,
     silu,
     learned_mem_model_weights,
+    attn_pool_chunks,
     max_grad_norm,
     per_parameter_lr_modulation
 ):
@@ -24,6 +26,7 @@ def test_titans(
         dim = 384,
         chunk_size = 64,
         activation = nn.SiLU() if silu else None,
+        attn_pool_chunks = attn_pool_chunks,
         max_grad_norm = max_grad_norm,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
         learned_mem_model_weights = learned_mem_model_weights
