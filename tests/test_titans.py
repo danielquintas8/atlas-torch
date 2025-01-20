@@ -3,6 +3,10 @@ from torch import nn
 
 import pytest
 from titans_pytorch import NeuralMemory
+from titans_pytorch.mac_transformer import flex_attention, SegmentedAttention
+
+def exists(v):
+    return v is not None
 
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
 @pytest.mark.parametrize('silu', (False, True))
@@ -70,3 +74,26 @@ def test_mac(
 
     logits = transformer(x)
     assert logits.shape == (1, 1023, 256)
+
+@pytest.mark.parametrize('sliding', (True, False))
+def test_flex(
+    sliding
+):
+    if not (torch.cuda.is_available() and exists(flex_attention)):
+        pytest.skip()
+
+    attn = SegmentedAttention(
+        dim = 512,
+        segment_len = 32,
+        num_persist_mem_tokens = 1,
+        num_longterm_mem_tokens = 1,
+        use_flex_attn = True,
+        sliding = sliding
+    ).cuda()
+
+    seq = torch.randn(1, 1019, 512).cuda()
+
+    out_flex, _ = attn(seq)
+    out_non_flex, _ = attn(seq, disable_flex_attn = True)
+
+    assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
