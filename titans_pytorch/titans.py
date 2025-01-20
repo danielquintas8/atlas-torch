@@ -17,6 +17,7 @@ from titans_pytorch.associative_scan import (
     pad_at_dim
 )
 
+import einx
 from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
@@ -26,6 +27,7 @@ b - batch
 n - sequence
 d - feature dimension
 c - intra-chunk
+w - num memory network weight parameters
 """
 
 LinearNoBias = partial(Linear, bias = False)
@@ -220,6 +222,8 @@ class NeuralMemory(Module):
         store_memory_loss_fn: Callable = default_loss_fn,
         adaptive_step_transform: Callable | None = None,
         default_step_transform_max_lr = 1e-2,
+        per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
+        max_mem_layer_modulation = 1e1, # max of 10.
         pre_rmsnorm = True,
         post_rmsnorm = True,
         learned_mem_model_weights = True,
@@ -250,7 +254,7 @@ class NeuralMemory(Module):
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
         self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
 
-        self.retrieve_gate = nn.Sequential(
+        self.retrieve_gate = Sequential(
             LinearNoBias(dim, heads),
             Rearrange('b n h -> b h n 1'),
             nn.Sigmoid()
@@ -269,6 +273,8 @@ class NeuralMemory(Module):
         # the memory is the weights of the model
 
         self.memory_model = model
+
+        self.num_memory_parameter_tensors = len(set(model.parameters()))
 
         # the chunk size within the paper where adaptive step, momentum, weight decay are shared
 
@@ -299,15 +305,14 @@ class NeuralMemory(Module):
         nn.init.normal_(self.empty_memory_embed, std = 0.02)
 
         # learned adaptive learning rate and momentum
-        # todo - explore mlp layerwise learned lr / momentum
 
-        self.to_momentum = nn.Sequential(
+        self.to_momentum = Sequential(
             Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
 
-        self.to_adaptive_step = nn.Sequential(
+        self.to_adaptive_step = Sequential(
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n')
         )
@@ -317,13 +322,24 @@ class NeuralMemory(Module):
 
         self.adaptive_step_transform = adaptive_step_transform
 
+        # per layer learning rate modulation
+
+        self.to_layer_modulation = Sequential(
+            Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
+            LinearNoBias(dim, heads * self.num_memory_parameter_tensors),
+            Rearrange('b n (h w) -> w (b h) n', h = heads),
+            nn.Sigmoid()
+        ) if per_parameter_lr_modulation else None
+
+        self.max_mem_layer_modulation = max_mem_layer_modulation
+
         # allow for softclamp the gradient norms for storing memories
 
         self.max_grad_norm = max_grad_norm
 
         # weight decay factor
 
-        self.to_decay_factor = nn.Sequential(
+        self.to_decay_factor = Sequential(
             Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size),
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
@@ -387,6 +403,11 @@ class NeuralMemory(Module):
         adaptive_momentum = self.to_momentum(seq).sigmoid()
         decay_factor = self.to_decay_factor(seq).sigmoid()
 
+        need_layer_lr_mod = exists(self.to_layer_modulation)
+
+        if need_layer_lr_mod:
+            layer_lr_mod = self.to_layer_modulation(seq) * self.max_mem_layer_modulation
+
         # keys and values
 
         keys, values = self.to_keys_values(seq).chunk(2, dim = -1)
@@ -417,6 +438,11 @@ class NeuralMemory(Module):
         # restore batch and sequence dimension
 
         grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch))
+
+        # maybe per layer modulation
+
+        if need_layer_lr_mod:
+            grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
 
         # negative gradients, adaptive lr already applied as loss weight
 
@@ -469,7 +495,7 @@ class NeuralMemory(Module):
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            update = scan_fn(1. - decay_factor, momentum) # momentum is S / surprise in the paper
+            update = scan_fn(1. - decay_factor, momentum)
 
             updates[param_name] = inverse_pack(update)
             next_momentum[param_name] = inverse_pack(momentum)
@@ -579,7 +605,6 @@ class NeuralMemory(Module):
         updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
-
 
         retrieved = self.retrieve_memories(seq, past_weights + updates)
 

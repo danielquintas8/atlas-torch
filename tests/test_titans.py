@@ -8,17 +8,20 @@ from titans_pytorch import NeuralMemory
 @pytest.mark.parametrize('silu', (False, True))
 @pytest.mark.parametrize('learned_mem_model_weights', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
+@pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 def test_titans(
     seq_len,
     silu,
     learned_mem_model_weights,
     max_grad_norm,
+    per_parameter_lr_modulation
 ):
     mem = NeuralMemory(
         dim = 384,
         chunk_size = 64,
         activation = nn.SiLU() if silu else None,
         max_grad_norm = max_grad_norm,
+        per_parameter_lr_modulation = per_parameter_lr_modulation,
         learned_mem_model_weights = learned_mem_model_weights
     )
 
