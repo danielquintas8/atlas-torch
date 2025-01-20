@@ -5,10 +5,10 @@ import numpy as np
 
 import torch
 from torch import nn, Tensor
-from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from adam_atan2_pytorch import AdoptAtan2
 from titans_pytorch import MemoryAsContextTransformer
 
 # constants
@@ -34,6 +34,7 @@ NEURAL_MEM_GATE_ATTN_OUTPUT = True
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2 # set smaller for more granularity for learning rate / momentum etc
 SLIDING_WINDOWS = True
+STORE_ATTN_POOL_CHUNKS = True # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 KV_RECON_LOSS_WEIGHT = 0.
 LEARNED_MEM_MODEL_WEIGHTS = True
 
@@ -86,6 +87,7 @@ model = MemoryAsContextTransformer(
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
+        attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
         learned_mem_model_weights = LEARNED_MEM_MODEL_WEIGHTS,
         default_model_kwargs = dict(
@@ -122,11 +124,11 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 # optimizer
 
-optim = Adam(model.parameters(), lr=LEARNING_RATE)
+optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):

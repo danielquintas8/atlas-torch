@@ -45,6 +45,7 @@ Repository = "https://github.com/lucidrains/titans-pytorch"
 [project.optional-dependencies]
 
 examples = [
+    "adam-atan2-pytorch>=0.1.18",
     "wandb"
 ]
 
