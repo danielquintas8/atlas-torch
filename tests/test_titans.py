@@ -50,10 +50,12 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
+@pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
 @pytest.mark.parametrize('neural_mem_gate_attn_output', (False, True))
 def test_mac(
+    seq_len,
     num_persist_mem_tokens,
     num_longterm_mem_tokens,
     neural_mem_gate_attn_output
@@ -70,13 +72,15 @@ def test_mac(
         neural_mem_gate_attn_output = neural_mem_gate_attn_output
     )
 
-    x = torch.randint(0, 256, (1, 1023))
+    x = torch.randint(0, 256, (1, seq_len))
 
     logits = transformer(x)
-    assert logits.shape == (1, 1023, 256)
+    assert logits.shape == (1, seq_len, 256)
 
+@pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('sliding', (True, False))
 def test_flex(
+    seq_len,
     sliding
 ):
     if not (torch.cuda.is_available() and exists(flex_attention)):
@@ -91,7 +95,7 @@ def test_flex(
         sliding = sliding
     ).cuda()
 
-    seq = torch.randn(1, 1019, 512).cuda()
+    seq = torch.randn(1, seq_len, 512).cuda()
 
     out_flex, _ = attn(seq)
     out_non_flex, _ = attn(seq, disable_flex_attn = True)
