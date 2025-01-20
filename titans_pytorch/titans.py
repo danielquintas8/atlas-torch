@@ -44,6 +44,9 @@ def default(v, d):
 def identity(t):
     return t
 
+def pair(v):
+    return (v, v) if not isinstance(v, tuple) else v
+
 def round_down_multiple(seq, mult):
     return seq // mult * mult
 
@@ -290,7 +293,7 @@ class NeuralMemory(Module):
     def __init__(
         self,
         dim,
-        chunk_size = 1,
+        chunk_size: int | tuple[int, int] = 1,
         dim_head = None,
         heads = 1,
         model: Module | None = None,
@@ -312,6 +315,8 @@ class NeuralMemory(Module):
     ):
         super().__init__()
         dim_head = default(dim_head, dim)
+
+        self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
         # norms
 
@@ -379,6 +384,10 @@ class NeuralMemory(Module):
 
         self.empty_memory_embed = nn.Parameter(torch.zeros(dim))
         nn.init.normal_(self.empty_memory_embed, std = 0.02)
+
+        # `chunk_size` refers to chunk size used for storing to memory model weights
+
+        chunk_size = self.store_chunk_size
 
         # whether to use averaging of chunks, or attention pooling
 
@@ -451,11 +460,11 @@ class NeuralMemory(Module):
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
         return_aux_kv_loss = False
     ):
-        seq_len = seq.shape[-2]
+        seq_len, chunk_size = seq.shape[-2], self.store_chunk_size
 
         # handle edge case
 
-        if seq_len < self.chunk_size:
+        if seq_len < chunk_size:
             past_weight, _ = past_state
             return TensorDict(past_weight).clone().zero_(), self.zero
 
@@ -464,8 +473,7 @@ class NeuralMemory(Module):
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
 
-        seq_len, chunk_size = seq.shape[-2], self.chunk_size
-        round_down_seq_len = round_down_multiple(seq_len, self.chunk_size)
+        round_down_seq_len = round_down_multiple(seq_len, chunk_size)
 
         seq = seq[:, :round_down_seq_len]
 
@@ -597,12 +605,12 @@ class NeuralMemory(Module):
         seq,
         past_weights: dict[str, Tensor] | None = None,
     ):
-        chunk_size = self.chunk_size
+        chunk_size = self.retrieve_chunk_size
         batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
 
-        if seq_len < self.chunk_size:
+        if seq_len < chunk_size:
             return self.init_empty_memory_embed(batch, seq_len)
 
         seq = seq[:, (chunk_size - 1):]
@@ -674,7 +682,7 @@ class NeuralMemory(Module):
     ):
         batch, seq_len = seq.shape[:2]
 
-        if seq_len < self.chunk_size:
+        if seq_len < self.retrieve_chunk_size:
             out = self.init_empty_memory_embed(batch, seq_len)
 
             if not return_aux_kv_loss:

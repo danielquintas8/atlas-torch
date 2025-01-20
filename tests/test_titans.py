@@ -53,6 +53,19 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
+def test_retrieve_store_diff_seq():
+    mem = NeuralMemory(
+        dim = 384,
+        chunk_size = (64, 32),
+    )
+
+    retrieve_seq = torch.randn(2, 64 * 64, 384)
+    store_seq = torch.randn(2, 64 * 32, 384)
+
+    retrieved = mem(retrieve_seq, store_seq = store_seq)
+
+    assert retrieve_seq.shape == retrieved.shape
+
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
