@@ -528,7 +528,8 @@ class MemoryAsContextTransformer(Module):
         filter_fn: Callable = min_p_filter,
         filter_kwargs: dict = dict(
             min_p = 0.1,
-        )
+        ),
+        show_progress = True
     ):
         was_training = self.training
         self.eval()
@@ -536,7 +537,9 @@ class MemoryAsContextTransformer(Module):
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
-        for _ in tqdm.tqdm(range(sample_num_times)):
+        iter_wrap = tqdm.tqdm if show_progress else identity
+
+        for _ in iter_wrap(range(sample_num_times)):
             logits = self.forward(out, disable_flex_attn = True)
             logits = logits[:, -1]
 
