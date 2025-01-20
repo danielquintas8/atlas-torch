@@ -391,6 +391,8 @@ class NeuralMemory(Module):
 
         # whether to use averaging of chunks, or attention pooling
 
+        assert not (attn_pool_chunks and chunk_size == 1), '`attn_pool_chunks` cannot be set to True if `chunk_size` is set to 1'
+
         if not attn_pool_chunks:
             chunk_reduce_module = Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size)
         else:
