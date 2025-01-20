@@ -592,7 +592,12 @@ class NeuralMemory(Module):
         batch, seq_len = seq.shape[:2]
 
         if seq_len < self.chunk_size:
-            return self.init_empty_memory_embed(batch, seq_len)
+            out = self.init_empty_memory_embed(batch, seq_len)
+
+            if not return_aux_kv_loss:
+                return out
+
+            return out, self.zero
 
         if exists(past_state):
             past_state = tuple(TensorDict(d) for d in past_state)

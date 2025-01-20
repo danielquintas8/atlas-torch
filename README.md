@@ -51,7 +51,12 @@ transformer = MemoryAsContextTransformer(
 
 token_ids = torch.randint(0, 256, (1, 1023))
 
-logits = transformer(token_ids) # (1, 1023, 256)
+loss = transformer(token_ids, return_loss = True) # (1, 1023, 256)
+loss.backward()
+
+# after much training
+
+sampled = transformer.sample(token_ids[:, :4], 512)
 ```
 
 ## Experiments
