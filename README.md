@@ -83,12 +83,13 @@ $ python train_mac.py
 ```
 
 ```bibtex
-@software{Kyrylov_Accelerated_Scan_2024,
-    author  = {Kyrylov, Volodymyr},
-    doi     = {10.5281/zenodo.10600962},
-    title   = {Accelerated Scan},
-    version = {0.1.2},
-    year    = {2024}
+@article{Sun2024LearningT,
+    title   = {Learning to (Learn at Test Time): RNNs with Expressive Hidden States},
+    author  = {Yu Sun and Xinhao Li and Karan Dalal and Jiarui Xu and Arjun Vikram and Genghan Zhang and Yann Dubois and Xinlei Chen and Xiaolong Wang and Oluwasanmi Koyejo and Tatsunori Hashimoto and Carlos Guestrin},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2407.04620},
+    url     = {https://api.semanticscholar.org/CorpusID:271039606}
 }
 ```
 
@@ -111,17 +112,6 @@ $ python train_mac.py
 ```
 
 ```bibtex
-@article{Sun2024LearningT,
-    title   = {Learning to (Learn at Test Time): RNNs with Expressive Hidden States},
-    author  = {Yu Sun and Xinhao Li and Karan Dalal and Jiarui Xu and Arjun Vikram and Genghan Zhang and Yann Dubois and Xinlei Chen and Xiaolong Wang and Oluwasanmi Koyejo and Tatsunori Hashimoto and Carlos Guestrin},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2407.04620},
-    url     = {https://api.semanticscholar.org/CorpusID:271039606}
-}
-```
-
-```bibtex
 @article{Zhu2024HyperConnections,
     title   = {Hyper-Connections},
     author  = {Defa Zhu and Hongzhi Huang and Zihao Huang and Yutao Zeng and Yunyao Mao and Banggu Wu and Qiyang Min and Xun Zhou},
@@ -140,5 +130,15 @@ $ python train_mac.py
     year    = {2024},
     volume  = {abs/2410.17897},
     url     = {https://api.semanticscholar.org/CorpusID:273532030}
+}
+```
+
+```bibtex
+@software{Kyrylov_Accelerated_Scan_2024,
+    author  = {Kyrylov, Volodymyr},
+    doi     = {10.5281/zenodo.10600962},
+    title   = {Accelerated Scan},
+    version = {0.1.2},
+    year    = {2024}
 }
 ```
