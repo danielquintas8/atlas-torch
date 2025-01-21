@@ -66,6 +66,19 @@ def test_retrieve_store_diff_seq():
 
     assert retrieve_seq.shape == retrieved.shape
 
+def test_overriding_chunk_size():
+    mem = NeuralMemory(
+        dim = 384,
+        chunk_size = 64,
+    )
+
+    seq = torch.randn(2, 128 * 16, 384)
+    store_seq = torch.randn(2, 128 * 8, 384)
+
+    retrieved = mem(seq, store_seq, chunk_size = 16, store_chunk_size = 8)
+
+    assert seq.shape == retrieved.shape
+
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))

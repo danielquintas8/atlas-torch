@@ -99,7 +99,23 @@ class MultiheadRMSNorm(Module):
     def forward(self, x):
         return self.rmsnorm(x) * (self.gamma + 1.)
 
-# attention pool
+# chunk pooling
+
+class AveragePool(Module):
+    def __init__(
+        self,
+        chunk_size
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+
+    def forward(
+        self,
+        x,
+        chunk_size = None
+    ):
+        chunk_size = default(chunk_size, self.chunk_size)
+        return reduce(x, 'b (n c) d -> b n d', 'mean', c = chunk_size)
 
 class AttentionPool(Module):
     def __init__(
@@ -111,7 +127,7 @@ class AttentionPool(Module):
         taken from Enformer https://www.nature.com/articles/s41592-021-01252-x , in turn taken from somewhere else
         """
         super().__init__()
-        self.split_chunks = Rearrange('b (n c) d -> b n c d', c = chunk_size)
+        self.chunk_size = chunk_size
         self.to_attn_logits = nn.Linear(dim, dim)
 
         # default to average pool
@@ -121,9 +137,13 @@ class AttentionPool(Module):
 
     def forward(
         self,
-        x
+        x,
+        chunk_size = None
     ):
-        x = self.split_chunks(x)
+        chunk_size = default(chunk_size, self.chunk_size)
+
+        x = rearrange(x, 'b (n c) d -> b n c d', c = chunk_size)
+
         attn_logits = self.to_attn_logits(x)
 
         attn = attn_logits.softmax(dim = -2)
@@ -394,14 +414,13 @@ class NeuralMemory(Module):
         assert not (attn_pool_chunks and chunk_size == 1), '`attn_pool_chunks` cannot be set to True if `chunk_size` is set to 1'
 
         if not attn_pool_chunks:
-            chunk_reduce_module = Reduce('b (n c) ... -> b n ...', 'mean', c = chunk_size)
+            self.reduce_to_chunk_rep = AveragePool(chunk_size = chunk_size)
         else:
-            chunk_reduce_module = AttentionPool(dim, chunk_size = chunk_size)
+            self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = chunk_size)
 
         # learned adaptive learning rate and momentum
 
         self.to_momentum = Sequential(
-            chunk_reduce_module,
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
@@ -419,7 +438,6 @@ class NeuralMemory(Module):
         # per layer learning rate modulation
 
         self.to_layer_modulation = Sequential(
-            chunk_reduce_module,
             LinearNoBias(dim, heads * self.num_memory_parameter_tensors),
             Rearrange('b n (h w) -> w (b h) n', h = heads),
             nn.Sigmoid()
@@ -434,7 +452,6 @@ class NeuralMemory(Module):
         # weight decay factor
 
         self.to_decay_factor = Sequential(
-            chunk_reduce_module,
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
@@ -460,9 +477,10 @@ class NeuralMemory(Module):
         self,
         seq,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
-        return_aux_kv_loss = False
+        return_aux_kv_loss = False,
+        chunk_size = None
     ):
-        seq_len, chunk_size = seq.shape[-2], self.store_chunk_size
+        seq_len, chunk_size = seq.shape[-2], default(chunk_size, self.store_chunk_size)
 
         # handle edge case
 
@@ -488,18 +506,20 @@ class NeuralMemory(Module):
 
         curr_weights = curr_weights + past_weights
 
-        # pack batch and sequence dimension
+        # derive learned hparams for optimization of memory network
 
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
-        adaptive_momentum = self.to_momentum(seq).sigmoid()
-        decay_factor = self.to_decay_factor(seq).sigmoid()
+        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
+
+        adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
+        decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
 
         need_layer_lr_mod = exists(self.to_layer_modulation)
 
         if need_layer_lr_mod:
-            layer_lr_mod = self.to_layer_modulation(seq) * self.max_mem_layer_modulation
+            layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
 
         # keys and values
 
@@ -606,8 +626,9 @@ class NeuralMemory(Module):
         self,
         seq,
         past_weights: dict[str, Tensor] | None = None,
+        chunk_size = None
     ):
-        chunk_size = self.retrieve_chunk_size
+        chunk_size = default(chunk_size, self.retrieve_chunk_size)
         batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
@@ -680,7 +701,9 @@ class NeuralMemory(Module):
         seq,
         store_seq = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        return_aux_kv_loss = False
+        return_aux_kv_loss = False,
+        chunk_size = None,
+        store_chunk_size = None
     ):
         batch, seq_len = seq.shape[:2]
 
@@ -699,12 +722,13 @@ class NeuralMemory(Module):
             past_state = self.init_weights_and_momentum()
 
         store_seq = default(store_seq, seq)
+        store_chunk_size = default(store_chunk_size, chunk_size)
 
-        updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, return_aux_kv_loss = True)
+        updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, chunk_size = store_chunk_size, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
 
-        retrieved = self.retrieve_memories(seq, past_weights + updates)
+        retrieved = self.retrieve_memories(seq, past_weights + updates, chunk_size = chunk_size)
 
         if not return_aux_kv_loss:
             return retrieved
