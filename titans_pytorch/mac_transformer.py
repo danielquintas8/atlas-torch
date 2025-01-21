@@ -1,12 +1,14 @@
 from __future__ import annotations
 from typing import Callable
+
 from math import ceil
 from functools import partial
+from collections import namedtuple
 
 import tqdm
 
 import torch
-from torch import nn, cat
+from torch import nn, stack, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
@@ -69,6 +71,8 @@ from titans_pytorch.titans import NeuralMemory
 
 LinearNoBias = partial(Linear, bias = False)
 
+AttnIntermediates = namedtuple('AttnIntermediates', ('value_residual', 'cached_key_values'))
+
 # helpers
 
 def exists(v):
@@ -79,6 +83,9 @@ def default(v, d):
 
 def identity(t):
     return t
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def round_up_multiple(seq, mult):
     return ceil(seq / mult) * mult
@@ -218,7 +225,8 @@ class SegmentedAttention(Module):
         seq,
         value_residual = None,
         flex_attn_fn: Callable | None = None,
-        output_gating = None
+        output_gating = None,
+        cache = None
     ):
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -239,6 +247,10 @@ class SegmentedAttention(Module):
         if exists(self.to_learned_v_mix):
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
+
+        # caching
+
+        next_cache = (k, v)
 
         # take care of persistent memory key / values
 
@@ -271,7 +283,7 @@ class SegmentedAttention(Module):
         if exists(output_gating):
             out = out * output_gating
 
-        return out, orig_v
+        return out, AttnIntermediates(orig_v, next_cache)
 
     def forward(
         self,
@@ -279,10 +291,11 @@ class SegmentedAttention(Module):
         value_residual = None,
         flex_attn_fn: Callable | None = None,
         disable_flex_attn = False,
-        output_gating = None
+        output_gating = None,
+        cache = None
     ):
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
-            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating)
+            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
@@ -309,6 +322,10 @@ class SegmentedAttention(Module):
         if exists(self.to_learned_v_mix):
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
+
+        # caching
+
+        next_cache = (k, v)
 
         # relative positions
 
@@ -369,7 +386,7 @@ class SegmentedAttention(Module):
         if exists(output_gating):
             out = out * output_gating
 
-        return out, orig_v
+        return out, AttnIntermediates(orig_v, next_cache)
 
 # MAC transformer
 
@@ -413,6 +430,7 @@ class MemoryAsContextTransformer(Module):
         # maybe sliding window attn
 
         self.sliding_window_attn = sliding_window_attn
+        self.attn_window_size = segment_len + num_longterm_mem_tokens
 
         # hyper conection
 
@@ -487,7 +505,6 @@ class MemoryAsContextTransformer(Module):
         assert not (use_flex_attn and not exists(flex_attention)), 'you need to be on the latest pytorch with a cuda device available'
         self.use_flex_attn = use_flex_attn
 
-        self.segment_len = segment_len
         self.num_persist_mem_tokens = num_persist_mem_tokens
 
     @torch.no_grad()
@@ -569,7 +586,7 @@ class MemoryAsContextTransformer(Module):
 
         # math
 
-        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens
+        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
 
         # token embedding
 
@@ -603,6 +620,11 @@ class MemoryAsContextTransformer(Module):
             block_mask = create_mac_block_mask(seq_len_with_mem, segment_len + num_longterm_mem_tokens, self.num_persist_mem_tokens, self.sliding_window_attn)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
+        # kv caching
+
+        cache = iter(default(cache, []))
+        next_kv_caches = []
+
         # value residual
 
         value_residual = None
@@ -620,6 +642,8 @@ class MemoryAsContextTransformer(Module):
             retrieved = None
             attn_out_gates = None
 
+            # maybe neural memory
+
             if exists(mem):
                 retrieved, mem_kv_aux_loss = mem(x, return_aux_kv_loss = True)
                 kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
@@ -631,15 +655,21 @@ class MemoryAsContextTransformer(Module):
 
             # attention
 
-            x, values = attn(
+            attn_cache = next(cache, None)
+            has_cache = exists(attn_cache)
+
+            x, (values, next_kv_cache) = attn(
                 x,
                 value_residual = value_residual,
                 disable_flex_attn = disable_flex_attn,
                 flex_attn_fn = flex_attn_fn,
-                output_gating = attn_out_gates
+                output_gating = attn_out_gates,
+                cache = attn_cache
             )
 
             value_residual = default(value_residual, values)
+
+            next_kv_caches.append(next_kv_cache)
 
             # feedforward
 
@@ -665,7 +695,16 @@ class MemoryAsContextTransformer(Module):
             if not return_cache:
                 return logits
 
-            return logits, cache
+            next_kv_caches = stack([stack(kv_cache) for kv_cache in next_kv_caches])
+
+            # handle kv cache length depending on local attention type
+
+            next_kv_caches = next_kv_caches[..., -attn_window_size:, :]
+
+            if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
+                next_kv_caches = None
+
+            return logits, next_kv_caches
 
         ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
 

@@ -107,7 +107,8 @@ def test_mac(
     logits = transformer(x)
     assert logits.shape == (1, seq_len, 256)
 
-def test_mac_sampling():
+@pytest.mark.parametrize('sliding', (False, True))
+def test_mac_sampling(sliding):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
         dim = 256,
@@ -115,6 +116,8 @@ def test_mac_sampling():
         segment_len = 32,
         num_persist_mem_tokens = 4,
         num_longterm_mem_tokens = 16,
+        sliding_window_attn = sliding,
+        neural_mem_gate_attn_output = False
     )
 
     ids = torch.randint(0, 256, (1, 1023))
