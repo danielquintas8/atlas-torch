@@ -217,7 +217,8 @@ class SegmentedAttention(Module):
         self,
         seq,
         value_residual = None,
-        flex_attn_fn: Callable | None = None
+        flex_attn_fn: Callable | None = None,
+        output_gating = None
     ):
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -267,6 +268,9 @@ class SegmentedAttention(Module):
 
         out = self.to_out(out)
 
+        if exists(output_gating):
+            out = out * output_gating
+
         return out, orig_v
 
     def forward(
@@ -274,10 +278,11 @@ class SegmentedAttention(Module):
         seq,
         value_residual = None,
         flex_attn_fn: Callable | None = None,
-        disable_flex_attn = False
+        disable_flex_attn = False,
+        output_gating = None
     ):
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
-            return self.forward_flex(seq, value_residual, flex_attn_fn)
+            return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
 
@@ -361,50 +366,10 @@ class SegmentedAttention(Module):
 
         out = inverse_segment(out)
 
+        if exists(output_gating):
+            out = out * output_gating
+
         return out, orig_v
-
-# Attention + Neural Memory gating configuration, as depicted in Figure 2
-
-class NeuralMemoryGatingWrapper(Module):
-    def __init__(
-        self,
-        dim,
-        attn: SegmentedAttention,
-        neural_mem: NeuralMemory | None = None,
-        gate_attn_output = True
-    ):
-        super().__init__()
-        self.attn = attn
-        self.neural_mem = neural_mem
-        self.gate_attn_output = gate_attn_output
-
-    def forward(
-        self,
-        seq,
-        *args,
-        **kwargs
-    ):
-        batch, seq_len = seq.shape[:2]
-        mem = self.neural_mem
-
-        if not exists(mem):
-            return self.attn(seq, *args, **kwargs), 0.
-
-        # initial retrieve, still should store first, it doesn't make sense not to, unless if all layers share the same neural memory
-
-        retrieved, kv_aux_loss = mem(seq, return_aux_kv_loss = True)
-
-        if not self.gate_attn_output:
-            seq = seq + retrieved
-
-        # attention
-
-        attn_out, values = self.attn(seq, *args, **kwargs)
-
-        if self.gate_attn_output:
-            attn_out = attn_out * retrieved.sigmoid()
-
-        return (attn_out, values), kv_aux_loss
 
 # MAC transformer
 
@@ -494,16 +459,10 @@ class MemoryAsContextTransformer(Module):
                     **neural_memory_kwargs
                 )
 
-            attn = NeuralMemoryGatingWrapper(
-                dim,
-                attn = attn,
-                neural_mem = mem,
-                gate_attn_output = neural_mem_gate_attn_output
-            )
-
             ff = FeedForward(dim = dim, mult = ff_mult)
 
             self.layers.append(ModuleList([
+                init_hyper_conn(dim = dim, branch = mem, add_branch_out_to_residual = not neural_mem_gate_attn_output) if exists(mem) else None,
                 init_hyper_conn(dim = dim, branch = attn),
                 init_hyper_conn(dim = dim, branch = ff)
             ]))
@@ -511,6 +470,10 @@ class MemoryAsContextTransformer(Module):
         self.norm = nn.RMSNorm(dim)
 
         self.to_logits = LinearNoBias(dim, num_tokens)
+
+        # whether to gate the attention output with the retrieved memories
+
+        self.gate_attn_output = neural_mem_gate_attn_output
 
         # auxiliary loss on kv recon
 
@@ -652,18 +615,33 @@ class MemoryAsContextTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for attn, ff in self.layers:
+        for mem, attn, ff in self.layers:
 
-            (x, values), maybe_mem_kv_aux_loss = attn(
+            retrieved = None
+            attn_out_gates = None
+
+            if exists(mem):
+                retrieved, mem_kv_aux_loss = mem(x, return_aux_kv_loss = True)
+                kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
+
+                if self.gate_attn_output:
+                    attn_out_gates = retrieved.sigmoid()
+                else:
+                    seq = retrieved
+
+            # attention
+
+            x, values = attn(
                 x,
                 value_residual = value_residual,
                 disable_flex_attn = disable_flex_attn,
-                flex_attn_fn = flex_attn_fn
+                flex_attn_fn = flex_attn_fn,
+                output_gating = attn_out_gates
             )
 
-            kv_recon_losses = kv_recon_losses + maybe_mem_kv_aux_loss
-
             value_residual = default(value_residual, values)
+
+            # feedforward
 
             x = ff(x)
 
