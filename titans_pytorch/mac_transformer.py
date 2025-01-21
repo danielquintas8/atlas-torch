@@ -537,7 +537,8 @@ class MemoryAsContextTransformer(Module):
         filter_kwargs: dict = dict(
             min_p = 0.1,
         ),
-        show_progress = True
+        show_progress = True,
+        use_cache = False
     ):
         was_training = self.training
         self.eval()
@@ -547,8 +548,37 @@ class MemoryAsContextTransformer(Module):
 
         iter_wrap = tqdm.tqdm if show_progress else identity
 
+        # cache for axial pos, attention, and neural memory
+
+        cache = None
+        factorized_pos_emb = None
+
+        # precompute factorized pos emb
+
+        if use_cache:
+            round_up_seq_len = round_up_multiple(seq_len, self.segment_len)
+            longterm_mem_lens = (round_up_seq_len // self.segment_len) * self.num_longterm_mem_tokens
+            seq_len_with_mem = round_up_seq_len + longterm_mem_lens
+
+            axial_dims = self.axial_pos_emb.maybe_derive_outer_dim(seq_len_with_mem, (self.neural_memory_segment_len,))
+
+            factorized_pos_emb = self.axial_pos_emb(axial_dims, return_factorized = True)
+
+        # sample
+
         for _ in iter_wrap(range(sample_num_times)):
-            logits = self.forward(out, disable_flex_attn = True)
+
+            logits, next_cache = self.forward(
+                out,
+                disable_flex_attn = True,
+                cache = cache,
+                return_cache = True,
+                factorized_pos_emb = factorized_pos_emb
+            )
+
+            if use_cache:
+                cache = next_cache
+
             logits = logits[:, -1]
 
             logits = filter_fn(logits, **filter_kwargs)
@@ -565,7 +595,10 @@ class MemoryAsContextTransformer(Module):
         x,
         return_loss = False,
         return_loss_breakdown = False,
-        disable_flex_attn = False
+        disable_flex_attn = False,
+        cache = None,
+        return_cache = False,
+        factorized_pos_emb = None
     ):
 
         if return_loss:
@@ -593,7 +626,7 @@ class MemoryAsContextTransformer(Module):
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
 
-        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,))
+        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
 
         x = x + pos_emb
 
@@ -651,7 +684,10 @@ class MemoryAsContextTransformer(Module):
         logits = self.to_logits(x)
 
         if not return_loss:
-            return logits
+            if not return_cache:
+                return logits
+
+            return logits, cache
 
         ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
 

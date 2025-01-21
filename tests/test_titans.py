@@ -3,7 +3,7 @@ from torch import nn
 
 import pytest
 from titans_pytorch import NeuralMemory
-from titans_pytorch.mac_transformer import flex_attention, SegmentedAttention
+from titans_pytorch.mac_transformer import flex_attention, SegmentedAttention, MemoryAsContextTransformer
 
 def exists(v):
     return v is not None
@@ -92,8 +92,6 @@ def test_mac(
     num_longterm_mem_tokens,
     neural_mem_gate_attn_output
 ):
-    from titans_pytorch.mac_transformer import MemoryAsContextTransformer
-
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
         dim = 256,
@@ -108,6 +106,25 @@ def test_mac(
 
     logits = transformer(x)
     assert logits.shape == (1, seq_len, 256)
+
+def test_mac_sampling():
+    transformer = MemoryAsContextTransformer(
+        num_tokens = 256,
+        dim = 256,
+        depth = 2,
+        segment_len = 32,
+        num_persist_mem_tokens = 4,
+        num_longterm_mem_tokens = 16,
+    )
+
+    ids = torch.randint(0, 256, (1, 1023))
+
+    # after much training
+
+    sampled = transformer.sample(ids[:, :4], 53, use_cache = False, temperature = 0.)
+    sampled_with_cache = transformer.sample(ids[:, :4], 53, use_cache = True, temperature = 0.)
+
+    assert torch.allclose(sampled, sampled_with_cache)
 
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('sliding', (True, False))
