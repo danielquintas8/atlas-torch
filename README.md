@@ -100,3 +100,45 @@ $ python train_mac.py
     url     = {https://api.semanticscholar.org/CorpusID:274598177}
 }
 ```
+
+```bibtex
+@inproceedings{Nguyen2024TurningUT,
+    title   = {Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs},
+    author  = {Minh Nguyen and Andrew Baker and Clement Neo and Allen Roush and Andreas Kirsch and Ravid Shwartz-Ziv},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:270870613}
+}
+```
+
+```bibtex
+@article{Sun2024LearningT,
+    title   = {Learning to (Learn at Test Time): RNNs with Expressive Hidden States},
+    author  = {Yu Sun and Xinhao Li and Karan Dalal and Jiarui Xu and Arjun Vikram and Genghan Zhang and Yann Dubois and Xinlei Chen and Xiaolong Wang and Oluwasanmi Koyejo and Tatsunori Hashimoto and Carlos Guestrin},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2407.04620},
+    url     = {https://api.semanticscholar.org/CorpusID:271039606}
+}
+```
+
+```bibtex
+@article{Zhu2024HyperConnections,
+    title   = {Hyper-Connections},
+    author  = {Defa Zhu and Hongzhi Huang and Zihao Huang and Yutao Zeng and Yunyao Mao and Banggu Wu and Qiyang Min and Xun Zhou},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2409.19606},
+    url     = {https://api.semanticscholar.org/CorpusID:272987528}
+}
+```
+
+```bibtex
+@article{Zhou2024ValueRL,
+    title   = {Value Residual Learning For Alleviating Attention Concentration In Transformers},
+    author  = {Zhanchao Zhou and Tianyi Wu and Zhiyun Jiang and Zhenzhong Lan},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2410.17897},
+    url     = {https://api.semanticscholar.org/CorpusID:273532030}
+}
+```
