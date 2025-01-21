@@ -593,11 +593,9 @@ class MemoryAsContextTransformer(Module):
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
 
-        neural_mem_windows = ceil(seq_len_with_mem / neural_mem_segment_len)
+        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,))
 
-        pos_emb = self.axial_pos_emb((neural_mem_windows, neural_mem_segment_len), flatten = True)
-
-        x = x + pos_emb[:seq_len_with_mem]
+        x = x + pos_emb
 
         # prep flex attention
 

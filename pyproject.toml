@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.1.9"
+version = "0.1.10"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -26,7 +26,7 @@ classifiers=[
 
 dependencies = [
     "accelerated-scan>=0.2.0",
-    "axial_positional_embedding>=0.3.5",
+    "axial_positional_embedding>=0.3.6",
     "einops>=0.8.0",
     "einx>=0.3.0",
     "hyper-connections>=0.1.8",
