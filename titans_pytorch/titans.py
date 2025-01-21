@@ -462,11 +462,14 @@ class NeuralMemory(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
-    def init_weights_and_momentum(self):
+    def init_weights_and_momentum(self, zero_weights = False):
         params = TensorDict(dict(self.memory_model.named_parameters()))
 
-        init_weights = params.clone().zero_()
+        init_weights = params
         init_momentum = params.clone().zero_()
+
+        if zero_weights:
+            init_weights = params.clone().zero_()
 
         return init_weights, init_momentum
 
@@ -497,14 +500,10 @@ class NeuralMemory(Module):
 
         seq = seq[:, :round_down_seq_len]
 
-        # curr weights + past weights, in the case that the initial weights are learned
-
-        curr_weights = TensorDict(dict(self.memory_model.named_parameters()))
+        # get the weights of the memory network
 
         past_state = tuple(TensorDict(d) for d in past_state)
-        past_weights, past_momentum = past_state
-
-        curr_weights = curr_weights + past_weights
+        curr_weights, past_momentum = past_state
 
         # derive learned hparams for optimization of memory network
 
