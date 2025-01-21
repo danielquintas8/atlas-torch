@@ -323,6 +323,7 @@ class NeuralMemory(Module):
         per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
         max_mem_layer_modulation = 1e1, # max of 10.
         attn_pool_chunks = False,
+        momentum = True,
         pre_rmsnorm = True,
         post_rmsnorm = True,
         learned_mem_model_weights = True,
@@ -423,7 +424,7 @@ class NeuralMemory(Module):
         self.to_momentum = Sequential(
             LinearNoBias(dim, heads),
             Rearrange('b n h -> (b h) n 1')
-        )
+        ) if momentum else None
 
         self.to_adaptive_step = Sequential(
             LinearNoBias(dim, heads),
@@ -512,10 +513,13 @@ class NeuralMemory(Module):
 
         chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
 
-        adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
         decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
 
         need_layer_lr_mod = exists(self.to_layer_modulation)
+        has_momentum = exists(self.to_momentum)
+
+        if has_momentum:
+            adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
 
         if need_layer_lr_mod:
             layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
@@ -594,23 +598,29 @@ class NeuralMemory(Module):
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
-        next_momentum = TensorDict()
+        next_momentum = TensorDict() if has_momentum else None
         updates = TensorDict()
 
         for param_name, surprise in surprises.items():
 
             surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
 
+            update = surprise
+
             # derive momentum with associative scan - eq (10)
 
-            momentum = scan_fn(adaptive_momentum, surprise) # momentum is S / surprise in the paper
+            if has_momentum:
+                update = scan_fn(adaptive_momentum, surprise) # momentum is S / surprise in the paper
+                momentum = update
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            update = scan_fn(1. - decay_factor, momentum)
+            update = scan_fn(1. - decay_factor, update)
 
             updates[param_name] = inverse_pack(update)
-            next_momentum[param_name] = inverse_pack(momentum)
+
+            if has_momentum:
+                next_momentum[param_name] = inverse_pack(momentum)
 
         # compute the next weight per batch
 
