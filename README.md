@@ -24,8 +24,7 @@ from titans_pytorch import NeuralMemory
 
 mem = NeuralMemory(
     dim = 384,
-    chunk_size = 64,
-    pre_rmsnorm = True
+    chunk_size = 64
 ).cuda()
 
 seq = torch.randn(2, 1024, 384).cuda()
@@ -140,5 +139,17 @@ $ python train_mac.py
     title   = {Accelerated Scan},
     version = {0.1.2},
     year    = {2024}
+}
+```
+
+```bibtex
+@misc{wang2025testtimeregressionunifyingframework,
+    title   = {Test-time regression: a unifying framework for designing sequence models with associative memory},
+    author  = {Ke Alexander Wang and Jiaxin Shi and Emily B. Fox},
+    year    = {2025},
+    eprint  = {2501.12352},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url = {https://arxiv.org/abs/2501.12352},
 }
 ```
