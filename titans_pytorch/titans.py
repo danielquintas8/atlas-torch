@@ -44,6 +44,16 @@ def default(v, d):
 def xnor(x, y):
     return not (x ^ y)
 
+def safe_cat(inputs, dim = -2):
+    inputs = tuple(filter(exists, inputs))
+
+    if len(inputs) == 0:
+        return None
+    elif len(inputs) == 1:
+        return inputs[0]
+
+    return cat(inputs, dim = dim)
+
 def identity(t):
     return t
 
@@ -756,20 +766,36 @@ class NeuralMemory(Module):
     def forward_inference(
         self,
         token: Tensor,
-        seq_index, # the index of the token in the sequence, starts at 0
-        state = None
+        seq_index = None, # the index of the token in the sequence, starts at 0
+        mem_model_state = None,
+        store_seq_cache = None
     ):
+        seq_index = default(seq_index, 0)
+        curr_seq_len = seq_index + 1
         batch = token.shape[0]
 
         if token.ndim == 2:
             token = rearrange(token, 'b d -> b 1 d')
 
-        if seq_index < self.chunk_size:
-            return self.init_empty_memory_embed(batch, 1)
+        # init memory model if needed
 
-        raise NotImplementedError
+        if not exists(mem_model_state):
+            mem_model_state = self.init_weights_and_momentum()
 
-        return token
+        # increment the sequence cache which is at most the chunk size
+
+        store_seq_cache = safe_cat((store_seq_cache, token), dim = -2)
+
+        # early return empty memory, when no memories are stored for steps < first chunk size
+
+        if curr_seq_len < self.chunk_size:
+            empty_mem = self.init_empty_memory_embed(batch, 1)
+
+            return empty_mem, store_seq_cache, mem_model_state
+
+        # store if necessary and retrieve from memory model
+
+        return token, None, mem_model_state
 
     def forward(
         self,

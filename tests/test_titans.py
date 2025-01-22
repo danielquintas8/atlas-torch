@@ -147,15 +147,19 @@ def test_neural_mem_inference(
 
     assert seq.shape == parallel_retrieved.shape
 
+    seq_index = None,
+    store_seq_cache = None
     neural_mem_state = None
+
     sequential_retrieved = []
 
     for ind, token in enumerate(seq.unbind(dim = 1)):
 
-        one_retrieved, neural_mem_state = mem.forward_inference(
+        one_retrieved, store_seq_cache, neural_mem_state = mem.forward_inference(
             token,
             seq_index = ind,
-            state = neural_mem_state
+            store_seq_cache = store_seq_cache,
+            mem_model_state = neural_mem_state
         )
 
         sequential_retrieved.append(one_retrieved)
