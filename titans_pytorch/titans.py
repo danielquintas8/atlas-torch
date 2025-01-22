@@ -324,15 +324,26 @@ class AssocScan(Module):
         super().__init__()
         self.use_accelerated = use_accelerated
 
-    def forward(self, gates, inputs, prev = None):
+    def forward(
+        self,
+        gates,
+        inputs,
+        prev = None,
+        remove_prev = None
+    ):
+        remove_prev = default(remove_prev, exists(prev))
 
         if exists(prev):
             inputs, _ = pack([prev, inputs], 'b * d')
             gates = pad_at_dim(gates, (1, 0), value = 1., dim = -2)
 
         if not self.use_accelerated:
-            _, outputs = associative_scan(binary_operator, (gates, inputs))
-            return outputs
+            _, out = associative_scan(binary_operator, (gates, inputs))
+
+            if remove_prev:
+                out = out[:, 1:]
+
+            return out
 
         from accelerated_scan.triton import scan as triton_scan
         from accelerated_scan.warp import scan as warp_scan
@@ -355,7 +366,12 @@ class AssocScan(Module):
             outputs = rearrange(outputs, 'b d n -> b n d')
             return outputs
 
-        return accelerate_scan_fn(gates, inputs)
+        out = accelerate_scan_fn(gates, inputs)
+
+        if remove_prev:
+            out = out[:, 1:]
+
+        return out
 
 # main neural memory
 

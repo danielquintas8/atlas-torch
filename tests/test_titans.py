@@ -229,5 +229,6 @@ def test_assoc_scan():
     first_half = scan(gates1, inputs1)
 
     second_half = scan(gates2, inputs2, prev = first_half[:, -1])
+    assert second_half.shape == inputs2.shape
 
     assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-6)
