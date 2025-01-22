@@ -115,8 +115,9 @@ def test_mac_sampling(sliding):
         depth = 2,
         segment_len = 32,
         num_persist_mem_tokens = 4,
-        num_longterm_mem_tokens = 16,
+        num_longterm_mem_tokens = 0,
         sliding_window_attn = sliding,
+        neural_memory_layers = (),
         neural_mem_gate_attn_output = False
     )
 

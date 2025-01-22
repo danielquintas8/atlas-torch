@@ -118,7 +118,7 @@ def pad_and_segment_with_inverse(seq, segment_len, fold_into_batch = True):
 
     def inverse(out):
         if fold_into_batch:
-            out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
+            out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
 
         if needs_pad:
             out = out[..., :-padding, :]
@@ -220,6 +220,68 @@ class SegmentedAttention(Module):
         self.segment_len = segment_len
         self.num_persist_mem_tokens = num_persist_mem_tokens
 
+    def forward_inference(
+        self,
+        token,
+        cache,
+        value_residual = None,
+        output_gating = None,
+    ):
+        batch = token.shape[0]
+
+        # attention
+
+        token = self.norm(token)
+
+        q, k, v = self.to_qkv(token).chunk(3, dim = -1)
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        # value residual
+
+        orig_v = v
+
+        if exists(self.to_learned_v_mix):
+            mix = self.to_learned_v_mix(token)
+            v = v.lerp(value_residual, mix)
+
+        # caching
+
+        ck, cv = cache
+        k = cat((ck, k), dim = -2)
+        v = cat((cv, v), dim = -2)
+
+        next_cache = (k, v)
+
+        # relative positions
+
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # fold
+
+        q, k, v = tuple(rearrange(t, 'b h n d -> b h n d') for t in (q, k, v))
+
+        # take care of persistent memory key / values
+
+        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
+
+        # persistent memory
+
+        k = cat((pmk, k), dim = -2)
+        v = cat((pmv, v), dim = -2)
+
+        # attention
+
+        out, _ = self.attend(q, k, v)
+
+        out = self.merge_heads(out)
+
+        out = self.to_out(out)
+
+        if exists(output_gating):
+            out = out * output_gating
+
+        return out, AttnIntermediates(orig_v, next_cache)
+
     def forward_flex(
         self,
         seq,
@@ -250,7 +312,7 @@ class SegmentedAttention(Module):
 
         # caching
 
-        next_cache = (k, v)
+        next_cache = tuple(map(inverse_segment, (k, v)))
 
         # take care of persistent memory key / values
 
@@ -294,6 +356,12 @@ class SegmentedAttention(Module):
         output_gating = None,
         cache = None
     ):
+        is_inferencing = exists(cache)
+
+        if is_inferencing:
+            assert seq.shape[-2] == 1
+            return self.forward_inference(seq, cache, value_residual, output_gating = output_gating)
+
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
             return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache)
 
@@ -325,7 +393,7 @@ class SegmentedAttention(Module):
 
         # caching
 
-        next_cache = (k, v)
+        next_cache = tuple(map(inverse_segment, (k, v)))
 
         # relative positions
 
@@ -622,6 +690,7 @@ class MemoryAsContextTransformer(Module):
 
         # kv caching
 
+        is_inferencing = exists(cache)
         cache = iter(default(cache, []))
         next_kv_caches = []
 
@@ -632,6 +701,11 @@ class MemoryAsContextTransformer(Module):
         # aux losses
 
         kv_recon_losses = self.zero
+
+        # when inferencing, only do one token at a time
+
+        if is_inferencing:
+            x = x[:, -1:]
 
         # expand and reduce streams for hyper connections
 
@@ -655,16 +729,13 @@ class MemoryAsContextTransformer(Module):
 
             # attention
 
-            attn_cache = next(cache, None)
-            has_cache = exists(attn_cache)
-
             x, (values, next_kv_cache) = attn(
                 x,
                 value_residual = value_residual,
                 disable_flex_attn = disable_flex_attn,
                 flex_attn_fn = flex_attn_fn,
                 output_gating = attn_out_gates,
-                cache = attn_cache
+                cache = next(cache, None)
             )
 
             value_residual = default(value_residual, values)
@@ -702,7 +773,7 @@ class MemoryAsContextTransformer(Module):
             next_kv_caches = next_kv_caches[..., -attn_window_size:, :]
 
             if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
-                next_kv_caches = None
+                next_kv_caches = next_kv_caches[..., 0:0, :]
 
             return logits, next_kv_caches
 
