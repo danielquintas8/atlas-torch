@@ -688,7 +688,7 @@ class NeuralMemory(Module):
     def retrieve_memories(
         self,
         seq,
-        past_weights: dict[str, Tensor] | None = None,
+        past_weights: dict[str, Tensor],
         chunk_size = None
     ):
         chunk_size = default(chunk_size, self.retrieve_chunk_size)
@@ -710,13 +710,7 @@ class NeuralMemory(Module):
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
-        curr_weights = TensorDict(dict(self.memory_model.named_parameters()))
-
-        if exists(past_weights):
-            past_weights = TensorDict(past_weights)
-            assert past_weights.keys() == curr_weights.keys()
-
-            curr_weights = curr_weights + past_weights
+        curr_weights = TensorDict(past_weights)
 
         # sequence Float['b n d'] to queries
 
@@ -768,7 +762,7 @@ class NeuralMemory(Module):
         token: Tensor,
         seq_index = None, # the index of the token in the sequence, starts at 0
         mem_model_state = None,
-        store_seq_cache = None
+        cache_store_seq = None
     ):
         seq_index = default(seq_index, 0)
         curr_seq_len = seq_index + 1
@@ -784,18 +778,32 @@ class NeuralMemory(Module):
 
         # increment the sequence cache which is at most the chunk size
 
-        store_seq_cache = safe_cat((store_seq_cache, token), dim = -2)
+        cache_store_seq = safe_cat((cache_store_seq, token), dim = -2)
 
         # early return empty memory, when no memories are stored for steps < first chunk size
 
         if curr_seq_len < self.chunk_size:
             empty_mem = self.init_empty_memory_embed(batch, 1)
 
-            return empty_mem, store_seq_cache, mem_model_state
+            return empty_mem, cache_store_seq, mem_model_state
 
-        # store if necessary and retrieve from memory model
+        # store if storage sequence cache hits the chunk size
 
-        return token, None, mem_model_state
+        if cache_store_seq.shape[-2] == self.chunk_size:
+            updates, _ = self.store_memories(cache_store_seq, mem_model_state)
+
+            past_weights, past_momentum = mem_model_state
+            mem_model_state = (past_weights + updates, past_momentum)
+
+            cache_store_seq = None
+
+        # retrieve
+
+        past_weights, _ = mem_model_state
+
+        retrieved = self.retrieve_memories(token, past_weights, chunk_size = 1)
+
+        return retrieved, cache_store_seq, mem_model_state
 
     def forward(
         self,

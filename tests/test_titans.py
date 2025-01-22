@@ -133,7 +133,7 @@ def test_mac_sampling(sliding):
 
     assert torch.allclose(sampled, sampled_with_cache)
 
-@pytest.mark.parametrize('seq_len', (2,))
+@pytest.mark.parametrize('seq_len', (2, 64))
 def test_neural_mem_inference(
     seq_len
 ):
@@ -147,24 +147,23 @@ def test_neural_mem_inference(
 
     assert seq.shape == parallel_retrieved.shape
 
-    seq_index = None,
-    store_seq_cache = None
-    neural_mem_state = None
-
+    mem_model_state = None
+    cache_store_seq = None
     sequential_retrieved = []
 
     for ind, token in enumerate(seq.unbind(dim = 1)):
 
-        one_retrieved, store_seq_cache, neural_mem_state = mem.forward_inference(
+        one_retrieved, cache_store_seq, neural_mem_state = mem.forward_inference(
             token,
             seq_index = ind,
-            store_seq_cache = store_seq_cache,
-            mem_model_state = neural_mem_state
+            cache_store_seq = cache_store_seq,
+            mem_model_state = mem_model_state
         )
 
         sequential_retrieved.append(one_retrieved)
 
-    sequential_retrieved = torch.stack(sequential_retrieved, dim = -2)
+    sequential_retrieved = torch.cat(sequential_retrieved, dim = -2)
+
     assert torch.allclose(parallel_retrieved, sequential_retrieved, atol = 1e-6)
 
 @pytest.mark.parametrize('seq_len', (1023, 17))
