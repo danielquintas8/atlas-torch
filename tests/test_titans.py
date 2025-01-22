@@ -133,6 +133,36 @@ def test_mac_sampling(sliding):
 
     assert torch.allclose(sampled, sampled_with_cache)
 
+@pytest.mark.parametrize('seq_len', (2,))
+def test_neural_mem_inference(
+    seq_len
+):
+    mem = NeuralMemory(
+        dim = 384,
+        chunk_size = 64,
+    )
+
+    seq = torch.randn(2, seq_len, 384)
+    parallel_retrieved = mem(seq)
+
+    assert seq.shape == parallel_retrieved.shape
+
+    neural_mem_state = None
+    sequential_retrieved = []
+
+    for ind, token in enumerate(seq.unbind(dim = 1)):
+
+        one_retrieved, neural_mem_state = mem.forward_inference(
+            token,
+            seq_index = ind,
+            state = neural_mem_state
+        )
+
+        sequential_retrieved.append(one_retrieved)
+
+    sequential_retrieved = torch.stack(sequential_retrieved, dim = -2)
+    assert torch.allclose(parallel_retrieved, sequential_retrieved, atol = 1e-6)
+
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('sliding', (True, False))
 def test_flex(

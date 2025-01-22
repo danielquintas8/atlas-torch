@@ -753,6 +753,24 @@ class NeuralMemory(Module):
 
         return values[:, :seq_len]
 
+    def forward_inference(
+        self,
+        token: Tensor,
+        seq_index, # the index of the token in the sequence, starts at 0
+        state = None
+    ):
+        batch = token.shape[0]
+
+        if token.ndim == 2:
+            token = rearrange(token, 'b d -> b 1 d')
+
+        if seq_index < self.chunk_size:
+            return self.init_empty_memory_embed(batch, 1)
+
+        raise NotImplementedError
+
+        return token
+
     def forward(
         self,
         seq,
