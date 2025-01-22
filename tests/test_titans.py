@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+torch.set_default_dtype(torch.float64)
 
 import pytest
 from titans_pytorch import NeuralMemory
@@ -167,7 +168,7 @@ def test_neural_mem_inference(
 
     sequential_retrieved = torch.cat(sequential_retrieved, dim = -2)
 
-    assert torch.allclose(parallel_retrieved, sequential_retrieved, atol = 1e-5)
+    assert torch.allclose(parallel_retrieved, sequential_retrieved, atol = 1e-6)
 
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('sliding', (True, False))
@@ -196,7 +197,6 @@ def test_flex(
 
 def test_assoc_scan():
     from titans_pytorch.titans import AssocScan
-    import torch.nn.functional as F
 
     scan = AssocScan()
 
