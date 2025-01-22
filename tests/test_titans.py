@@ -153,7 +153,7 @@ def test_neural_mem_inference(
 
     for ind, token in enumerate(seq.unbind(dim = 1)):
 
-        one_retrieved, cache_store_seq, neural_mem_state = mem.forward_inference(
+        one_retrieved, cache_store_seq, mem_model_state = mem.forward_inference(
             token,
             seq_index = ind,
             cache_store_seq = cache_store_seq,
