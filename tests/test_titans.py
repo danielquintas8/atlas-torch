@@ -193,3 +193,26 @@ def test_flex(
     out_non_flex, _ = attn(seq, disable_flex_attn = True)
 
     assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
+
+def test_assoc_scan():
+    from titans_pytorch.titans import AssocScan
+    import torch.nn.functional as F
+
+    scan = AssocScan()
+
+    seq_len = 128
+    mid_point = seq_len // 2
+
+    gates = torch.ones(2, seq_len, 512)
+    inputs = torch.randn(2, seq_len, 512)
+
+    output = scan(gates, inputs)
+
+    gates1, gates2 = gates[:, :mid_point], gates[:, mid_point:]
+    inputs1, inputs2 = inputs[:, :mid_point], inputs[:, mid_point:]
+
+    first_half = scan(gates1, inputs1)
+
+    second_half = scan(gates2, inputs2, prev = first_half[:, -1])
+
+    assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-6)
