@@ -41,6 +41,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def xnor(x, y):
+    return not (x ^ y)
+
 def identity(t):
     return t
 
@@ -366,6 +369,7 @@ class NeuralMemory(Module):
         pre_rmsnorm = True,
         post_rmsnorm = True,
         qk_rmsnorm = False,
+        accept_value_residual = False,
         learned_mem_model_weights = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
@@ -399,7 +403,7 @@ class NeuralMemory(Module):
 
         self.heads = heads
 
-        self.split_heads = Rearrange('b n (h d) -> (b h) n d', h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
         self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
 
@@ -447,6 +451,14 @@ class NeuralMemory(Module):
 
         self.to_keys_values = Sequential(LinearNoBias(dim, dim_inner * 2), activation)
         self.store_memory_loss_fn = store_memory_loss_fn
+
+        # value residual learning
+
+        self.learned_value_residual = Sequential(
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> b h n 1'),
+            nn.Sigmoid()
+        ) if accept_value_residual else None
 
         # empty memory embed
 
@@ -529,8 +541,11 @@ class NeuralMemory(Module):
         seq,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
         return_aux_kv_loss = False,
-        chunk_size = None
+        chunk_size = None,
+        value_residual = None
     ):
+        assert xnor(exists(value_residual), exists(self.learned_value_residual))
+
         seq_len, chunk_size = seq.shape[-2], default(chunk_size, self.store_chunk_size)
 
         # handle edge case
@@ -585,9 +600,17 @@ class NeuralMemory(Module):
 
         keys = self.k_norm(keys)
 
+        # maybe value residual learning
+
+        orig_values = values
+
+        if exists(self.learned_value_residual):
+            mix = self.learned_value_residual(seq)
+            values = values.lerp(value_residual, mix)
+
         # take care of chunking
 
-        keys, values = tuple(rearrange(t, 'b (n c) d -> (b n) c d', c = chunk_size) for t in (keys, values))
+        keys, values = tuple(rearrange(t, 'b h (n c) d -> (b h n) c d', c = chunk_size) for t in (keys, values))
 
         adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = chunk_size)
 
@@ -645,10 +668,12 @@ class NeuralMemory(Module):
 
         last_update = updates.apply(lambda t: t[:, -1])
 
-        if not return_aux_kv_loss:
-            return updates
+        output = (updates, orig_values)
 
-        return updates, aux_kv_recon_loss.mean()
+        if not return_aux_kv_loss:
+            return output
+
+        return output, aux_kv_recon_loss.mean()
 
     def retrieve_memories(
         self,
@@ -698,7 +723,7 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
-        queries = rearrange(queries, 'b (n c) d -> (b n) c d', c = chunk_size)
+        queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
         # forward functional call
 
@@ -735,7 +760,8 @@ class NeuralMemory(Module):
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_aux_kv_loss = False,
         chunk_size = None,
-        store_chunk_size = None
+        store_chunk_size = None,
+        return_values = False
     ):
         batch, seq_len = seq.shape[:2]
 
@@ -756,13 +782,18 @@ class NeuralMemory(Module):
         store_seq = default(store_seq, seq)
         store_chunk_size = default(store_chunk_size, chunk_size)
 
-        updates, aux_kv_recon_loss = self.store_memories(store_seq, past_state, chunk_size = store_chunk_size, return_aux_kv_loss = True)
+        (updates, values), aux_kv_recon_loss = self.store_memories(store_seq, past_state, chunk_size = store_chunk_size, return_aux_kv_loss = True)
 
         past_weights, _ = past_state
 
         retrieved = self.retrieve_memories(seq, past_weights + updates, chunk_size = chunk_size)
 
-        if not return_aux_kv_loss:
-            return retrieved
+        output = retrieved
 
-        return retrieved, aux_kv_recon_loss
+        if return_values:
+            output = (retrieved, values)
+
+        if not return_aux_kv_loss:
+            return output
+
+        return output, aux_kv_recon_loss
