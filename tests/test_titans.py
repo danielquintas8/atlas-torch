@@ -26,7 +26,6 @@ def torch_default_dtype(dtype):
 
 @pytest.mark.parametrize('seq_len', (32, 1024, 77))
 @pytest.mark.parametrize('silu', (False, True))
-@pytest.mark.parametrize('learned_mem_model_weights', (False, True))
 @pytest.mark.parametrize('attn_pool_chunks', (False, True))
 @pytest.mark.parametrize('momentum', (False, True))
 @pytest.mark.parametrize('qk_rmsnorm', (False, True))
@@ -35,7 +34,6 @@ def torch_default_dtype(dtype):
 def test_titans(
     seq_len,
     silu,
-    learned_mem_model_weights,
     attn_pool_chunks,
     momentum,
     qk_rmsnorm,
@@ -51,7 +49,6 @@ def test_titans(
         momentum = momentum,
         qk_rmsnorm = qk_rmsnorm,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
-        learned_mem_model_weights = learned_mem_model_weights
     )
 
     seq = torch.randn(2, seq_len, 384)
@@ -149,7 +146,7 @@ def test_mac_sampling(sliding):
 
     assert torch.allclose(sampled, sampled_with_cache)
 
-@pytest.mark.parametrize('seq_len', (2, 64))
+@pytest.mark.parametrize('seq_len', (2, 64, 256))
 @torch_default_dtype(torch.float64)
 def test_neural_mem_inference(
     seq_len
@@ -164,17 +161,15 @@ def test_neural_mem_inference(
 
     assert seq.shape == parallel_retrieved.shape
 
-    mem_model_state = None
-    cache_store_seq = None
+    state = None
     sequential_retrieved = []
 
     for ind, token in enumerate(seq.unbind(dim = 1)):
 
-        one_retrieved, cache_store_seq, mem_model_state = mem.forward_inference(
+        one_retrieved, state = mem.forward_inference(
             token,
             seq_index = ind,
-            cache_store_seq = cache_store_seq,
-            mem_model_state = mem_model_state
+            state = state,
         )
 
         sequential_retrieved.append(one_retrieved)
@@ -218,7 +213,7 @@ def test_assoc_scan():
     seq_len = 128
     mid_point = seq_len // 2
 
-    gates = torch.ones(2, seq_len, 512)
+    gates = torch.randn(2, seq_len, 512).sigmoid()
     inputs = torch.randn(2, seq_len, 512)
 
     output = scan(gates, inputs)

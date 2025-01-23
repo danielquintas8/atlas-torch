@@ -400,7 +400,6 @@ class NeuralMemory(Module):
         post_rmsnorm = True,
         qk_rmsnorm = False,
         accept_value_residual = False,
-        learned_mem_model_weights = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         activation: Module | None = None,
@@ -447,9 +446,6 @@ class NeuralMemory(Module):
 
         if not exists(model):
             model = MemoryMLP(dim_head, **default_model_kwargs)
-
-        if not learned_mem_model_weights:
-            model.requires_grad_(False)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 
@@ -552,16 +548,9 @@ class NeuralMemory(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
-    def init_weights_and_momentum(self, zero_weights = False):
-        params = TensorDict(dict(self.memory_model.named_parameters()))
-
-        init_weights = params
-        init_momentum = params.clone().zero_()
-
-        if zero_weights:
-            init_weights = params.clone().zero_()
-
-        return init_weights, init_momentum
+    def init_weights(self):
+        weights = TensorDict(dict(self.memory_model.named_parameters()))
+        return weights
 
     def init_empty_memory_embed(self, batch, seq_len):
         return repeat(self.empty_memory_embed, 'd -> b n d', b = batch, n = seq_len)
@@ -569,7 +558,8 @@ class NeuralMemory(Module):
     def store_memories(
         self,
         seq,
-        past_state: tuple[dict[str, Tensor], dict[str, Tensor]],
+        weights: dict[str, Tensor],
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_aux_kv_loss = False,
         chunk_size = None,
         value_residual = None
@@ -581,8 +571,7 @@ class NeuralMemory(Module):
         # handle edge case
 
         if seq_len < chunk_size:
-            past_weight, _ = past_state
-            return TensorDict(past_weight).clone().zero_(), self.zero
+            return TensorDict(weights).clone().zero_(), self.zero
 
         seq = self.store_norm(seq)
 
@@ -593,10 +582,9 @@ class NeuralMemory(Module):
 
         seq = seq[:, :round_down_seq_len]
 
-        # get the weights of the memory network
+        # weights of the memory network
 
-        past_state = tuple(TensorDict(d) for d in past_state)
-        curr_weights, past_momentum = past_state
+        weights = TensorDict(weights)
 
         # derive learned hparams for optimization of memory network
 
@@ -646,7 +634,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_kv_recon_loss = self.per_sample_grad_fn(dict(curr_weights), keys, adaptive_lr, values)
+        grads, aux_kv_recon_loss = self.per_sample_grad_fn(dict(weights), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
@@ -668,12 +656,23 @@ class NeuralMemory(Module):
 
         surprises = grads.apply(lambda t: -t)
 
+        # past states
+
+        if not exists(past_state):
+            empty_dict = {key: None for key in weights.keys()}
+            past_state = (empty_dict, empty_dict)
+
+        past_last_update, past_last_momentum = past_state
+
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
         next_momentum = TensorDict() if has_momentum else None
         updates = TensorDict()
 
-        for param_name, surprise in surprises.items():
+        next_last_update = TensorDict()
+        next_last_momentum = TensorDict()
+
+        for (param_name, surprise), (_, last_update), (_, last_momentum) in zip(surprises.items(), past_last_update.items(), past_last_momentum.items()):
 
             surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
 
@@ -682,23 +681,27 @@ class NeuralMemory(Module):
             # derive momentum with associative scan - eq (10)
 
             if has_momentum:
-                update = self.assoc_scan(adaptive_momentum, surprise) # momentum is S / surprise in the paper
+                update = self.assoc_scan(adaptive_momentum, surprise, prev = last_momentum) # momentum is S / surprise in the paper
                 momentum = update
+                next_last_momentum[param_name] = momentum[:, -1]
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            update = self.assoc_scan(1. - decay_factor, update)
+            update = self.assoc_scan(1. - decay_factor, update, prev = last_update)
+            next_last_update[param_name] = update[:, -1]
 
             updates[param_name] = inverse_pack(update)
 
             if has_momentum:
                 next_momentum[param_name] = inverse_pack(momentum)
 
-        # compute the next weight per batch
+        # compute next states for inference, or titans-xl like training
 
-        last_update = updates.apply(lambda t: t[:, -1])
+        next_state = (next_last_update, next_last_momentum)
 
-        output = (updates, orig_values)
+        # returns
+
+        output = (updates, next_state, orig_values)
 
         if not return_aux_kv_loss:
             return output
@@ -781,9 +784,16 @@ class NeuralMemory(Module):
         self,
         token: Tensor,
         seq_index = None, # the index of the token in the sequence, starts at 0
-        mem_model_state = None,
-        cache_store_seq = None
+        state = None,
     ):
+
+        # unpack previous state
+
+        if not exists(state):
+            state = (None, None, None)
+
+        cache_store_seq, past_states, updates = state
+
         seq_index = default(seq_index, 0)
         curr_seq_len = seq_index + 1
         batch = token.shape[0]
@@ -791,10 +801,9 @@ class NeuralMemory(Module):
         if token.ndim == 2:
             token = rearrange(token, 'b d -> b 1 d')
 
-        # init memory model if needed
+        # get memory model weights
 
-        if not exists(mem_model_state):
-            mem_model_state = self.init_weights_and_momentum()
+        weights = self.init_weights()
 
         # increment the sequence cache which is at most the chunk size
 
@@ -805,32 +814,43 @@ class NeuralMemory(Module):
         if curr_seq_len < self.chunk_size:
             empty_mem = self.init_empty_memory_embed(batch, 1)
 
-            return empty_mem, cache_store_seq, mem_model_state
+            return empty_mem, (cache_store_seq, past_states, updates)
 
         # store if storage sequence cache hits the chunk size
 
+        next_states = past_states
         store_seq_cache_len = cache_store_seq.shape[-2]
 
+        if not exists(updates):
+            updates = weights.clone().zero_()
+            updates = updates.apply(lambda t: repeat(t, '... -> b 1 ...', b = batch))
+
         if store_seq_cache_len == self.chunk_size:
-            updates, _ = self.store_memories(cache_store_seq, mem_model_state)
 
-            past_weights, past_momentum = mem_model_state
-            mem_model_state = (past_weights + updates, past_momentum)
+            next_updates, next_states, _ = self.store_memories(
+                cache_store_seq,
+                weights,
+                past_state = past_states
+            )
 
+            updates = next_updates
             cache_store_seq = None
 
         # retrieve
 
-        past_weights, _ = mem_model_state
+        retrieved = self.retrieve_memories(token, updates + weights, chunk_size = 1)
 
-        retrieved = self.retrieve_memories(token, past_weights, chunk_size = 1)
+        # next state tuple
 
-        return retrieved, cache_store_seq, mem_model_state
+        next_state = (cache_store_seq, next_states, updates)
+
+        return retrieved, next_state
 
     def forward(
         self,
         seq,
         store_seq = None,
+        mem_model_weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         return_aux_kv_loss = False,
         chunk_size = None,
@@ -847,20 +867,15 @@ class NeuralMemory(Module):
 
             return out, self.zero
 
-        if exists(past_state):
-            past_state = tuple(TensorDict(d) for d in past_state)
-
-        if not exists(past_state):
-            past_state = self.init_weights_and_momentum()
+        if not exists(mem_model_weights):
+            mem_model_weights = self.init_weights()
 
         store_seq = default(store_seq, seq)
         store_chunk_size = default(store_chunk_size, chunk_size)
 
-        (updates, values), aux_kv_recon_loss = self.store_memories(store_seq, past_state, chunk_size = store_chunk_size, return_aux_kv_loss = True)
+        (updates, next_state, values), aux_kv_recon_loss = self.store_memories(store_seq, mem_model_weights, chunk_size = store_chunk_size, return_aux_kv_loss = True)
 
-        past_weights, _ = past_state
-
-        retrieved = self.retrieve_memories(seq, past_weights + updates, chunk_size = chunk_size)
+        retrieved = self.retrieve_memories(seq, mem_model_weights + updates, chunk_size = chunk_size)
 
         output = retrieved
 
