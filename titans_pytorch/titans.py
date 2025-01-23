@@ -783,18 +783,16 @@ class NeuralMemory(Module):
     def forward_inference(
         self,
         token: Tensor,
-        seq_index = None, # the index of the token in the sequence, starts at 0
         state = None,
     ):
 
         # unpack previous state
 
         if not exists(state):
-            state = (None, None, None)
+            state = (0, None, None, None)
 
-        cache_store_seq, past_states, updates = state
+        seq_index, cache_store_seq, past_states, updates = state
 
-        seq_index = default(seq_index, 0)
         curr_seq_len = seq_index + 1
         batch = token.shape[0]
 
@@ -814,7 +812,7 @@ class NeuralMemory(Module):
         if curr_seq_len < self.chunk_size:
             empty_mem = self.init_empty_memory_embed(batch, 1)
 
-            return empty_mem, (cache_store_seq, past_states, updates)
+            return empty_mem, (curr_seq_len, cache_store_seq, past_states, updates)
 
         # store if storage sequence cache hits the chunk size
 
@@ -842,7 +840,7 @@ class NeuralMemory(Module):
 
         # next state tuple
 
-        next_state = (cache_store_seq, next_states, updates)
+        next_state = (curr_seq_len, cache_store_seq, next_states, updates)
 
         return retrieved, next_state
 

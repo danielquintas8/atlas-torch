@@ -168,11 +168,10 @@ def test_neural_mem_inference(
     state = None
     sequential_retrieved = []
 
-    for ind, token in enumerate(seq.unbind(dim = 1)):
+    for token in seq.unbind(dim = 1):
 
         one_retrieved, state = mem.forward_inference(
             token,
-            seq_index = ind,
             state = state,
         )
 

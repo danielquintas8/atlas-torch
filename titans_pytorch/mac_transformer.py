@@ -741,10 +741,10 @@ class MemoryAsContextTransformer(Module):
 
                     kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
 
+                    next_neural_mem_cache = (seq_len, None, None, None)
                 else:
                     retrieved, next_neural_mem_cache = mem.forward_inference(
                         mem_input,
-                        seq_index = seq_len - 1,
                         state = next(neural_mem_caches, None)
                     )
 
