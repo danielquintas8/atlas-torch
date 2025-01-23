@@ -124,7 +124,11 @@ def test_mac(
     assert logits.shape == (1, seq_len, 256)
 
 @pytest.mark.parametrize('sliding', (False, True))
-def test_mac_sampling(sliding):
+@pytest.mark.parametrize('mem_layers', ((), None, (4,)))
+def test_mac_sampling(
+    sliding,
+    mem_layers
+):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
         dim = 256,
@@ -133,7 +137,7 @@ def test_mac_sampling(sliding):
         num_persist_mem_tokens = 4,
         num_longterm_mem_tokens = 0,
         sliding_window_attn = sliding,
-        neural_memory_layers = (),
+        neural_memory_layers = mem_layers,
         neural_mem_gate_attn_output = False
     )
 

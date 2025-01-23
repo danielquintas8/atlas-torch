@@ -510,10 +510,7 @@ class MemoryAsContextTransformer(Module):
 
         layers = tuple(range(1, depth + 1))
 
-        if not exists(neural_memory_layers):
-            neural_memory_layers = layers if has_longterm_mems else ()
-
-        assert not (num_longterm_mem_tokens > 0 and len(neural_memory_layers) == 0), 'empty `neural_memory_layers` when longterm memory tokens are present'
+        neural_memory_layers = default(neural_memory_layers, layers)
 
         # mem, attn, and feedforward layers
 
@@ -535,9 +532,10 @@ class MemoryAsContextTransformer(Module):
             )
 
             mem = None
+            mem_hyper_conn = None
 
             if layer in neural_memory_layers:
-                assert has_longterm_mems, '`num_longterm_mem_tokens` must be greater than 0'
+                mem_hyper_conn = init_hyper_conn(dim = dim, add_branch_out_to_residual = not neural_mem_gate_attn_output)
 
                 mem = NeuralMemory(
                     dim = dim,
@@ -545,10 +543,12 @@ class MemoryAsContextTransformer(Module):
                     **neural_memory_kwargs
                 )
 
+
             ff = FeedForward(dim = dim, mult = ff_mult)
 
             self.layers.append(ModuleList([
-                init_hyper_conn(dim = dim, branch = mem, add_branch_out_to_residual = not neural_mem_gate_attn_output) if exists(mem) else None,
+                mem_hyper_conn,
+                mem,
                 init_hyper_conn(dim = dim, branch = attn),
                 init_hyper_conn(dim = dim, branch = ff)
             ]))
@@ -691,8 +691,18 @@ class MemoryAsContextTransformer(Module):
         # kv caching
 
         is_inferencing = exists(cache)
-        cache = iter(default(cache, []))
+        assert not (is_inferencing and self.num_longterm_mem_tokens > 0)
+
+        if not exists(cache):
+            cache = (None, None)
+
+        kv_caches, neural_mem_caches = cache
+
+        kv_caches = iter(default(kv_caches, []))
+        neural_mem_caches = iter(default(neural_mem_caches, []))
+
         next_kv_caches = []
+        next_neural_mem_caches = []
 
         # value residual
 
@@ -711,21 +721,37 @@ class MemoryAsContextTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for mem, attn, ff in self.layers:
+        for mem_hyper_conn, mem, attn, ff in self.layers:
 
             retrieved = None
             attn_out_gates = None
+            next_neural_mem_cache = None
 
             # maybe neural memory
 
             if exists(mem):
-                retrieved, mem_kv_aux_loss = mem(x, return_aux_kv_loss = True)
-                kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
+
+                mem_input, add_residual = mem_hyper_conn(x)
+
+                if not is_inferencing:
+                    retrieved, mem_kv_aux_loss = mem(
+                        mem_input,
+                        return_aux_kv_loss = True
+                    )
+
+                    kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
+
+                else:
+                    retrieved, next_neural_mem_cache = mem.forward_inference(
+                        mem_input,
+                        seq_index = seq_len - 1,
+                        state = next(neural_mem_caches, None)
+                    )
 
                 if self.gate_attn_output:
                     attn_out_gates = retrieved.sigmoid()
                 else:
-                    seq = retrieved
+                    x = add_residual(retrieved)
 
             # attention
 
@@ -735,12 +761,15 @@ class MemoryAsContextTransformer(Module):
                 disable_flex_attn = disable_flex_attn,
                 flex_attn_fn = flex_attn_fn,
                 output_gating = attn_out_gates,
-                cache = next(cache, None)
+                cache = next(kv_caches, None)
             )
 
             value_residual = default(value_residual, values)
 
+            # caches
+
             next_kv_caches.append(next_kv_cache)
+            next_neural_mem_caches.append(next_neural_mem_cache)
 
             # feedforward
 
@@ -775,7 +804,7 @@ class MemoryAsContextTransformer(Module):
             if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
                 next_kv_caches = next_kv_caches[..., 0:0, :]
 
-            return logits, next_kv_caches
+            return logits, (next_kv_caches, next_neural_mem_caches)
 
         ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
 
