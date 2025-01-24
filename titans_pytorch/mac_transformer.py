@@ -479,7 +479,7 @@ class MemoryAsContextTransformer(Module):
         depth,
         segment_len,
         neural_memory_segment_len = None,
-        neural_mem_gate_attn_output = True,
+        neural_mem_gate_attn_output = False,
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
         dim_head = 64,
