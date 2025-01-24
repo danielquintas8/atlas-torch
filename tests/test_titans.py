@@ -57,7 +57,7 @@ def test_titans(
     assert seq.shape == retrieved.shape
 
 def test_titans_attn_memory():
-    from titans_pytorch.neural_memory import MemoryAttention
+    from titans_pytorch.memory_models import MemoryAttention
 
     mem = NeuralMemory(
         dim = 384,
