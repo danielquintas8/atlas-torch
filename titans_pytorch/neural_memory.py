@@ -921,6 +921,9 @@ class NeuralMemory(Module):
 
             out = (out, next_store_state)
 
+            if return_values:
+                out = (*out, self.zero)
+
             if not return_aux_kv_loss:
                 return out
 
