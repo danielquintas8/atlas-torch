@@ -468,7 +468,12 @@ class NeuralMemory(Module):
             weighted_loss = loss * loss_weights
             return weighted_loss.sum(), weighted_loss.mean()
 
-        self.per_sample_grad_fn = vmap(grad(forward_and_loss, has_aux = True), in_dims = (None, 0, 0, 0))
+        # two functions
+
+        grad_fn = grad(forward_and_loss, has_aux = True)
+
+        self.per_sample_grad_fn = vmap(grad_fn, in_dims = (None, 0, 0, 0))
+        self.per_sample_grad_fn_expanded_weights = vmap(grad_fn, in_dims = (0,) * 4)
 
         # queries for retrieving from the model
 
@@ -561,6 +566,7 @@ class NeuralMemory(Module):
         seq,
         weights: dict[str, Tensor],
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
+        prev_layer_updates: dict[str, Tensor] | None = None,
         return_aux_kv_loss = False,
         chunk_size = None,
         value_residual = None
@@ -583,9 +589,24 @@ class NeuralMemory(Module):
 
         seq = seq[:, :round_down_seq_len]
 
+        # per sample grad function
+
+        per_sample_grad_fn = self.per_sample_grad_fn
+
         # weights of the memory network
 
         weights = TensorDict(weights)
+
+        # allow for neural memory of a previous layer and the past to produce gradients that become the weights of the current one generating the surprise
+        # think this is necessary otherwise the memory model is static (unless if paper is misunderstood)
+        # improvise (or perhaps correcting to) a solution
+
+        if exists(prev_layer_updates):
+            prev_layer_updates = TensorDict(weights)
+
+            weights = weights + prev_layer_updates
+
+            per_sample_grad_fn = self.per_sample_grad_fn_expanded_weights # the weights will now have a batch * chunk dimension
 
         # derive learned hparams for optimization of memory network
 
@@ -635,7 +656,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_kv_recon_loss = self.per_sample_grad_fn(dict(weights), keys, adaptive_lr, values)
+        grads, aux_kv_recon_loss = per_sample_grad_fn(dict(weights), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
