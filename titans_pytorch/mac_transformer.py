@@ -582,13 +582,8 @@ class MemoryAsContextTransformer(Module):
         self,
         seq_index
     ):
-        total_segment_len = self.attn_window_size
-
-        seq = seq_index + 1
-        seq -= int((seq % total_segment_len) == 0)
-        last_segment_len = round_down_multiple(seq, total_segment_len)
-        segment_seq = seq - last_segment_len
-        return (segment_seq - self.segment_len) > 0
+        total_segment_len, segment_len = self.attn_window_size, self.segment_len
+        return ((seq_index % total_segment_len + 1) - segment_len) > 0
 
     def seq_len_with_longterm_mem(
         self,
