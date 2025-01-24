@@ -718,9 +718,9 @@ class MemoryAsContextTransformer(Module):
         is_inferencing = exists(cache)
 
         if not exists(cache):
-            cache = (None, None)
+            cache = (seq_len_with_mem - 1, None, None)
 
-        kv_caches, neural_mem_caches = cache
+        inference_seq_index, kv_caches, neural_mem_caches = cache
 
         kv_caches = iter(default(kv_caches, []))
         neural_mem_caches = iter(default(neural_mem_caches, []))
@@ -739,7 +739,8 @@ class MemoryAsContextTransformer(Module):
         # when inferencing, only do one token at a time
 
         if is_inferencing:
-            x = x[:, -1:]
+            ind = inference_seq_index
+            x = x[:, ind:(ind + 1)]
 
         # expand and reduce streams for hyper connections
 
@@ -812,6 +813,17 @@ class MemoryAsContextTransformer(Module):
             if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
                 next_kv_caches = next_kv_caches[..., 0:0, :]
 
+            next_cache = (
+                inference_seq_index + 1,
+                next_kv_caches,
+                next_neural_mem_caches
+            )
+
+            is_longterm_mem = self.seq_index_is_longterm(inference_seq_index)
+
+            if is_inferencing and is_longterm_mem:
+                return None, next_cache
+
         # hyper connection reducing of streams
 
         x = self.reduce_streams(x)
@@ -824,7 +836,7 @@ class MemoryAsContextTransformer(Module):
 
             x, _ = inverse_pack_mems(x)
 
-            x = inverse_segment(x)
+            x = inverse_segment(x, remove_pad = False)
 
             x = x[:, :seq_len]
 
@@ -838,7 +850,7 @@ class MemoryAsContextTransformer(Module):
             if not return_cache:
                 return logits
 
-            return logits, (next_kv_caches, next_neural_mem_caches)
+            return logits, next_cache
 
         ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
 
