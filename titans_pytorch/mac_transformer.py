@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Callable
 
 from math import ceil
+from copy import deepcopy
 from functools import partial
 from collections import namedtuple
 
@@ -485,11 +486,13 @@ class MemoryAsContextTransformer(Module):
         heads = 8,
         ff_mult = 4,
         num_residual_streams = 4,
+        neural_memory_model: Module | None = None,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
         aux_kv_recon_loss_weight = 0.,
         use_flex_attn = False,
-        sliding_window_attn = False
+        sliding_window_attn = False,
+        weight_tie_memory_model = False
     ):
         super().__init__()
 
@@ -523,6 +526,15 @@ class MemoryAsContextTransformer(Module):
 
         neural_memory_layers = default(neural_memory_layers, layers)
 
+        # weight tying neural memory model
+
+        maybe_copy = deepcopy if not weight_tie_memory_model else identity
+
+        if weight_tie_memory_model:
+            assert exists(neural_memory_model), '`neural_memory_model` must be explicitly set'
+
+        self.weight_tie_memory_model = weight_tie_memory_model
+
         # mem, attn, and feedforward layers
 
         for layer in layers:
@@ -551,6 +563,7 @@ class MemoryAsContextTransformer(Module):
                 mem = NeuralMemory(
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
+                    model = maybe_copy(neural_memory_model),
                     **neural_memory_kwargs
                 )
 
@@ -683,7 +696,7 @@ class MemoryAsContextTransformer(Module):
 
         # math
 
-        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
+        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size, weight_tie_memory_model = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size, self.weight_tie_memory_model
 
         seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
 
@@ -736,6 +749,10 @@ class MemoryAsContextTransformer(Module):
         next_kv_caches = []
         next_neural_mem_caches = []
 
+        # weight tied neural memory
+
+        neural_memory_updates = None
+
         # value residual
 
         value_residual = None
@@ -769,7 +786,8 @@ class MemoryAsContextTransformer(Module):
                 if not is_inferencing:
                     (retrieved, next_neural_mem_cache), mem_kv_aux_loss = mem(
                         mem_input,
-                        return_aux_kv_loss = True
+                        return_aux_kv_loss = True,
+                        prev_layer_updates = neural_memory_updates
                     )
 
                     kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
@@ -777,8 +795,12 @@ class MemoryAsContextTransformer(Module):
                 else:
                     retrieved, next_neural_mem_cache = mem.forward_inference(
                         mem_input,
-                        state = next(neural_mem_caches, None)
+                        state = next(neural_mem_caches, None),
+                        prev_layer_updates = neural_memory_updates
                     )
+
+                if weight_tie_memory_model:
+                    neural_memory_updates = next_neural_mem_cache.updates
 
                 if self.gate_attn_output:
                     attn_out_gates = retrieved.sigmoid()
