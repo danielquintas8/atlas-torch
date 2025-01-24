@@ -9,7 +9,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from adam_atan2_pytorch import AdoptAtan2
-from titans_pytorch import MemoryAsContextTransformer
+
+from titans_pytorch import MemoryAsContextTransformer, MemoryMLP
 
 # constants
 
@@ -29,12 +30,13 @@ SEQ_LEN = 512
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
-NEURAL_MEM_LAYERS = (2, 4)
-NEURAL_MEM_GATE_ATTN_OUTPUT = True
+NEURAL_MEM_LAYERS = (2, 4, 6)   # layers 2, 4, 6 have neural memory, can add more
+NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2 # set smaller for more granularity for learning rate / momentum etc
 SLIDING_WINDOWS = True
+WEIGHT_TIE_MEMORY_MODEL = False  # set to have memory MLP shared across layers
 STORE_ATTN_POOL_CHUNKS = True # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 KV_RECON_LOSS_WEIGHT = 0.
 
@@ -84,6 +86,11 @@ model = MemoryAsContextTransformer(
     aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
+    weight_tie_memory_model = WEIGHT_TIE_MEMORY_MODEL,
+    neural_memory_model = MemoryMLP(
+        dim = 64,
+        depth = NEURAL_MEMORY_DEPTH
+    ),
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
