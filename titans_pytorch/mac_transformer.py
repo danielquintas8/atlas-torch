@@ -106,7 +106,11 @@ def pad_at_dim(t, pad, dim = -1, value = 0.):
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
-def pad_and_segment_with_inverse(seq, segment_len, fold_into_batch = True):
+def pad_and_segment_with_inverse(
+    seq,
+    segment_len,
+    fold_into_batch = True,
+):
     batch, seq_len = seq.shape[:2]
     next_seq_len_mult = round_up_multiple(seq_len, segment_len)
 
@@ -119,11 +123,15 @@ def pad_and_segment_with_inverse(seq, segment_len, fold_into_batch = True):
     if fold_into_batch:
         seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
-    def inverse(out, remove_pad = True):
+    shape = seq.shape
+
+    def inverse(out):
+        unchanged_shape = out.shape == shape
+
         if fold_into_batch:
             out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
 
-        if needs_pad and remove_pad:
+        if needs_pad and unchanged_shape:
             out = out[..., :-padding, :]
 
         return out
@@ -690,7 +698,7 @@ class MemoryAsContextTransformer(Module):
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
         x, inverse_pack_mems = pack_with_inverse((x, mems), 'b * d')
 
-        x = inverse_segment(x, remove_pad = False)
+        x = inverse_segment(x)
 
         # splice out unneeded tokens from padding for longterm mems
 
@@ -836,7 +844,7 @@ class MemoryAsContextTransformer(Module):
 
             x, _ = inverse_pack_mems(x)
 
-            x = inverse_segment(x, remove_pad = False)
+            x = inverse_segment(x)
 
             x = x[:, :seq_len]
 
