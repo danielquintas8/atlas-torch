@@ -124,18 +124,22 @@ def test_mac(
     assert logits.shape == (1, seq_len, 256)
 
 @pytest.mark.parametrize('sliding', (False, True))
-@pytest.mark.parametrize('mem_layers', ((), None, (4,)))
+@pytest.mark.parametrize('mem_layers', (()))
+@pytest.mark.parametrize('longterm_mems', (0, 4, 16))
+@pytest.mark.parametrize('prompt_len', (0, 4, 16))
 def test_mac_sampling(
     sliding,
-    mem_layers
+    mem_layers,
+    longterm_mems,
+    prompt_len
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
         dim = 256,
-        depth = 2,
+        depth = 4,
         segment_len = 32,
         num_persist_mem_tokens = 4,
-        num_longterm_mem_tokens = 0,
+        num_longterm_mem_tokens = longterm_mems,
         sliding_window_attn = sliding,
         neural_memory_layers = mem_layers,
         neural_mem_gate_attn_output = False
@@ -145,8 +149,10 @@ def test_mac_sampling(
 
     # after much training
 
-    sampled = transformer.sample(ids[:, :4], 53, use_cache = False, temperature = 0.)
-    sampled_with_cache = transformer.sample(ids[:, :4], 53, use_cache = True, temperature = 0.)
+    prompt = ids[:, :prompt_len]
+
+    sampled = transformer.sample(prompt, 53, use_cache = False, temperature = 0.)
+    sampled_with_cache = transformer.sample(prompt, 53, use_cache = True, temperature = 0.)
 
     assert torch.allclose(sampled, sampled_with_cache)
 
