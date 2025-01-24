@@ -822,7 +822,9 @@ class NeuralMemory(Module):
         self,
         token: Tensor,
         state = None,
-        prev_layer_updates: dict[str, Tensor] | None = None
+        prev_layer_updates: dict[str, Tensor] | None = None,
+        return_values = False,
+        value_residual = None,
     ):
 
         # unpack previous state
@@ -870,11 +872,12 @@ class NeuralMemory(Module):
 
         if store_seq_cache_len == self.chunk_size:
 
-            next_updates, next_states, _ = self.store_memories(
+            next_updates, next_states, values = self.store_memories(
                 cache_store_seq,
                 weights,
                 past_state = past_states,
                 prev_layer_updates = prev_layer_updates,
+                value_residual = value_residual
             )
 
             updates = next_updates
@@ -888,7 +891,12 @@ class NeuralMemory(Module):
 
         next_state = NeuralMemCache(curr_seq_len, cache_store_seq, next_states, updates)
 
-        return retrieved, next_state
+        output = (retrieved, next_state)
+
+        if return_values:
+            output = (*output, values)
+
+        return output
 
     def forward(
         self,
@@ -900,6 +908,7 @@ class NeuralMemory(Module):
         chunk_size = None,
         store_chunk_size = None,
         return_values = False,
+        value_residual = None,
         return_next_state = False,
         prev_layer_updates: dict[str, Tensor] | None = None
     ):
@@ -933,6 +942,7 @@ class NeuralMemory(Module):
             mem_model_weights,
             chunk_size = store_chunk_size,
             prev_layer_updates = prev_layer_updates,
+            value_residual = value_residual,
             return_aux_kv_loss = True
         )
 
