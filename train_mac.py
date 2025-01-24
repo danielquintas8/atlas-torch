@@ -37,7 +37,6 @@ NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2 # set smaller for more granularity for
 SLIDING_WINDOWS = True
 STORE_ATTN_POOL_CHUNKS = True # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 KV_RECON_LOSS_WEIGHT = 0.
-LEARNED_MEM_MODEL_WEIGHTS = True
 
 # experiment related
 
@@ -91,7 +90,6 @@ model = MemoryAsContextTransformer(
         attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
         momentum = NEURAL_MEM_MOMENTUM,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
-        learned_mem_model_weights = LEARNED_MEM_MODEL_WEIGHTS,
         default_model_kwargs = dict(
             depth = NEURAL_MEMORY_DEPTH,
         )
