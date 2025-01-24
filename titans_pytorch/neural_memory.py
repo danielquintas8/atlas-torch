@@ -822,6 +822,7 @@ class NeuralMemory(Module):
         self,
         token: Tensor,
         state = None,
+        prev_layer_updates: dict[str, Tensor] | None = None
     ):
 
         # unpack previous state
@@ -863,12 +864,17 @@ class NeuralMemory(Module):
         else:
             updates = updates.apply(lambda t: t[:, -1:])
 
+        if exists(prev_layer_updates):
+            prev_layer_updates = TensorDict(prev_layer_updates)
+            prev_layer_updates = prev_layer_updates.apply(lambda t: t[:, -1:])
+
         if store_seq_cache_len == self.chunk_size:
 
             next_updates, next_states, _ = self.store_memories(
                 cache_store_seq,
                 weights,
-                past_state = past_states
+                past_state = past_states,
+                prev_layer_updates = prev_layer_updates,
             )
 
             updates = next_updates
