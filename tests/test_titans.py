@@ -85,6 +85,34 @@ def test_retrieve_store_diff_seq():
 
     assert retrieve_seq.shape == retrieved.shape
 
+def test_weight_tied_mlp_neural_mem():
+    mem  = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 2
+    )
+
+    mem2 = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 2
+    )
+
+    mem3 = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 2
+    )
+
+    seq = torch.randn(2, 128, 384)
+
+    seq, cache = mem(seq)
+    seq, cache2 = mem2(seq, prev_layer_updates = cache.updates)
+    seq, cache3 = mem3(seq, prev_layer_updates = cache2.updates)
+
 def test_overriding_chunk_size():
     mem = NeuralMemory(
         dim = 384,

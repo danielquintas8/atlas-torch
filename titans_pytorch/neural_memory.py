@@ -3,6 +3,7 @@ from typing import Callable
 
 import math
 from functools import partial
+from collections import namedtuple
 
 import torch
 from torch import nn, cat, Tensor
@@ -32,6 +33,8 @@ w - num memory network weight parameters
 """
 
 LinearNoBias = partial(Linear, bias = False)
+
+NeuralMemCache = namedtuple('NeuralMemCache', ['seq', 'cache_store_segment', 'states', 'updates'])
 
 # functions
 
@@ -605,7 +608,7 @@ class NeuralMemory(Module):
         # improvise (or perhaps correcting to) a solution
 
         if exists(prev_layer_updates):
-            prev_layer_updates = TensorDict(weights)
+            prev_layer_updates = TensorDict(prev_layer_updates)
 
             weights = weights + prev_layer_updates
 
@@ -656,6 +659,11 @@ class NeuralMemory(Module):
         keys, values = tuple(rearrange(t, 'b h (n c) d -> (b h n) c d', c = chunk_size) for t in (keys, values))
 
         adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = chunk_size)
+
+        # flatten batch and time if surprise depends on previous layer memory model
+
+        if exists(prev_layer_updates):
+            weights = weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
@@ -737,7 +745,8 @@ class NeuralMemory(Module):
         self,
         seq,
         past_weights: dict[str, Tensor],
-        chunk_size = None
+        chunk_size = None,
+        prev_layer_updates: dict[str, Tensor] | None = None
     ):
         chunk_size = default(chunk_size, self.retrieve_chunk_size)
         batch, seq_len = seq.shape[:2]
@@ -759,6 +768,9 @@ class NeuralMemory(Module):
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
         curr_weights = TensorDict(past_weights)
+
+        if exists(prev_layer_updates):
+            curr_weights = curr_weights + TensorDict(prev_layer_updates)
 
         # sequence Float['b n d'] to queries
 
@@ -838,7 +850,7 @@ class NeuralMemory(Module):
         if curr_seq_len < self.chunk_size:
             empty_mem = self.init_empty_memory_embed(batch, 1)
 
-            return empty_mem, (curr_seq_len, cache_store_seq, past_states, updates)
+            return empty_mem, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
 
         # store if storage sequence cache hits the chunk size
 
@@ -848,6 +860,8 @@ class NeuralMemory(Module):
         if not exists(updates):
             updates = weights.clone().zero_()
             updates = updates.apply(lambda t: repeat(t, '... -> b 1 ...', b = batch))
+        else:
+            updates = updates.apply(lambda t: t[:, -1:])
 
         if store_seq_cache_len == self.chunk_size:
 
@@ -866,7 +880,7 @@ class NeuralMemory(Module):
 
         # next state tuple
 
-        next_state = (curr_seq_len, cache_store_seq, next_states, updates)
+        next_state = NeuralMemCache(curr_seq_len, cache_store_seq, next_states, updates)
 
         return retrieved, next_state
 
@@ -880,7 +894,8 @@ class NeuralMemory(Module):
         chunk_size = None,
         store_chunk_size = None,
         return_values = False,
-        return_next_state = False
+        return_next_state = False,
+        prev_layer_updates: dict[str, Tensor] | None = None
     ):
         batch, seq_len = seq.shape[:2]
 
@@ -899,15 +914,30 @@ class NeuralMemory(Module):
         if not exists(mem_model_weights):
             mem_model_weights = self.init_weights()
 
+        # store
+
         store_seq = default(store_seq, seq)
 
         store_seq_len = store_seq.shape[-2]
         store_chunk_size = default(store_chunk_size, chunk_size, self.store_chunk_size)
         remainder = store_seq_len % store_chunk_size
 
-        (updates, next_state, values), aux_kv_recon_loss = self.store_memories(store_seq, mem_model_weights, chunk_size = store_chunk_size, return_aux_kv_loss = True)
+        (updates, next_state, values), aux_kv_recon_loss = self.store_memories(
+            store_seq,
+            mem_model_weights,
+            chunk_size = store_chunk_size,
+            prev_layer_updates = prev_layer_updates,
+            return_aux_kv_loss = True
+        )
 
-        retrieved = self.retrieve_memories(seq, mem_model_weights + updates, chunk_size = chunk_size)
+        # retrieve
+
+        retrieved = self.retrieve_memories(
+            seq,
+            mem_model_weights + updates,
+            chunk_size = chunk_size,
+            prev_layer_updates = prev_layer_updates
+        )
 
         # determine state for the storing of memories
         # for transformer-xl like training with neural memory as well as inferencing with initial prompt
@@ -917,9 +947,7 @@ class NeuralMemory(Module):
         if remainder > 0:
             cache_store_seq = store_seq[:, -remainder:]
 
-        updates = updates.apply(lambda t: t[:, -1:])
-
-        next_store_state = (seq_len, cache_store_seq, next_state, updates)
+        next_store_state = NeuralMemCache(seq_len, cache_store_seq, next_state, updates)
 
         output = (retrieved, next_store_state)
 
