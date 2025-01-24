@@ -767,14 +767,13 @@ class MemoryAsContextTransformer(Module):
                 mem_input, add_residual = mem_hyper_conn(x)
 
                 if not is_inferencing:
-                    retrieved, mem_kv_aux_loss = mem(
+                    (retrieved, next_neural_mem_cache), mem_kv_aux_loss = mem(
                         mem_input,
                         return_aux_kv_loss = True
                     )
 
                     kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
 
-                    next_neural_mem_cache = (seq_len, None, None, None)
                 else:
                     retrieved, next_neural_mem_cache = mem.forward_inference(
                         mem_input,

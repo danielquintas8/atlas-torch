@@ -28,7 +28,7 @@ mem = NeuralMemory(
 ).cuda()
 
 seq = torch.randn(2, 1024, 384).cuda()
-retrieved = mem(seq)
+retrieved, mem_state = mem(seq)
 
 assert seq.shape == retrieved.shape
 ```

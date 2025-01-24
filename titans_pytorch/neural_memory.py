@@ -38,8 +38,11 @@ LinearNoBias = partial(Linear, bias = False)
 def exists(v):
     return v is not None
 
-def default(v, d):
-    return v if exists(v) else d
+def default(*args):
+    for arg in args:
+        if exists(arg):
+            return arg
+    return None
 
 def xnor(x, y):
     return not (x ^ y)
@@ -802,6 +805,7 @@ class NeuralMemory(Module):
 
         return values[:, :seq_len]
 
+    @torch.no_grad()
     def forward_inference(
         self,
         token: Tensor,
@@ -875,12 +879,17 @@ class NeuralMemory(Module):
         return_aux_kv_loss = False,
         chunk_size = None,
         store_chunk_size = None,
-        return_values = False
+        return_values = False,
+        return_next_state = False
     ):
         batch, seq_len = seq.shape[:2]
 
         if seq_len < self.retrieve_chunk_size:
             out = self.init_empty_memory_embed(batch, seq_len)
+
+            next_store_state = (seq_len, seq, None, None)
+
+            out = (out, next_store_state)
 
             if not return_aux_kv_loss:
                 return out
@@ -891,16 +900,31 @@ class NeuralMemory(Module):
             mem_model_weights = self.init_weights()
 
         store_seq = default(store_seq, seq)
-        store_chunk_size = default(store_chunk_size, chunk_size)
+
+        store_seq_len = store_seq.shape[-2]
+        store_chunk_size = default(store_chunk_size, chunk_size, self.store_chunk_size)
+        remainder = store_seq_len % store_chunk_size
 
         (updates, next_state, values), aux_kv_recon_loss = self.store_memories(store_seq, mem_model_weights, chunk_size = store_chunk_size, return_aux_kv_loss = True)
 
         retrieved = self.retrieve_memories(seq, mem_model_weights + updates, chunk_size = chunk_size)
 
-        output = retrieved
+        # determine state for the storing of memories
+        # for transformer-xl like training with neural memory as well as inferencing with initial prompt
+
+        cache_store_seq = None
+
+        if remainder > 0:
+            cache_store_seq = store_seq[:, -remainder:]
+
+        updates = updates.apply(lambda t: t[:, -1:])
+
+        next_store_state = (seq_len, cache_store_seq, next_state, updates)
+
+        output = (retrieved, next_store_state)
 
         if return_values:
-            output = (retrieved, values)
+            output = (*output, values)
 
         if not return_aux_kv_loss:
             return output

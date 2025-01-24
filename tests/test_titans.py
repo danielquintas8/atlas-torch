@@ -52,7 +52,7 @@ def test_titans(
     )
 
     seq = torch.randn(2, seq_len, 384)
-    retrieved = mem(seq)
+    retrieved, _ = mem(seq)
 
     assert seq.shape == retrieved.shape
 
@@ -68,7 +68,7 @@ def test_titans_attn_memory():
     )
 
     seq = torch.randn(2, 1024, 384)
-    retrieved = mem(seq)
+    retrieved, _ = mem(seq)
 
     assert seq.shape == retrieved.shape
 
@@ -81,7 +81,7 @@ def test_retrieve_store_diff_seq():
     retrieve_seq = torch.randn(2, 64 * 64, 384)
     store_seq = torch.randn(2, 64 * 32, 384)
 
-    retrieved = mem(retrieve_seq, store_seq = store_seq)
+    retrieved, _ = mem(retrieve_seq, store_seq = store_seq)
 
     assert retrieve_seq.shape == retrieved.shape
 
@@ -94,7 +94,7 @@ def test_overriding_chunk_size():
     seq = torch.randn(2, 128 * 16, 384)
     store_seq = torch.randn(2, 128 * 8, 384)
 
-    retrieved = mem(seq, store_seq, chunk_size = 16, store_chunk_size = 8)
+    retrieved, _ = mem(seq, store_seq, chunk_size = 16, store_chunk_size = 8)
 
     assert seq.shape == retrieved.shape
 
@@ -157,22 +157,37 @@ def test_mac_sampling(
     assert torch.allclose(sampled, sampled_with_cache)
 
 @pytest.mark.parametrize('seq_len', (2, 64, 256))
+@pytest.mark.parametrize('prompt_len', (0, 65))
+@pytest.mark.parametrize('mem_chunk_size', (2, 32, 64))
 @torch_default_dtype(torch.float64)
 def test_neural_mem_inference(
-    seq_len
+    seq_len,
+    prompt_len,
+    mem_chunk_size
 ):
     mem = NeuralMemory(
         dim = 384,
-        chunk_size = 64,
+        chunk_size = mem_chunk_size,
     )
 
     seq = torch.randn(2, seq_len, 384)
-    parallel_retrieved = mem(seq)
+    parallel_retrieved, _ = mem(seq)
 
     assert seq.shape == parallel_retrieved.shape
 
     state = None
     sequential_retrieved = []
+
+    # test initial parallel prompt
+
+    test_parallel_prompt = prompt_len > 0 and prompt_len < seq_len
+
+    if test_parallel_prompt:
+        prompt, seq = seq[:, :prompt_len], seq[:, prompt_len:]
+        retrieved_prompt, state = mem(prompt)
+        sequential_retrieved.append(retrieved_prompt)
+
+    # sequential inference
 
     for token in seq.unbind(dim = 1):
 
