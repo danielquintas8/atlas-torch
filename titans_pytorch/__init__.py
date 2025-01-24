@@ -1,4 +1,4 @@
-from titans_pytorch.titans import (
+from titans_pytorch.neural_memory import (
     NeuralMemory,
     MemoryMLP,
     MemoryAttention,

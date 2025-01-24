@@ -57,7 +57,7 @@ def test_titans(
     assert seq.shape == retrieved.shape
 
 def test_titans_attn_memory():
-    from titans_pytorch.titans import MemoryAttention
+    from titans_pytorch.neural_memory import MemoryAttention
 
     mem = NeuralMemory(
         dim = 384,
@@ -214,7 +214,7 @@ def test_flex(
 
 @torch_default_dtype(torch.float64)
 def test_assoc_scan():
-    from titans_pytorch.titans import AssocScan
+    from titans_pytorch.neural_memory import AssocScan
     torch.set_default_dtype(torch.float64)
 
     scan = AssocScan()
