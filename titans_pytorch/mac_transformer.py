@@ -90,6 +90,9 @@ def divisible_by(num, den):
 def round_up_multiple(seq, mult):
     return ceil(seq / mult) * mult
 
+def round_down_multiple(seq, mult):
+    return seq // mult * mult
+
 def pack_with_inverse(t, pattern):
     packed, packed_shape = pack(t, pattern)
 
@@ -116,11 +119,11 @@ def pad_and_segment_with_inverse(seq, segment_len, fold_into_batch = True):
     if fold_into_batch:
         seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
-    def inverse(out):
+    def inverse(out, remove_pad = True):
         if fold_into_batch:
             out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
 
-        if needs_pad:
+        if needs_pad and remove_pad:
             out = out[..., :-padding, :]
 
         return out
@@ -575,6 +578,27 @@ class MemoryAsContextTransformer(Module):
 
         self.num_persist_mem_tokens = num_persist_mem_tokens
 
+    def seq_index_is_longterm(
+        self,
+        seq_index
+    ):
+        total_segment_len = self.attn_window_size
+
+        seq = seq_index + 1
+        seq -= int((seq % total_segment_len) == 0)
+        last_segment_len = round_down_multiple(seq, total_segment_len)
+        segment_seq = seq - last_segment_len
+        return (segment_seq - self.segment_len) > 0
+
+    def seq_len_with_longterm_mem(
+        self,
+        seq_len
+    ):
+        assert seq_len > 0
+
+        segment_len, num_mem = self.segment_len, self.num_longterm_mem_tokens
+        return ceil(seq_len / segment_len) * num_mem + seq_len
+
     @torch.no_grad()
     def sample(
         self,
@@ -594,8 +618,6 @@ class MemoryAsContextTransformer(Module):
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
-        iter_wrap = tqdm.tqdm if show_progress else identity
-
         # cache for axial pos, attention, and neural memory
 
         cache = None
@@ -604,9 +626,7 @@ class MemoryAsContextTransformer(Module):
         # precompute factorized pos emb
 
         if use_cache:
-            round_up_seq_len = round_up_multiple(seq_len, self.segment_len)
-            longterm_mem_lens = (round_up_seq_len // self.segment_len) * self.num_longterm_mem_tokens
-            seq_len_with_mem = round_up_seq_len + longterm_mem_lens
+            seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
 
             axial_dims = self.axial_pos_emb.maybe_derive_outer_dim(seq_len_with_mem, (self.neural_memory_segment_len,))
 
@@ -614,25 +634,31 @@ class MemoryAsContextTransformer(Module):
 
         # sample
 
-        for _ in iter_wrap(range(sample_num_times)):
+        with tqdm.tqdm(total = sample_num_times, disable = not show_progress) as pbar:
 
-            logits, next_cache = self.forward(
-                out,
-                disable_flex_attn = True,
-                cache = cache,
-                return_cache = True,
-                factorized_pos_emb = factorized_pos_emb
-            )
+            while out.shape[-1] < seq_len:
 
-            if use_cache:
-                cache = next_cache
+                logits, next_cache = self.forward(
+                    out,
+                    disable_flex_attn = True,
+                    cache = cache,
+                    return_cache = True,
+                    factorized_pos_emb = factorized_pos_emb
+                )
 
-            logits = logits[:, -1]
+                if use_cache:
+                    cache = next_cache
 
-            logits = filter_fn(logits, **filter_kwargs)
-            sample = gumbel_sample(logits, temperature = temperature)
+                if not exists(logits):
+                    continue
 
-            out = torch.cat((out, sample), dim = -1)
+                logits = logits[:, -1]
+
+                logits = filter_fn(logits, **filter_kwargs)
+                sample = gumbel_sample(logits, temperature = temperature)
+
+                out = torch.cat((out, sample), dim = -1)
+                pbar.update(1)
 
         self.train(was_training)
 
@@ -656,6 +682,8 @@ class MemoryAsContextTransformer(Module):
 
         batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
 
+        seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
+
         # token embedding
 
         x = self.token_emb(x)
@@ -667,9 +695,11 @@ class MemoryAsContextTransformer(Module):
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
         x, inverse_pack_mems = pack_with_inverse((x, mems), 'b * d')
 
-        x = inverse_segment(x)
+        x = inverse_segment(x, remove_pad = False)
 
-        seq_len_with_mem = x.shape[-2]
+        # splice out unneeded tokens from padding for longterm mems
+
+        x = x[:, :seq_len_with_mem]
 
         # apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
@@ -685,13 +715,12 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len_with_mem, segment_len + num_longterm_mem_tokens, self.num_persist_mem_tokens, self.sliding_window_attn)
+            block_mask = create_mac_block_mask(seq_len_with_mem, self.attn_window_size, self.num_persist_mem_tokens, self.sliding_window_attn)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # kv caching
 
         is_inferencing = exists(cache)
-        assert not (is_inferencing and self.num_longterm_mem_tokens > 0)
 
         if not exists(cache):
             cache = (None, None)
@@ -775,15 +804,34 @@ class MemoryAsContextTransformer(Module):
 
             x = ff(x)
 
+        # taking care of cache first
+        # for early return when processing long term mem tokens during inference
+
+        if return_cache:
+            next_kv_caches = stack([stack(kv_cache) for kv_cache in next_kv_caches])
+
+            # handle kv cache length depending on local attention type
+
+            next_kv_caches = next_kv_caches[..., -attn_window_size:, :]
+
+            if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
+                next_kv_caches = next_kv_caches[..., 0:0, :]
+
+        # hyper connection reducing of streams
+
         x = self.reduce_streams(x)
 
         # excise out the memories
 
-        x, inverse_segment = pad_and_segment_with_inverse(x, segment_len + num_longterm_mem_tokens)
+        if not is_inferencing:
 
-        x, _ = inverse_pack_mems(x)
+            x, inverse_segment = pad_and_segment_with_inverse(x, attn_window_size)
 
-        x = inverse_segment(x)
+            x, _ = inverse_pack_mems(x)
+
+            x = inverse_segment(x)
+
+            x = x[:, :seq_len]
 
         # to logits
 
@@ -794,15 +842,6 @@ class MemoryAsContextTransformer(Module):
         if not return_loss:
             if not return_cache:
                 return logits
-
-            next_kv_caches = stack([stack(kv_cache) for kv_cache in next_kv_caches])
-
-            # handle kv cache length depending on local attention type
-
-            next_kv_caches = next_kv_caches[..., -attn_window_size:, :]
-
-            if not self.sliding_window_attn and divisible_by(seq_len_with_mem, attn_window_size):
-                next_kv_caches = next_kv_caches[..., 0:0, :]
 
             return logits, (next_kv_caches, next_neural_mem_caches)
 
