@@ -409,6 +409,7 @@ class NeuralMemory(Module):
     ):
         super().__init__()
         dim_head = default(dim_head, dim)
+        assert not (heads == 1 and dim_head != dim)
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
@@ -566,7 +567,7 @@ class NeuralMemory(Module):
     ):
         assert xnor(exists(value_residual), exists(self.learned_value_residual))
 
-        seq_len, chunk_size = seq.shape[-2], default(chunk_size, self.store_chunk_size)
+        seq_len, heads, chunk_size = seq.shape[-2], self.heads, default(chunk_size, self.store_chunk_size)
 
         # handle edge case
 
@@ -645,7 +646,7 @@ class NeuralMemory(Module):
 
         # restore batch and sequence dimension
 
-        grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch))
+        grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch * heads))
 
         # maybe per layer modulation
 
