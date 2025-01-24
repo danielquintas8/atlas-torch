@@ -34,10 +34,11 @@ NEURAL_MEM_LAYERS = (2, 4, 6)   # layers 2, 4, 6 have neural memory, can add mor
 NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
 WINDOW_SIZE = 32
-NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2 # set smaller for more granularity for learning rate / momentum etc
+NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 4 # set smaller for more granularity for learning rate / momentum etc
 SLIDING_WINDOWS = True
 WEIGHT_TIE_MEMORY_MODEL = True  # set to have memory MLP shared across layers
 STORE_ATTN_POOL_CHUNKS = True # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
+MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
 KV_RECON_LOSS_WEIGHT = 0.
 
 # experiment related
@@ -97,9 +98,7 @@ model = MemoryAsContextTransformer(
         attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
         momentum = NEURAL_MEM_MOMENTUM,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
-        default_model_kwargs = dict(
-            depth = NEURAL_MEMORY_DEPTH,
-        )
+        per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR
     )
 ).cuda()
 
