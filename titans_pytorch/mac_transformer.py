@@ -592,7 +592,7 @@ class MemoryAsContextTransformer(Module):
         assert seq_len > 0
 
         segment_len, num_mem = self.segment_len, self.num_longterm_mem_tokens
-        return ceil(seq_len / segment_len) * num_mem + seq_len
+        return ((seq_len - 1) // segment_len) * num_mem + seq_len
 
     @torch.no_grad()
     def sample(
