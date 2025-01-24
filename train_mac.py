@@ -36,7 +36,7 @@ NEURAL_MEM_MOMENTUM = True
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2 # set smaller for more granularity for learning rate / momentum etc
 SLIDING_WINDOWS = True
-WEIGHT_TIE_MEMORY_MODEL = False  # set to have memory MLP shared across layers
+WEIGHT_TIE_MEMORY_MODEL = True  # set to have memory MLP shared across layers
 STORE_ATTN_POOL_CHUNKS = True # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 KV_RECON_LOSS_WEIGHT = 0.
 
