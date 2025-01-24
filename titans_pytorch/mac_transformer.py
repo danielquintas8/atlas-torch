@@ -315,7 +315,7 @@ class SegmentedAttention(Module):
 
         # caching
 
-        next_cache = tuple(map(inverse_segment, (k, v)))
+        next_cache = (k, v)
 
         # take care of persistent memory key / values
 
