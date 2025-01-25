@@ -723,6 +723,8 @@ class NeuralMemory(Module):
             prev_layer_updates = TensorDict(prev_layer_updates)
             prev_layer_updates = prev_layer_updates.apply(lambda t: t[:, -1:])
 
+        values = None
+
         if store_seq_cache_len == self.chunk_size:
 
             next_updates, next_states, values = self.store_memories(
@@ -770,7 +772,7 @@ class NeuralMemory(Module):
         if seq_len < self.retrieve_chunk_size:
             out = self.init_empty_memory_embed(batch, seq_len)
 
-            next_store_state = (seq_len, seq, None, None)
+            next_store_state = NeuralMemCache(seq_len, seq, None, None)
 
             out = (out, next_store_state)
 
