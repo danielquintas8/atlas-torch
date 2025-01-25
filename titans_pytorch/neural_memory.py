@@ -706,7 +706,12 @@ class NeuralMemory(Module):
         if curr_seq_len < self.chunk_size:
             empty_mem = self.init_empty_memory_embed(batch, 1)
 
-            return empty_mem, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
+            output = empty_mem, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
+
+            if return_values:
+                output = (*output, self.zero)
+
+            return output
 
         # store if storage sequence cache hits the chunk size
 
