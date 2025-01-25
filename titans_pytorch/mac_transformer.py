@@ -536,11 +536,6 @@ class MemoryAsContextTransformer(Module):
         self.weight_tie_memory_model = weight_tie_memory_model
         self.prev_neural_mem_update_for_weights = default(prev_neural_mem_update_for_weights, weight_tie_memory_model)
 
-        # value residual learning for neural memory
-
-        is_first_mem = True
-        self.mem_add_value_residual = neural_memory_add_value_residual
-
         # mem, attn, and feedforward layers
 
         for layer in layers:
@@ -570,11 +565,8 @@ class MemoryAsContextTransformer(Module):
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
                     model = maybe_copy(neural_memory_model),
-                    accept_value_residual = not is_first_mem and neural_memory_add_value_residual,
                     **neural_memory_kwargs
                 )
-
-                is_first_mem = False
 
             ff = FeedForward(dim = dim, mult = ff_mult)
 
@@ -765,8 +757,6 @@ class MemoryAsContextTransformer(Module):
 
         value_residual = None
 
-        mem_value_residual = None
-
         # aux losses
 
         kv_recon_losses = self.zero
@@ -794,27 +784,20 @@ class MemoryAsContextTransformer(Module):
                 mem_input, add_residual = mem_hyper_conn(x)
 
                 if not is_inferencing:
-                    (retrieved, next_neural_mem_cache, next_mem_value_residual), mem_kv_aux_loss = mem(
+                    (retrieved, next_neural_mem_cache), mem_kv_aux_loss = mem(
                         mem_input,
                         return_aux_kv_loss = True,
-                        return_values = True,
-                        value_residual = mem_value_residual,
                         prev_layer_updates = neural_memory_updates
                     )
 
                     kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
 
                 else:
-                    (retrieved, next_neural_mem_cache, next_mem_value_residual) = mem.forward_inference(
+                    (retrieved, next_neural_mem_cache) = mem.forward_inference(
                         mem_input,
                         state = next(neural_mem_caches, None),
-                        return_values = True,
-                        value_residual = mem_value_residual,
                         prev_layer_updates = neural_memory_updates
                     )
-
-                if self.mem_add_value_residual:
-                    mem_value_residual = next_mem_value_residual
 
                 if prev_neural_mem_update_for_weights:
                     neural_memory_updates = next_neural_mem_cache.updates

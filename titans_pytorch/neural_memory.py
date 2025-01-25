@@ -258,7 +258,6 @@ class NeuralMemory(Module):
         pre_rmsnorm = True,
         post_rmsnorm = True,
         qk_rmsnorm = False,
-        accept_value_residual = False,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         activation: Module | None = None,
@@ -343,14 +342,6 @@ class NeuralMemory(Module):
         self.to_keys_values = Sequential(LinearNoBias(dim, dim_inner * 2), activation)
         self.store_memory_loss_fn = store_memory_loss_fn
 
-        # value residual learning
-
-        self.learned_value_residual = Sequential(
-            LinearNoBias(dim, heads),
-            Rearrange('b n h -> b h n 1'),
-            nn.Sigmoid()
-        ) if accept_value_residual else None
-
         # empty memory embed
 
         self.empty_memory_embed = nn.Parameter(torch.zeros(dim))
@@ -428,10 +419,7 @@ class NeuralMemory(Module):
         prev_layer_updates: dict[str, Tensor] | None = None,
         return_aux_kv_loss = False,
         chunk_size = None,
-        value_residual = None
     ):
-        assert xnor(exists(value_residual), exists(self.learned_value_residual))
-
         seq_len, heads, chunk_size = seq.shape[-2], self.heads, default(chunk_size, self.store_chunk_size)
 
         # handle edge case
@@ -498,14 +486,6 @@ class NeuralMemory(Module):
         # maybe qk rmsnorm
 
         keys = self.k_norm(keys)
-
-        # maybe value residual learning
-
-        orig_values = values
-
-        if exists(self.learned_value_residual):
-            mix = self.learned_value_residual(seq)
-            values = values.lerp(value_residual, mix)
 
         # take care of chunking
 
@@ -587,7 +567,7 @@ class NeuralMemory(Module):
 
         # returns
 
-        output = (updates, next_state, orig_values)
+        output = (updates, next_state)
 
         if not return_aux_kv_loss:
             return output
@@ -676,8 +656,6 @@ class NeuralMemory(Module):
         token: Tensor,
         state = None,
         prev_layer_updates: dict[str, Tensor] | None = None,
-        return_values = False,
-        value_residual = None,
     ):
 
         # unpack previous state
@@ -708,9 +686,6 @@ class NeuralMemory(Module):
 
             output = empty_mem, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
 
-            if return_values:
-                output = (*output, self.zero)
-
             return output
 
         # store if storage sequence cache hits the chunk size
@@ -728,16 +703,13 @@ class NeuralMemory(Module):
             prev_layer_updates = TensorDict(prev_layer_updates)
             prev_layer_updates = prev_layer_updates.apply(lambda t: t[:, -1:])
 
-        values = None
-
         if store_seq_cache_len == self.chunk_size:
 
-            next_updates, next_states, values = self.store_memories(
+            next_updates, next_states = self.store_memories(
                 cache_store_seq,
                 weights,
                 past_state = past_states,
                 prev_layer_updates = prev_layer_updates,
-                value_residual = value_residual
             )
 
             updates = next_updates
@@ -753,9 +725,6 @@ class NeuralMemory(Module):
 
         output = (retrieved, next_state)
 
-        if return_values:
-            output = (*output, values)
-
         return output
 
     def forward(
@@ -767,8 +736,6 @@ class NeuralMemory(Module):
         return_aux_kv_loss = False,
         chunk_size = None,
         store_chunk_size = None,
-        return_values = False,
-        value_residual = None,
         return_next_state = False,
         prev_layer_updates: dict[str, Tensor] | None = None
     ):
@@ -780,9 +747,6 @@ class NeuralMemory(Module):
             next_store_state = NeuralMemCache(seq_len, seq, None, None)
 
             out = (out, next_store_state)
-
-            if return_values:
-                out = (*out, self.zero)
 
             if not return_aux_kv_loss:
                 return out
@@ -800,12 +764,11 @@ class NeuralMemory(Module):
         store_chunk_size = default(store_chunk_size, chunk_size, self.store_chunk_size)
         remainder = store_seq_len % store_chunk_size
 
-        (updates, next_state, values), aux_kv_recon_loss = self.store_memories(
+        (updates, next_state), aux_kv_recon_loss = self.store_memories(
             store_seq,
             mem_model_weights,
             chunk_size = store_chunk_size,
             prev_layer_updates = prev_layer_updates,
-            value_residual = value_residual,
             return_aux_kv_loss = True
         )
 
@@ -829,9 +792,6 @@ class NeuralMemory(Module):
         next_store_state = NeuralMemCache(seq_len, cache_store_seq, next_state, updates)
 
         output = (retrieved, next_store_state)
-
-        if return_values:
-            output = (*output, values)
 
         if not return_aux_kv_loss:
             return output
