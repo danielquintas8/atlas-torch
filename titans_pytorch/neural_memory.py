@@ -434,7 +434,7 @@ class NeuralMemory(Module):
 
         round_down_seq_len = round_down_multiple(seq_len, chunk_size)
 
-        seq = seq[:, :round_down_seq_len]
+        seq, remainder = seq[:, :round_down_seq_len], seq[:, round_down_seq_len:]
 
         # per sample grad function
 
@@ -561,13 +561,15 @@ class NeuralMemory(Module):
             if has_momentum:
                 next_momentum[param_name] = inverse_pack(momentum)
 
-        # compute next states for inference, or titans-xl like training
+        # determine next state for the storing of memories
 
         next_state = (next_last_update, next_last_momentum)
 
+        next_store_state = NeuralMemCache(seq_len, remainder, next_state, updates)
+
         # returns
 
-        output = (updates, next_state)
+        output = (updates, next_store_state)
 
         if not return_aux_kv_loss:
             return output
@@ -705,7 +707,7 @@ class NeuralMemory(Module):
 
         if store_seq_cache_len == self.chunk_size:
 
-            next_updates, next_states = self.store_memories(
+            next_updates, store_state = self.store_memories(
                 cache_store_seq,
                 weights,
                 past_state = past_states,
@@ -714,6 +716,7 @@ class NeuralMemory(Module):
 
             updates = next_updates
             cache_store_seq = None
+            next_states = store_state.states
 
         # retrieve
 
@@ -721,11 +724,9 @@ class NeuralMemory(Module):
 
         # next state tuple
 
-        next_state = NeuralMemCache(curr_seq_len, cache_store_seq, next_states, updates)
+        next_store_state = NeuralMemCache(curr_seq_len, cache_store_seq, next_states, updates)
 
-        output = (retrieved, next_state)
-
-        return output
+        return retrieved, next_store_state
 
     def forward(
         self,
@@ -760,11 +761,7 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        store_seq_len = store_seq.shape[-2]
-        store_chunk_size = default(store_chunk_size, chunk_size, self.store_chunk_size)
-        remainder = store_seq_len % store_chunk_size
-
-        (updates, next_state), aux_kv_recon_loss = self.store_memories(
+        (updates, next_store_state), aux_kv_recon_loss = self.store_memories(
             store_seq,
             mem_model_weights,
             chunk_size = store_chunk_size,
@@ -780,16 +777,6 @@ class NeuralMemory(Module):
             chunk_size = chunk_size,
             prev_layer_updates = prev_layer_updates
         )
-
-        # determine state for the storing of memories
-        # for transformer-xl like training with neural memory as well as inferencing with initial prompt
-
-        cache_store_seq = None
-
-        if remainder > 0:
-            cache_store_seq = store_seq[:, -remainder:]
-
-        next_store_state = NeuralMemCache(seq_len, cache_store_seq, next_state, updates)
 
         output = (retrieved, next_store_state)
 
