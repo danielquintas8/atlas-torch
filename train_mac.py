@@ -41,7 +41,7 @@ WEIGHT_TIE_MEMORY_MODEL = False                 # set to have memory MLP shared 
 PREV_MEM_UPDATE_FOR_WEIGHTS = True,
 STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
-KV_RECON_LOSS_WEIGHT = 0.
+KV_RECON_LOSS_WEIGHT = 1.
 
 # experiment related
 

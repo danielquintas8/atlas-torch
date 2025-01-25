@@ -488,7 +488,7 @@ class MemoryAsContextTransformer(Module):
         neural_memory_model: Module | None = None,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
-        aux_kv_recon_loss_weight = 0.,
+        aux_kv_recon_loss_weight = 1.,
         use_flex_attn = False,
         sliding_window_attn = False,
         weight_tie_memory_model = False,
