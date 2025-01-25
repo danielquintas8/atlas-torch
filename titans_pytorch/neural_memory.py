@@ -304,12 +304,25 @@ class NeuralMemory(Module):
             nn.Sigmoid()
         ) if heads > 1 else None
 
-        # memory mlp
+        # memory model
 
         if not exists(model):
             model = MemoryMLP(dim_head, **default_model_kwargs)
 
+        # validate memory model
+
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
+
+        test_shape = (3, 2, dim_head)
+
+        with torch.no_grad():
+            try:
+                test_input = torch.randn(test_shape)
+                mem_model_output = model(test_input)
+            except:
+                raise RuntimeError(f'memory model unable to accept a tensor of shape {test_shape}')
+
+            assert mem_model_output.shape == test_shape, 'output of memory model needs to be same shape as input'
 
         # the memory is the weights of the model
 
