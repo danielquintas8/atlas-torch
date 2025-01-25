@@ -67,6 +67,9 @@ def safe_cat(inputs, dim = -2):
 def identity(t):
     return t
 
+def dict_get_shape(td):
+    return {k: v.shape for k, v in td.items()}
+
 def pair(v):
     return (v, v) if not isinstance(v, tuple) else v
 
@@ -314,6 +317,8 @@ class NeuralMemory(Module):
 
         self.num_memory_parameter_tensors = len(set(model.parameters()))
 
+        self.init_weight_shape = dict_get_shape(dict(model.named_parameters()))
+
         # the chunk size within the paper where adaptive step, momentum, weight decay are shared
 
         self.chunk_size = chunk_size
@@ -341,11 +346,6 @@ class NeuralMemory(Module):
 
         self.to_keys_values = Sequential(LinearNoBias(dim, dim_inner * 2), activation)
         self.store_memory_loss_fn = store_memory_loss_fn
-
-        # empty memory embed
-
-        self.empty_memory_embed = nn.Parameter(torch.zeros(dim))
-        nn.init.normal_(self.empty_memory_embed, std = 0.02)
 
         # `chunk_size` refers to chunk size used for storing to memory model weights
 
@@ -407,9 +407,6 @@ class NeuralMemory(Module):
     def init_weights(self):
         weights = TensorDict(dict(self.memory_model.named_parameters()))
         return weights
-
-    def init_empty_memory_embed(self, batch, seq_len):
-        return repeat(self.empty_memory_embed, 'd -> b n d', b = batch, n = seq_len)
 
     def store_memories(
         self,
@@ -588,16 +585,18 @@ class NeuralMemory(Module):
 
         seq = self.retrieve_norm(seq)
 
-        if seq_len < chunk_size:
-            return self.init_empty_memory_embed(batch, seq_len)
+        assert seq_len >= chunk_size, 'must be handled outside of retrieve'
 
-        seq = seq[:, (chunk_size - 1):]
-        curtailed_seq_len = seq.shape[-2]
+        needs_pad = chunk_size > 1
 
-        next_seq_len = round_up_multiple(curtailed_seq_len, chunk_size)
+        if needs_pad:
+            seq = pad_at_dim(seq, (1, 0), dim = 1)
+            seq_len_plus_one = seq.shape[-2]
 
-        padding = next_seq_len - curtailed_seq_len
-        seq = pad_at_dim(seq, (0, padding), dim = 1)
+            next_seq_len = round_up_multiple(seq_len_plus_one, chunk_size)
+
+            padding = next_seq_len - seq_len_plus_one
+            seq = pad_at_dim(seq, (0, padding), dim = 1)
 
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
@@ -621,7 +620,9 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
-        curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+        if dict_get_shape(curr_weights) != self.init_weight_shape:
+            curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
         # forward functional call
@@ -647,10 +648,10 @@ class NeuralMemory(Module):
 
         # restore, pad with empty memory embed
 
-        empty_memory_embeds = self.init_empty_memory_embed(values.shape[0], chunk_size - 1)
-        values = torch.cat((empty_memory_embeds, values), dim = -2)
+        if needs_pad:
+            values = values[:, 1:(seq_len + 1)]
 
-        return values[:, :seq_len]
+        return values
 
     @torch.no_grad()
     def forward_inference(
@@ -684,9 +685,9 @@ class NeuralMemory(Module):
         # early return empty memory, when no memories are stored for steps < first chunk size
 
         if curr_seq_len < self.chunk_size:
-            empty_mem = self.init_empty_memory_embed(batch, 1)
+            retrieve = self.retrieve_memories(token, weights, chunk_size = 1)
 
-            output = empty_mem, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
+            output = retrieve, NeuralMemCache(curr_seq_len, cache_store_seq, past_states, updates)
 
             return output
 
@@ -742,20 +743,20 @@ class NeuralMemory(Module):
     ):
         batch, seq_len = seq.shape[:2]
 
+        if not exists(mem_model_weights):
+            mem_model_weights = self.init_weights()
+
         if seq_len < self.retrieve_chunk_size:
-            out = self.init_empty_memory_embed(batch, seq_len)
+            retrieved = self.retrieve_memories(seq, mem_model_weights, chunk_size = 1)
 
             next_store_state = NeuralMemCache(seq_len, seq, None, None)
 
-            out = (out, next_store_state)
+            out = (retrieved, next_store_state)
 
             if not return_aux_kv_loss:
                 return out
 
             return out, self.zero
-
-        if not exists(mem_model_weights):
-            mem_model_weights = self.init_weights()
 
         # store
 
@@ -770,6 +771,11 @@ class NeuralMemory(Module):
         )
 
         # retrieve
+
+        if exists(prev_layer_updates):
+            prev_layer_updates = prev_layer_updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+
+        updates = updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
 
         retrieved = self.retrieve_memories(
             seq,
