@@ -70,6 +70,12 @@ def safe_cat(inputs, dim = -2):
 def dict_get_shape(td):
     return {k: v.shape for k, v in td.items()}
 
+def rearrange_dict_values(td, pattern, **kwargs):
+    return td.apply(lambda t: rearrange(t, pattern, **kwargs))
+
+def repeat_dict_values(td, pattern, **kwargs):
+    return td.apply(lambda t: repeat(t, pattern, **kwargs))
+
 def pair(v):
     return (v, v) if not isinstance(v, tuple) else v
 
@@ -195,6 +201,12 @@ class AssocScan(Module):
     ):
         remove_prev = default(remove_prev, exists(prev))
 
+        inputs, inverse_pack_weight_shape = pack_one_with_inverse(inputs, 'b n *')
+        gates, _ = pack_one_with_inverse(gates, 'b n *')
+
+        if exists(prev):
+            prev, _ = pack_one_with_inverse(prev, 'b *')
+
         if exists(prev):
             inputs, _ = pack([prev, inputs], 'b * d')
             gates = pad_at_dim(gates, (1, 0), value = 1., dim = -2)
@@ -205,7 +217,7 @@ class AssocScan(Module):
             if remove_prev:
                 out = out[:, 1:]
 
-            return out
+            return inverse_pack_weight_shape(out)
 
         from accelerated_scan.triton import scan as triton_scan
         from accelerated_scan.warp import scan as warp_scan
@@ -226,14 +238,15 @@ class AssocScan(Module):
 
             outputs = outputs[..., :seq_len]
             outputs = rearrange(outputs, 'b d n -> b n d')
-            return outputs
+
+            return inverse_pack_weight_shape(outputs)
 
         out = accelerate_scan_fn(gates, inputs)
 
         if remove_prev:
             out = out[:, 1:]
 
-        return out
+        return inverse_pack_weight_shape(out)
 
 # main neural memory
 
@@ -506,7 +519,7 @@ class NeuralMemory(Module):
         # flatten batch and time if surprise depends on previous layer memory model
 
         if exists(prev_layer_updates):
-            weights_for_surprise = weights_for_surprise.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+            weights_for_surprise = rearrange_dict_values(weights_for_surprise, 'b n ... -> (b n) ...')
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
@@ -521,7 +534,7 @@ class NeuralMemory(Module):
 
         # restore batch and sequence dimension
 
-        grads = grads.apply(lambda t: rearrange(t, '(b n) ... -> b n ...', b = batch * heads))
+        grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
 
         # maybe per layer modulation
 
@@ -542,7 +555,7 @@ class NeuralMemory(Module):
             minibatch_init_weight = weights
 
             if dict_get_shape(weights) == self.init_weight_shape:
-                minibatch_init_weight = weights.apply(lambda t: repeat(t, '... -> b 1 (...)', b = batch * heads))
+                minibatch_init_weight = repeat_dict_values(weights, '... -> b 1 ...', b = batch * heads)
 
             past_state = (minibatch_init_weight, empty_dict)
 
@@ -558,8 +571,6 @@ class NeuralMemory(Module):
 
         for (param_name, surprise), (_, last_update), (_, last_momentum) in zip(surprises.items(), past_last_update.items(), past_last_momentum.items()):
 
-            surprise, inverse_pack = pack_one_with_inverse(surprise, 'b n *')
-
             update = surprise
 
             # derive momentum with associative scan - eq (10)
@@ -574,10 +585,10 @@ class NeuralMemory(Module):
             update = self.assoc_scan(1. - decay_factor, update, prev = last_update)
             next_last_update[param_name] = update[:, -1]
 
-            updates[param_name] = inverse_pack(update)
+            updates[param_name] = update
 
             if has_momentum:
-                next_momentum[param_name] = inverse_pack(momentum)
+                next_momentum[param_name] = momentum
 
         # determine next state for the storing of memories
 
@@ -642,7 +653,7 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if dict_get_shape(curr_weights) != self.init_weight_shape:
-            curr_weights = curr_weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+            curr_weights = rearrange_dict_values(curr_weights, 'b n ... -> (b n) ...')
 
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
@@ -719,7 +730,7 @@ class NeuralMemory(Module):
 
         if not exists(updates):
             updates = weights.clone().zero_()
-            updates = updates.apply(lambda t: repeat(t, '... -> b 1 ...', b = batch))
+            updates = repeat_dict_values(updates, '... -> b 1 ...', b = batch)
         else:
             updates = updates.apply(lambda t: t[:, -1:])
 
