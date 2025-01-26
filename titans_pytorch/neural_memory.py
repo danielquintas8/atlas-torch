@@ -742,7 +742,7 @@ class NeuralMemory(Module):
 
         # retrieve
 
-        retrieved = self.retrieve_memories(token, weights, chunk_size = 1)
+        retrieved = self.retrieve_memories(token, updates, chunk_size = 1)
 
         # next state tuple
 
@@ -801,10 +801,9 @@ class NeuralMemory(Module):
 
             updates = updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
 
-
         retrieved = self.retrieve_memories(
             seq,
-            mem_model_weights,
+            updates,
             chunk_size = chunk_size,
             prev_layer_updates = prev_layer_updates
         )
