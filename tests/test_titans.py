@@ -24,9 +24,9 @@ def torch_default_dtype(dtype):
 
 # main test
 
-@pytest.mark.parametrize('seq_len', (32, 1024, 77))
+@pytest.mark.parametrize('seq_len', (32, 512, 77))
 @pytest.mark.parametrize('silu', (False, True))
-@pytest.mark.parametrize('attn_pool_chunks', (False, True))
+@pytest.mark.parametrize('chunk_size, attn_pool_chunks', ((64, True), (64, False), (1, False)))
 @pytest.mark.parametrize('momentum', (False, True))
 @pytest.mark.parametrize('qk_rmsnorm', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
@@ -35,6 +35,7 @@ def test_titans(
     seq_len,
     silu,
     attn_pool_chunks,
+    chunk_size,
     momentum,
     qk_rmsnorm,
     max_grad_norm,
@@ -42,7 +43,7 @@ def test_titans(
 ):
     mem = NeuralMemory(
         dim = 384,
-        chunk_size = 64,
+        chunk_size = chunk_size,
         activation = nn.SiLU() if silu else None,
         attn_pool_chunks = attn_pool_chunks,
         max_grad_norm = max_grad_norm,
