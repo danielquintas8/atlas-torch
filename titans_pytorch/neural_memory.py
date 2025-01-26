@@ -785,10 +785,14 @@ class NeuralMemory(Module):
 
         # retrieve
 
-        if exists(prev_layer_updates):
-            prev_layer_updates = prev_layer_updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+        retrieve_chunk_size = default(chunk_size, self.retrieve_chunk_size)
 
-        updates = updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+        if retrieve_chunk_size != 1:
+            if exists(prev_layer_updates):
+                prev_layer_updates = prev_layer_updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+
+            updates = updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+
 
         retrieved = self.retrieve_memories(
             seq,
