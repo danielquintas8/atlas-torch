@@ -51,6 +51,9 @@ def default(*args):
             return arg
     return None
 
+def identity(t):
+    return t
+
 def xnor(x, y):
     return not (x ^ y)
 
@@ -63,9 +66,6 @@ def safe_cat(inputs, dim = -2):
         return inputs[0]
 
     return cat(inputs, dim = dim)
-
-def identity(t):
-    return t
 
 def dict_get_shape(td):
     return {k: v.shape for k, v in td.items()}
@@ -454,14 +454,14 @@ class NeuralMemory(Module):
 
         weights = TensorDict(weights)
 
-        # allow for neural memory of a previous layer and the past to produce gradients that become the weights of the current one generating the surprise
-        # think this is necessary otherwise the memory model is static (unless if paper is misunderstood)
-        # improvise (or perhaps correcting to) a solution
+        # allow for neural memory of a previous layer to influence surprise of current layer
+
+        weights_for_surprise = weights
 
         if exists(prev_layer_updates):
             prev_layer_updates = TensorDict(prev_layer_updates)
 
-            weights = weights + prev_layer_updates
+            weights_for_surprise = weights_for_surprise + prev_layer_updates
 
             per_sample_grad_fn = self.per_sample_grad_fn_expanded_weights # the weights will now have a batch * chunk dimension
 
@@ -506,11 +506,11 @@ class NeuralMemory(Module):
         # flatten batch and time if surprise depends on previous layer memory model
 
         if exists(prev_layer_updates):
-            weights = weights.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
+            weights_for_surprise = weights_for_surprise.apply(lambda t: rearrange(t, 'b n ... -> (b n) ...'))
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_kv_recon_loss = per_sample_grad_fn(dict(weights), keys, adaptive_lr, values)
+        grads, aux_kv_recon_loss = per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
@@ -536,7 +536,15 @@ class NeuralMemory(Module):
 
         if not exists(past_state):
             empty_dict = {key: None for key in weights.keys()}
-            past_state = (empty_dict, empty_dict)
+
+            # minibatch_init_weight corresponds to W0 in figure 7 of TTT paper
+
+            minibatch_init_weight = weights
+
+            if dict_get_shape(weights) == self.init_weight_shape:
+                minibatch_init_weight = weights.apply(lambda t: repeat(t, '... -> b 1 (...)', b = batch * heads))
+
+            past_state = (minibatch_init_weight, empty_dict)
 
         past_last_update, past_last_momentum = past_state
 
@@ -734,7 +742,7 @@ class NeuralMemory(Module):
 
         # retrieve
 
-        retrieved = self.retrieve_memories(token, updates + weights, chunk_size = 1)
+        retrieved = self.retrieve_memories(token, weights, chunk_size = 1)
 
         # next state tuple
 
@@ -796,7 +804,7 @@ class NeuralMemory(Module):
 
         retrieved = self.retrieve_memories(
             seq,
-            mem_model_weights + updates,
+            mem_model_weights,
             chunk_size = chunk_size,
             prev_layer_updates = prev_layer_updates
         )

@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.2.6"
+version = "0.2.7"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -11,9 +11,9 @@ license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
     'deep learning',
-    'neural memory module',
     'test time training',
-    'linear attention'
+    'linear attention',
+    'memory',
 ]
 
 classifiers=[
