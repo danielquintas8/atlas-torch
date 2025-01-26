@@ -3,10 +3,32 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Parameter, ParameterList
 
+from einops import rearrange
+
 # functions
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
+
+# norms
+
+class LayerNorm(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+
+        self.ln = nn.LayerNorm(dim, elementwise_affine = False)
+        self.gamma = Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        gamma = self.gamma
+
+        if gamma.ndim == 2:
+            gamma = rearrange(gamma, 'b d -> b 1 d')
+
+        return self.ln(x) * (gamma + 1.)
 
 # memory mlp proposed in TTT
 
@@ -18,6 +40,8 @@ class MemoryMLP(Module):
     ):
         super().__init__()
         self.weights = ParameterList([Parameter(torch.randn(dim, dim)) for _ in range(depth)])
+
+        self.ln = LayerNorm(dim)
 
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
@@ -36,7 +60,7 @@ class MemoryMLP(Module):
 
             x = x @ weight
 
-        return x + residual
+        return self.ln(x) + residual
 
 # memory mlp, but with gated residual + final projection
 
@@ -59,6 +83,8 @@ class GatedResidualMemoryMLP(Module):
         ])
 
         self.final_proj = Parameter(torch.randn(dim, dim))
+
+        self.ln = LayerNorm(dim)
 
         for param in self.parameters():
             nn.init.xavier_uniform_(param)
@@ -83,7 +109,7 @@ class GatedResidualMemoryMLP(Module):
 
         out = x @ self.final_proj
 
-        return out + residual
+        return self.ln(out) + residual
 
 # memory mlp with factorized weights
 # so can tradeoff capacity for smaller chunk sizes
@@ -103,6 +129,8 @@ class FactorizedMemoryMLP(Module):
             ]) for _ in range(depth)
         ])
 
+        self.ln = LayerNorm(dim)
+
         for weight1, weight2 in self.weights:
             nn.init.xavier_uniform_(weight1)
             nn.init.xavier_uniform_(weight2)
@@ -121,7 +149,7 @@ class FactorizedMemoryMLP(Module):
 
             x = x @ weight1 @ weight2
 
-        return x + residual
+        return self.ln(x) + residual
 
 # improvised attention as memory module
 
@@ -143,6 +171,8 @@ class MemoryAttention(Module):
             nn.Parameter(torch.randn(dim, dim_ff_hidden)), # ff w1
             nn.Parameter(torch.randn(dim_ff_hidden, dim)), # ff w2
         ])
+
+        self.ln = LayerNorm(dim)
 
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
@@ -168,4 +198,4 @@ class MemoryAttention(Module):
         h = F.gelu(x @ ffw1)
         ff_out = h @ ffw2
 
-        return attn_out + ff_out + residual
+        return self.ln(attn_out + ff_out) + residual
