@@ -655,15 +655,19 @@ class NeuralMemory(Module):
         self,
         seq,
         past_weights: dict[str, Tensor],
+        chunk_size = None,
+        need_pad = True
     ):
-        chunk_size = self.retrieve_chunk_size
+        chunk_size = default(chunk_size, self.retrieve_chunk_size)
         batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
 
-        needs_pad = chunk_size > 1
+        need_pad = need_pad or chunk_size > 1
 
-        seq = pad_at_dim(seq, (1, 0), dim = 1)
+        if need_pad:
+            seq = pad_at_dim(seq, (1, 0), dim = 1)
+
         seq_len_plus_one = seq.shape[-2]
 
         next_seq_len = round_up_multiple(seq_len_plus_one, chunk_size)
@@ -718,76 +722,10 @@ class NeuralMemory(Module):
 
         # restore, pad with empty memory embed
 
-        values = values[:, 1:(seq_len + 1)]
+        if need_pad:
+            values = values[:, 1:]
 
-        return values
-
-    @torch.no_grad()
-    def forward_inference(
-        self,
-        token: Tensor,
-        state: NeuralMemCache | None = None,
-    ):
-        # unpack previous state
-
-        if not exists(state):
-            state = (0, None, None, None, None)
-
-        seq_index, weights, cache_store_seq, past_states, updates = state
-
-        curr_seq_len = seq_index + 1
-        batch = token.shape[0]
-
-        if token.ndim == 2:
-            token = rearrange(token, 'b d -> b 1 d')
-
-        assert token.shape[1] == 1
-
-        # increment the sequence cache which is at most the chunk size
-
-        cache_store_seq = safe_cat((cache_store_seq, token), dim = -2)
-
-        # early return empty memory, when no memories are stored for steps < first chunk size
-
-        if curr_seq_len < self.chunk_size:
-            retrieve = self.retrieve_memories(token, weights, chunk_size = 1)
-
-            output = retrieve, NeuralMemCache(curr_seq_len, weights, cache_store_seq, past_states, updates)
-
-            return output
-
-        # store if storage sequence cache hits the chunk size
-
-        next_states = past_states
-        store_seq_cache_len = cache_store_seq.shape[-2]
-
-        if not exists(updates):
-            updates = weights.clone().zero_()
-            updates = repeat_dict_values(updates, '... -> b 1 ...', b = batch)
-        else:
-            updates = updates.apply(lambda t: t[:, -1:])
-
-        if store_seq_cache_len == self.chunk_size:
-
-            next_updates, store_state = self.store_memories(
-                cache_store_seq,
-                weights,
-                past_state = past_states,
-            )
-
-            updates = next_updates
-            cache_store_seq = None
-            next_states = store_state.states
-
-        # retrieve
-
-        retrieved = self.retrieve_memories(token, updates, chunk_size = 1)
-
-        # next state tuple
-
-        next_store_state = NeuralMemCache(curr_seq_len, weights, cache_store_seq, next_states, updates)
-
-        return retrieved, next_store_state
+        return values[:, :seq_len]
 
     def forward(
         self,
@@ -795,16 +733,24 @@ class NeuralMemory(Module):
         store_seq = None,
         state: NeuralMemCache | None = None,
     ):
+        if seq.ndim == 2:
+            seq = rearrange(seq, 'b d -> b 1 d')
+
+        is_single_token = seq.shape[1] == 1
+
         if not exists(state):
             state = (0, None, None, None, None)
 
         seq_index, weights, cache_store_seq, past_state, updates = state
 
-        assert not exists(cache_store_seq) or is_empty_tensor(cache_store_seq)
-
         # store
 
         store_seq = default(store_seq, seq)
+
+        # take care of cache
+
+        if exists(cache_store_seq):
+            store_seq = safe_cat((cache_store_seq, store_seq))
 
         # functions
 
@@ -883,9 +829,21 @@ class NeuralMemory(Module):
 
         # retrieve
 
+        need_pad = True
+        retrieve_chunk_size = None
+
+        if is_single_token:
+            retrieve_chunk_size = 1
+            need_pad = False
+
+            last_update, _ = past_state
+            updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
+
         retrieved = self.retrieve_memories(
             seq,
-            updates
+            updates,
+            chunk_size = retrieve_chunk_size,
+            need_pad = need_pad,
         )
 
         return retrieved, next_neural_mem_state

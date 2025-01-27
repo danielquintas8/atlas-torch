@@ -148,7 +148,7 @@ def test_mac(
     assert logits.shape == (1, seq_len, 256)
 
 @pytest.mark.parametrize('sliding', (False, True))
-@pytest.mark.parametrize('mem_layers', (()))
+@pytest.mark.parametrize('mem_layers', ((), None))
 @pytest.mark.parametrize('longterm_mems', (0, 4, 16))
 @pytest.mark.parametrize('prompt_len', (4, 16))
 @torch_default_dtype(torch.float64)
@@ -190,7 +190,6 @@ def test_neural_mem_inference(
     prompt_len,
     mem_chunk_size
 ):
-    pytest.skip()
 
     mem = NeuralMemory(
         dim = 384,
@@ -218,7 +217,7 @@ def test_neural_mem_inference(
 
     for token in seq.unbind(dim = 1):
 
-        one_retrieved, state = mem.forward_inference(
+        one_retrieved, state = mem.forward(
             token,
             state = state,
         )

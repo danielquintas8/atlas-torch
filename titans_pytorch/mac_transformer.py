@@ -761,16 +761,10 @@ class MemoryAsContextTransformer(Module):
 
                 mem_input, add_residual = mem_hyper_conn(x)
 
-                if not is_inferencing:
-                    retrieved, next_neural_mem_cache = mem(
-                        mem_input
-                    )
-
-                else:
-                    (retrieved, next_neural_mem_cache) = mem.forward_inference(
-                        mem_input,
-                        state = next(neural_mem_caches, None),
-                    )
+                retrieved, next_neural_mem_cache = mem.forward(
+                    mem_input,
+                    state = next(neural_mem_caches, None),
+                )
 
                 if self.gate_attn_output:
                     attn_out_gates = retrieved.sigmoid()
