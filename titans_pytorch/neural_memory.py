@@ -630,6 +630,11 @@ class NeuralMemory(Module):
             padding = next_seq_len - seq_len_plus_one
             seq = pad_at_dim(seq, (0, padding), dim = 1)
 
+            if exists(prev_layer_updates):
+                prev_layer_updates = prev_layer_updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+
+            past_weights = past_weights.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
+
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
@@ -803,14 +808,6 @@ class NeuralMemory(Module):
         )
 
         # retrieve
-
-        retrieve_chunk_size = default(chunk_size, self.retrieve_chunk_size)
-
-        if retrieve_chunk_size != 1:
-            if exists(prev_layer_updates):
-                prev_layer_updates = prev_layer_updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
-
-            updates = updates.apply(lambda t: pad_at_dim(t, (1, 0), dim = 1))
 
         retrieved = self.retrieve_memories(
             seq,
