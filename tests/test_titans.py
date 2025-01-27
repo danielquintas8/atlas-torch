@@ -86,66 +86,6 @@ def test_retrieve_store_diff_seq():
 
     assert retrieve_seq.shape == retrieved.shape
 
-def test_weight_tied_mlp_neural_mem():
-    from titans_pytorch import MemoryMLP
-
-    mlp = MemoryMLP(64, depth = 2)
-
-    mem  = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
-        heads = 2,
-        chunk_size = 2,
-        model = mlp
-    )
-
-    mem2 = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
-        heads = 2,
-        chunk_size = 2,
-        model = mlp
-    )
-
-    mem3 = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
-        heads = 2,
-        chunk_size = 2,
-        model = mlp
-    )
-
-    seq = torch.randn(2, 128, 384)
-
-    seq, cache = mem(seq)
-    seq, cache2 = mem2(seq, prev_layer_updates = cache.updates)
-    seq, cache3 = mem3(seq, prev_layer_updates = cache2.updates)
-
-def test_mac_with_weight_tied_neural_mem():
-    from titans_pytorch import MemoryMLP, MemoryAsContextTransformer
-
-    transformer = MemoryAsContextTransformer(
-        num_tokens = 256,
-        dim = 256,
-        depth = 2,
-        segment_len = 2,
-        num_persist_mem_tokens = 0,
-        num_longterm_mem_tokens = 2,
-        neural_memory_segment_len = 2,
-        sliding_window_attn = True,
-        neural_memory_layers = (1, 2),
-        neural_memory_model = MemoryMLP(256, depth = 1),
-        num_residual_streams = 4,
-        weight_tie_memory_model = True,
-        neural_mem_gate_attn_output = True,
-    )
-
-
-    ids = torch.randint(0, 256, (1, 1023))
-    logits = transformer(ids)
-
-    assert logits.shape == (1, 1023, 256)
-
 def test_overriding_chunk_size():
     mem = NeuralMemory(
         dim = 384,
