@@ -34,6 +34,7 @@ NEURAL_MEM_LAYERS = (2, 4, 6)                   # layers 2, 4, 6 have neural mem
 NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
 NEURAL_MEM_QK_NORM = True
+NEURAL_MEM_MAX_LR = 1e-1
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = 2                      # set smaller for more granularity for learning rate / momentum etc
 NEURAL_MEM_BATCH_SIZE = 128                     # set smaller to update the neural memory weights more often as it traverses the sequence
@@ -98,6 +99,7 @@ model = MemoryAsContextTransformer(
         attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
         qk_rmsnorm = NEURAL_MEM_QK_NORM,
         momentum = NEURAL_MEM_MOMENTUM,
+        default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
         per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR
     )
