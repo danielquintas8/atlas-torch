@@ -99,6 +99,26 @@ def test_overriding_chunk_size():
 
     assert seq.shape == retrieved.shape
 
+def test_neural_mem_chaining_chunks():
+    mem  = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 16
+    )
+
+    seq = torch.randn(2, 48, 384)
+
+    parallel_retrieved, state = mem(seq)
+
+    seq_first, seq_second, seq_third = seq.split(16, dim = 1)
+
+    first_retrieved, state = mem(seq_first)
+    second_retrieved, state = mem(seq_second, state = state)
+    third_retrieved, state = mem(seq_third, state = state)
+
+    assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1), atol = 1e-5)
+
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))

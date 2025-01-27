@@ -73,6 +73,9 @@ def safe_cat(inputs, dim = -2):
 
     return cat(inputs, dim = dim)
 
+def is_empty_tensor(t):
+    return t.numel() == 0
+
 def dict_get_shape(td):
     return {k: v.shape for k, v in td.items()}
 
@@ -118,7 +121,7 @@ def softclamp_max(t, max_value):
     return ((t / half_max_value).tanh() * half_max_value) + half_max_value
 
 def softclamp_grad_norm(t, max_value):
-    if t.numel() == 0:
+    if is_empty_tensor(t):
         return t
 
     t, inverse = pack_one_with_inverse(t, 'bn *')
@@ -691,9 +694,8 @@ class NeuralMemory(Module):
     def forward_inference(
         self,
         token: Tensor,
-        state = None,
+        state: NeuralMemCache | None = None,
     ):
-
         # unpack previous state
 
         if not exists(state):
@@ -706,6 +708,8 @@ class NeuralMemory(Module):
 
         if token.ndim == 2:
             token = rearrange(token, 'b d -> b 1 d')
+
+        assert token.shape[1] == 1
 
         # increment the sequence cache which is at most the chunk size
 
@@ -757,13 +761,17 @@ class NeuralMemory(Module):
         self,
         seq,
         store_seq = None,
-        mem_model_weights: dict[str, Tensor] | None = None,
-        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         chunk_size = None,
         store_chunk_size = None,
-        return_next_state = False,
+        state: NeuralMemCache | None = None,
     ):
-        batch, seq_len = seq.shape[:2]
+
+        if not exists(state):
+            state = (0, None, None, None, None)
+
+        seq_index, weights, cache_store_seq, past_state, updates = state
+
+        assert not exists(cache_store_seq) or is_empty_tensor(cache_store_seq)
 
         # store
 
@@ -771,7 +779,8 @@ class NeuralMemory(Module):
 
         updates, next_store_state = self.store_memories(
             store_seq,
-            mem_model_weights,
+            weights,
+            past_state = past_state,
             chunk_size = store_chunk_size,
         )
 
@@ -783,6 +792,4 @@ class NeuralMemory(Module):
             chunk_size = chunk_size,
         )
 
-        output = (retrieved, next_store_state)
-
-        return output
+        return retrieved, next_store_state
