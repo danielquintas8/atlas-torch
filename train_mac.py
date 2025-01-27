@@ -37,11 +37,8 @@ NEURAL_MEM_QK_NORM = True
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = WINDOW_SIZE // 2       # set smaller for more granularity for learning rate / momentum etc
 SLIDING_WINDOWS = True
-WEIGHT_TIE_MEMORY_MODEL = False                 # set to have memory MLP shared across layers
-PREV_MEM_UPDATE_FOR_WEIGHTS = True,
 STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
-KV_RECON_LOSS_WEIGHT = 1.
 
 # experiment related
 
@@ -87,11 +84,8 @@ model = MemoryAsContextTransformer(
     neural_memory_layers = NEURAL_MEM_LAYERS,
     neural_memory_segment_len = NEURAL_MEM_SEGMENT_LEN,
     neural_mem_gate_attn_output = NEURAL_MEM_GATE_ATTN_OUTPUT,
-    aux_kv_recon_loss_weight = KV_RECON_LOSS_WEIGHT,
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
-    weight_tie_memory_model = WEIGHT_TIE_MEMORY_MODEL,
-    prev_neural_mem_update_for_weights = PREV_MEM_UPDATE_FOR_WEIGHTS,
     neural_memory_model = MemoryMLP(
         dim = 64,
         depth = NEURAL_MEMORY_DEPTH
@@ -143,20 +137,20 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss, (ar_loss, kv_recon_losses) = model(next(train_loader), return_loss = True, return_loss_breakdown = True)
+        loss = model(next(train_loader), return_loss = True)
         loss.backward()
 
-    print(f'training loss: {ar_loss.item()}')
+    print(f'training loss: {loss.item()}')
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = ar_loss.item()))
+    wandb.log(dict(loss = loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss, (ar_loss, _) = model(next(val_loader), return_loss = True, return_loss_breakdown = True)
-            print(f'validation loss: {ar_loss.item()}')
+            loss = model(next(val_loader), return_loss = True)
+            print(f'validation loss: {loss.item()}')
 
     if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()

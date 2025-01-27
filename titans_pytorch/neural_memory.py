@@ -248,7 +248,7 @@ class AssocScan(Module):
             outputs = outputs[..., :seq_len]
             outputs = rearrange(outputs, 'b d n -> b n d')
 
-            return inverse_pack_weight_shape(outputs)
+            return outputs
 
         out = accelerate_scan_fn(gates, inputs)
 
@@ -275,7 +275,7 @@ class NeuralMemory(Module):
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
         adaptive_step_transform: Callable | None = None,
-        default_step_transform_max_lr = 1e-2,
+        default_step_transform_max_lr = 1.,
         per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
         max_mem_layer_modulation = 1e1, # max of 10.
         attn_pool_chunks = False,
@@ -364,11 +364,11 @@ class NeuralMemory(Module):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
             weighted_loss = loss * loss_weights
-            return weighted_loss.sum(), weighted_loss.mean()
+            return weighted_loss.sum()
 
         # two functions
 
-        grad_fn = grad(forward_and_loss, has_aux = True)
+        grad_fn = grad(forward_and_loss)
 
         self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
@@ -460,7 +460,6 @@ class NeuralMemory(Module):
         seq,
         weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        return_aux_kv_loss = False,
         chunk_size = None,
     ):
         batch, seq_len, heads, chunk_size = *seq.shape[:2], self.heads, default(chunk_size, self.store_chunk_size)
@@ -531,7 +530,7 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads, aux_kv_recon_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+        grads = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
@@ -573,10 +572,7 @@ class NeuralMemory(Module):
 
             output = (updates, next_store_state)
 
-            if not return_aux_kv_loss:
-                return output
-
-            return output, self.zero
+            return output
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
@@ -617,10 +613,7 @@ class NeuralMemory(Module):
 
         output = (updates, next_store_state)
 
-        if not return_aux_kv_loss:
-            return output
-
-        return output, aux_kv_recon_loss.mean()
+        return output
 
     def retrieve_memories(
         self,
@@ -766,7 +759,6 @@ class NeuralMemory(Module):
         store_seq = None,
         mem_model_weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        return_aux_kv_loss = False,
         chunk_size = None,
         store_chunk_size = None,
         return_next_state = False,
@@ -777,11 +769,10 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        (updates, next_store_state), aux_kv_recon_loss = self.store_memories(
+        updates, next_store_state = self.store_memories(
             store_seq,
             mem_model_weights,
             chunk_size = store_chunk_size,
-            return_aux_kv_loss = True
         )
 
         # retrieve
@@ -794,7 +785,4 @@ class NeuralMemory(Module):
 
         output = (retrieved, next_store_state)
 
-        if not return_aux_kv_loss:
-            return output
-
-        return output, aux_kv_recon_loss
+        return output

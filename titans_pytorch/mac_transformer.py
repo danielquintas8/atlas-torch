@@ -488,7 +488,6 @@ class MemoryAsContextTransformer(Module):
         neural_memory_model: Module | None = None,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
-        aux_kv_recon_loss_weight = 1.,
         use_flex_attn = False,
         sliding_window_attn = False,
     ):
@@ -573,10 +572,7 @@ class MemoryAsContextTransformer(Module):
 
         self.gate_attn_output = neural_mem_gate_attn_output
 
-        # auxiliary loss on kv recon
-
-        self.has_aux_kv_recon_loss = aux_kv_recon_loss_weight > 0.
-        self.aux_kv_recon_loss_weight = aux_kv_recon_loss_weight
+        # zero for maybe aux loss + device
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
@@ -741,10 +737,6 @@ class MemoryAsContextTransformer(Module):
 
         value_residual = None
 
-        # aux losses
-
-        kv_recon_losses = self.zero
-
         # when inferencing, only do one token at a time
 
         if is_inferencing:
@@ -768,12 +760,9 @@ class MemoryAsContextTransformer(Module):
                 mem_input, add_residual = mem_hyper_conn(x)
 
                 if not is_inferencing:
-                    (retrieved, next_neural_mem_cache), mem_kv_aux_loss = mem(
-                        mem_input,
-                        return_aux_kv_loss = True,
+                    retrieved, next_neural_mem_cache = mem(
+                        mem_input
                     )
-
-                    kv_recon_losses = kv_recon_losses + mem_kv_aux_loss
 
                 else:
                     (retrieved, next_neural_mem_cache) = mem.forward_inference(
@@ -862,14 +851,4 @@ class MemoryAsContextTransformer(Module):
 
             return logits, next_cache
 
-        ar_loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
-
-        losses = ar_loss
-
-        if self.has_aux_kv_recon_loss:
-            losses = losses + kv_recon_losses * self.aux_kv_recon_loss_weight
-
-        if not return_loss_breakdown:
-            return losses
-
-        return losses, (ar_loss, kv_recon_losses)
+        return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
