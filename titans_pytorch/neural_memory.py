@@ -288,7 +288,7 @@ class NeuralMemory(Module):
         attn_pool_chunks = False,
         momentum = True,
         pre_rmsnorm = True,
-        post_rmsnorm = True,
+        post_rmsnorm = False,
         qk_rmsnorm = False,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
