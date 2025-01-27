@@ -6,7 +6,7 @@ from functools import partial
 from collections import namedtuple
 
 import torch
-from torch import nn, cat, Tensor
+from torch import nn, cat, tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, Parameter, ParameterList
 from torch.func import functional_call, vmap, grad
@@ -39,7 +39,7 @@ w - num memory network weight parameters
 LinearNoBias = partial(Linear, bias = False)
 
 NeuralMemCache = namedtuple('NeuralMemCache', [
-    'seq',
+    'seq_index',
     'weights',
     'cache_store_segment',
     'states',
@@ -62,6 +62,9 @@ def identity(t):
 
 def xnor(x, y):
     return not (x ^ y)
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def safe_cat(inputs, dim = -2):
     inputs = tuple(filter(exists, inputs))
@@ -273,6 +276,7 @@ class NeuralMemory(Module):
         self,
         dim,
         chunk_size: int | tuple[int, int] = 1,
+        batch_size = None,
         dim_head = None,
         heads = 1,
         model: Module | None = None,
@@ -298,6 +302,13 @@ class NeuralMemory(Module):
         assert not (heads == 1 and dim_head != dim)
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
+
+        # batch size
+
+        if exists(batch_size):
+            assert divisible_by(batch_size, self.store_chunk_size)
+
+        self.batch_size = batch_size
 
         # associative scan
 
@@ -463,9 +474,9 @@ class NeuralMemory(Module):
         seq,
         weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        chunk_size = None,
+        seq_index = 0
     ):
-        batch, seq_len, heads, chunk_size = *seq.shape[:2], self.heads, default(chunk_size, self.store_chunk_size)
+        batch, seq_len, heads, chunk_size = *seq.shape[:2], self.heads, self.store_chunk_size
 
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
@@ -474,6 +485,8 @@ class NeuralMemory(Module):
         num_chunks = round_down_seq_len // chunk_size
 
         seq, remainder = seq[:, :round_down_seq_len], seq[:, round_down_seq_len:]
+
+        next_seq_len_index = seq_index + round_down_seq_len
 
         # init weights if needed
         # weights of the memory network
@@ -571,7 +584,7 @@ class NeuralMemory(Module):
 
         if num_chunks == 0:
             updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
-            next_store_state = NeuralMemCache(seq_len, weights, remainder, past_state, updates)
+            next_store_state = NeuralMemCache(next_seq_len_index, weights, remainder, past_state, updates)
 
             output = (updates, next_store_state)
 
@@ -610,7 +623,7 @@ class NeuralMemory(Module):
 
         next_state = (next_last_update, next_last_momentum)
 
-        next_store_state = NeuralMemCache(seq_len, weights, remainder, next_state, updates)
+        next_store_state = NeuralMemCache(next_seq_len_index, weights, remainder, next_state, updates)
 
         # returns
 
@@ -622,9 +635,8 @@ class NeuralMemory(Module):
         self,
         seq,
         past_weights: dict[str, Tensor],
-        chunk_size = None,
     ):
-        chunk_size = default(chunk_size, self.retrieve_chunk_size)
+        chunk_size = self.retrieve_chunk_size
         batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
@@ -761,11 +773,8 @@ class NeuralMemory(Module):
         self,
         seq,
         store_seq = None,
-        chunk_size = None,
-        store_chunk_size = None,
         state: NeuralMemCache | None = None,
     ):
-
         if not exists(state):
             state = (0, None, None, None, None)
 
@@ -777,19 +786,86 @@ class NeuralMemory(Module):
 
         store_seq = default(store_seq, seq)
 
-        updates, next_store_state = self.store_memories(
-            store_seq,
-            weights,
-            past_state = past_state,
-            chunk_size = store_chunk_size,
-        )
+        # functions
+
+        # compute split sizes of sequence
+        # for now manually update weights to last update at the correct boundaries
+
+        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, self.batch_size
+
+        need_update_weights = exists(batch_size)
+
+        # determine split sizes and when to update
+
+        if need_update_weights:
+            update_after_final_store = divisible_by(seq_index + store_seq_len, batch_size)
+
+            seq_range = torch.arange(store_seq_len) + seq_index + 1
+            batch_boundary = divisible_by(seq_range, batch_size)
+
+            indices = seq_range[batch_boundary] - seq_index
+
+            indices = F.pad(indices, (1, 0), value = 0)
+
+            if indices[-1] != store_seq_len:
+                indices = F.pad(indices, (0, 1), value = store_seq_len)
+
+            split_sizes = (indices[1:] - indices[:-1]).tolist()
+
+            assert sum(split_sizes) == store_seq_len
+        else:
+            split_sizes = (store_seq_len,)
+            update_after_final_store = False
+
+        # accumulate updates
+
+        updates = None
+
+        def accum_updates(past_updates, future_updates):
+            if not exists(past_updates):
+                return future_updates
+
+            return TensorDict({param_name: cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
+
+        # loop through chunks of store sequences
+
+        store_seqs = store_seq.split(split_sizes, dim = -2)
+
+        for ind, store_seq_chunk in enumerate(store_seqs):
+            is_last = ind == (len(store_seqs) - 1)
+
+            # store
+
+            next_updates, next_neural_mem_state = self.store_memories(
+                store_seq_chunk,
+                weights,
+                seq_index = seq_index,
+                past_state = past_state,
+            )
+
+            seq_index = next_neural_mem_state.seq_index
+            past_state = next_neural_mem_state.states
+
+            updates = accum_updates(updates, next_updates)
+
+            if is_last and not update_after_final_store:
+                continue
+
+            # update weights once batch size is fulfilled
+
+            last_update, _ = past_state
+
+            weights = last_update
+
+            next_neural_mem_state = list(next_neural_mem_state)
+            next_neural_mem_state[1] = last_update
+            next_neural_mem_state = NeuralMemCache(*next_neural_mem_state)
 
         # retrieve
 
         retrieved = self.retrieve_memories(
             seq,
-            updates,
-            chunk_size = chunk_size,
+            updates
         )
 
-        return retrieved, next_store_state
+        return retrieved, next_neural_mem_state

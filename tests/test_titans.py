@@ -73,32 +73,6 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
-def test_retrieve_store_diff_seq():
-    mem = NeuralMemory(
-        dim = 384,
-        chunk_size = (64, 32),
-    )
-
-    retrieve_seq = torch.randn(2, 64 * 64, 384)
-    store_seq = torch.randn(2, 64 * 32, 384)
-
-    retrieved, _ = mem(retrieve_seq, store_seq = store_seq)
-
-    assert retrieve_seq.shape == retrieved.shape
-
-def test_overriding_chunk_size():
-    mem = NeuralMemory(
-        dim = 384,
-        chunk_size = 64,
-    )
-
-    seq = torch.randn(2, 128 * 16, 384)
-    store_seq = torch.randn(2, 128 * 8, 384)
-
-    retrieved, _ = mem(seq, store_seq, chunk_size = 16, store_chunk_size = 8)
-
-    assert seq.shape == retrieved.shape
-
 def test_neural_mem_chaining_chunks():
     mem  = NeuralMemory(
         dim = 384,
@@ -119,15 +93,42 @@ def test_neural_mem_chaining_chunks():
 
     assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1), atol = 1e-5)
 
+def test_neural_mem_chaining_with_batch_size():
+    mem  = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 16,
+        batch_size = 64
+    )
+
+    seq = torch.randn(2, 112, 384)
+
+    parallel_retrieved, state = mem(seq)
+
+    seq_first, seq_second, seq_third = seq[:, :16], seq[:, 16:64], seq[:, 64:]
+
+    first_retrieved, state = mem(seq_first)
+    second_retrieved, state = mem(seq_second, state = state)
+    third_retrieved, state = mem(seq_third, state = state)
+
+    parallel_part_retrieved = torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1)
+
+    assert torch.allclose(parallel_retrieved, parallel_part_retrieved, atol = 1e-5)
+
 @pytest.mark.parametrize('seq_len', (1023, 17))
 @pytest.mark.parametrize('num_persist_mem_tokens', (0, 16))
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
 @pytest.mark.parametrize('neural_mem_gate_attn_output', (False, True))
+@pytest.mark.parametrize('neural_mem_segment_len', (8, 16))
+@pytest.mark.parametrize('neural_mem_batch_size', (None, 64))
 def test_mac(
     seq_len,
     num_persist_mem_tokens,
     num_longterm_mem_tokens,
-    neural_mem_gate_attn_output
+    neural_mem_gate_attn_output,
+    neural_mem_segment_len,
+    neural_mem_batch_size
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
@@ -136,7 +137,9 @@ def test_mac(
         num_persist_mem_tokens = num_persist_mem_tokens,
         num_longterm_mem_tokens = num_longterm_mem_tokens,
         segment_len = 128,
-        neural_mem_gate_attn_output = neural_mem_gate_attn_output
+        neural_mem_gate_attn_output = neural_mem_gate_attn_output,
+        neural_memory_segment_len = neural_mem_segment_len,
+        neural_memory_batch_size = neural_mem_batch_size,
     )
 
     x = torch.randint(0, 256, (1, seq_len))

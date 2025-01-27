@@ -481,6 +481,7 @@ class MemoryAsContextTransformer(Module):
         neural_memory_add_value_residual = False,
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
+        neural_memory_batch_size = None,
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
@@ -551,6 +552,7 @@ class MemoryAsContextTransformer(Module):
                 mem = NeuralMemory(
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
+                    batch_size = neural_memory_batch_size,
                     model = deepcopy(neural_memory_model),
                     **neural_memory_kwargs
                 )
