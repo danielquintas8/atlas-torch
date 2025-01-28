@@ -869,13 +869,15 @@ class NeuralMemory(Module):
 
             # update weights once batch size is fulfilled
 
-            last_update, _ = past_state
+            last_update, last_momentum = past_state
 
             if exists(gate):
                 weights = TensorDict({param_name: one_weight.lerp(one_last_update, gate) for (param_name, one_weight), (_, one_last_update) in zip(weights.items(), last_update.items())})
             else:
                 weights = last_update
 
+            past_state = (weights, last_momentum)
+            next_neural_mem_state = tuple_index_set(next_neural_mem_state, -2, past_state)
             next_neural_mem_state = tuple_index_set(next_neural_mem_state, 1, weights)
 
         next_neural_mem_state = tuple_index_set(next_neural_mem_state, -1, updates)
