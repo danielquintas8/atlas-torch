@@ -296,6 +296,7 @@ class NeuralMemory(Module):
         init_adaptive_step_bias = None,
         init_momentum_bias = None,
         init_decay_bias = None,
+        learned_weight_residual = False,
         default_model_kwargs: dict = dict(
             depth = 2
         )
@@ -438,6 +439,14 @@ class NeuralMemory(Module):
 
         self.max_mem_layer_modulation = max_mem_layer_modulation
 
+        # learned weight residual
+
+        self.to_learned_weight_residual_mix = Sequential(
+            nn.Linear(dim, heads),
+            Rearrange('b n h -> b h n'),
+            nn.Sigmoid()
+        ) if learned_weight_residual else None
+
         # allow for softclamp the gradient norms for storing memories
 
         self.max_grad_norm = max_grad_norm
@@ -563,12 +572,20 @@ class NeuralMemory(Module):
 
         # maybe add previous layer weight
 
+        assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
+
         if exists(prev_weights):
 
             start_index = math.ceil(seq_index / chunk_size)
             end_index = start_index + num_chunks
 
             prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
+
+            if exists(self.to_learned_weight_residual_mix):
+                mix = self.to_learned_weight_residual_mix(chunked_seq)
+                mix = rearrange(mix, 'b h n -> (b h) n')
+
+                prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 
             weights_for_surprise = weights_for_surprise + prev_weights
 

@@ -149,6 +149,7 @@ def test_neural_mem_chaining_with_batch_size():
 @pytest.mark.parametrize('num_longterm_mem_tokens', (0, 16))
 @pytest.mark.parametrize('neural_mem_gate_attn_output', (False, True))
 @pytest.mark.parametrize('neural_mem_segment_len', (8, 16))
+@pytest.mark.parametrize('neural_mem_weight_residual', (False, True))
 @pytest.mark.parametrize('neural_mem_batch_size', (None, 64))
 def test_mac(
     seq_len,
@@ -156,7 +157,8 @@ def test_mac(
     num_longterm_mem_tokens,
     neural_mem_gate_attn_output,
     neural_mem_segment_len,
-    neural_mem_batch_size
+    neural_mem_weight_residual,
+    neural_mem_batch_size,
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
@@ -168,6 +170,7 @@ def test_mac(
         neural_mem_gate_attn_output = neural_mem_gate_attn_output,
         neural_memory_segment_len = neural_mem_segment_len,
         neural_memory_batch_size = neural_mem_batch_size,
+        neural_mem_weight_residual = neural_mem_weight_residual
     )
 
     x = torch.randint(0, 256, (1, seq_len))

@@ -491,7 +491,7 @@ class MemoryAsContextTransformer(Module):
         neural_memory_layers: tuple[int, ...] | None = None,
         use_flex_attn = False,
         sliding_window_attn = False,
-        neural_mem_weight_residual = False
+        neural_mem_weight_residual = False,
     ):
         super().__init__()
 
@@ -525,7 +525,10 @@ class MemoryAsContextTransformer(Module):
 
         neural_memory_layers = default(neural_memory_layers, layers)
 
+        # weight residual related
+
         self.neural_mem_weight_residual = neural_mem_weight_residual
+        is_first_neural_mem = True
 
         # mem, attn, and feedforward layers
 
@@ -557,8 +560,11 @@ class MemoryAsContextTransformer(Module):
                     chunk_size = self.neural_memory_segment_len,
                     batch_size = neural_memory_batch_size,
                     model = deepcopy(neural_memory_model),
+                    learned_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
                     **neural_memory_kwargs
                 )
+
+                is_first_neural_mem = False
 
             ff = FeedForward(dim = dim, mult = ff_mult)
 
