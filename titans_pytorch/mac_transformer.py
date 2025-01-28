@@ -560,7 +560,7 @@ class MemoryAsContextTransformer(Module):
                     chunk_size = self.neural_memory_segment_len,
                     batch_size = neural_memory_batch_size,
                     model = deepcopy(neural_memory_model),
-                    learned_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
+                    accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
                     **neural_memory_kwargs
                 )
 
