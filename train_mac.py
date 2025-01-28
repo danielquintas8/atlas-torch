@@ -38,10 +38,10 @@ NEURAL_MEM_MAX_LR = 1e-1
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = 4                      # set smaller for more granularity for learning rate / momentum etc
 NEURAL_MEM_BATCH_SIZE = 128                     # set smaller to update the neural memory weights more often as it traverses the sequence
-NEURAL_MEM_WEIGHT_RESIDUAL = False
 SLIDING_WINDOWS = True
 STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
+NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributions from the weights of the previous neural mem layer brings about significant improvements. this was improvised and not in the paper, but inspired by the value residual learning free lunch paper
 
 # experiment related
 
