@@ -105,7 +105,8 @@ def test_neural_mem_chaining_with_weight_residual():
         dim = 384,
         dim_head = 64,
         heads = 2,
-        chunk_size = 64
+        chunk_size = 64,
+        accept_weight_residual = True
     )
 
     seq = torch.randn(2, 256, 384)

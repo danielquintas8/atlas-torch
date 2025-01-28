@@ -1,6 +1,6 @@
 [project]
 name = "titans-pytorch"
-version = "0.2.18"
+version = "0.2.19"
 description = "Titans"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

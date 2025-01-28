@@ -66,6 +66,12 @@ def xnor(x, y):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def tuple_index_set(t: tuple, index, value):
+    klass = type(t)
+    t = list(t)
+    t[index] = value
+    return klass(*t)
+
 def safe_cat(inputs, dim = -2):
     inputs = tuple(filter(exists, inputs))
 
@@ -296,7 +302,7 @@ class NeuralMemory(Module):
         init_adaptive_step_bias = None,
         init_momentum_bias = None,
         init_decay_bias = None,
-        learned_weight_residual = False,
+        accept_weight_residual = False,
         default_model_kwargs: dict = dict(
             depth = 2
         )
@@ -445,7 +451,7 @@ class NeuralMemory(Module):
             nn.Linear(dim, heads),
             Rearrange('b n h -> b h n'),
             nn.Sigmoid()
-        ) if learned_weight_residual else None
+        ) if accept_weight_residual else None
 
         # allow for softclamp the gradient norms for storing memories
 
@@ -584,7 +590,6 @@ class NeuralMemory(Module):
             if exists(self.to_learned_weight_residual_mix):
                 mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
-
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 
             weights_for_surprise = weights_for_surprise + prev_weights
@@ -854,9 +859,9 @@ class NeuralMemory(Module):
 
             weights = last_update
 
-            next_neural_mem_state = list(next_neural_mem_state)
-            next_neural_mem_state[1] = last_update
-            next_neural_mem_state = NeuralMemCache(*next_neural_mem_state)
+            next_neural_mem_state = tuple_index_set(next_neural_mem_state, 1, last_update)
+
+        next_neural_mem_state = tuple_index_set(next_neural_mem_state, -1, updates)
 
         # retrieve
 
