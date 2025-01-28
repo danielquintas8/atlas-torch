@@ -494,7 +494,8 @@ class NeuralMemory(Module):
         seq,
         weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        seq_index = 0
+        seq_index = 0,
+        prev_weights = None
     ):
         batch, seq_len, heads, chunk_size = *seq.shape[:2], self.heads, self.store_chunk_size
 
@@ -559,6 +560,12 @@ class NeuralMemory(Module):
         keys, values = tuple(rearrange(t, 'b h (n c) d -> (b h n) c d', c = chunk_size) for t in (keys, values))
 
         adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = chunk_size)
+
+        # maybe add previous layer weight
+
+        if exists(prev_weights):
+            prev_weights = prev_weights.apply(lambda t: t[:, -1:])
+            weights_for_surprise = weights_for_surprise + prev_weights
 
         # flatten batch and time if surprise depends on previous layer memory model
 
@@ -732,6 +739,7 @@ class NeuralMemory(Module):
         seq,
         store_seq = None,
         state: NeuralMemCache | None = None,
+        prev_weights = None
     ):
         if seq.ndim == 2:
             seq = rearrange(seq, 'b d -> b 1 d')
@@ -807,6 +815,7 @@ class NeuralMemory(Module):
                 weights,
                 seq_index = seq_index,
                 past_state = past_state,
+                prev_weights = prev_weights
             )
 
             seq_index = next_neural_mem_state.seq_index

@@ -491,6 +491,7 @@ class MemoryAsContextTransformer(Module):
         neural_memory_layers: tuple[int, ...] | None = None,
         use_flex_attn = False,
         sliding_window_attn = False,
+        neural_mem_weight_residual = False
     ):
         super().__init__()
 
@@ -523,6 +524,8 @@ class MemoryAsContextTransformer(Module):
         layers = tuple(range(1, depth + 1))
 
         neural_memory_layers = default(neural_memory_layers, layers)
+
+        self.neural_mem_weight_residual = neural_mem_weight_residual
 
         # mem, attn, and feedforward layers
 
@@ -739,6 +742,10 @@ class MemoryAsContextTransformer(Module):
 
         value_residual = None
 
+        # neural mem weight residual
+
+        mem_weight_residual = None
+
         # when inferencing, only do one token at a time
 
         if is_inferencing:
@@ -764,7 +771,11 @@ class MemoryAsContextTransformer(Module):
                 retrieved, next_neural_mem_cache = mem.forward(
                     mem_input,
                     state = next(neural_mem_caches, None),
+                    prev_weights = mem_weight_residual
                 )
+
+                if self.neural_mem_weight_residual:
+                    mem_weight_residual = next_neural_mem_cache.updates
 
                 if self.gate_attn_output:
                     attn_out_gates = retrieved.sigmoid()
