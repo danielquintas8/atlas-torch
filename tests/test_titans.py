@@ -73,12 +73,16 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
-def test_neural_mem_chaining_chunks():
+@pytest.mark.parametrize('gated_transition', (True, False))
+def test_neural_mem_chaining_chunks(
+    gated_transition
+):
     mem  = NeuralMemory(
         dim = 384,
         dim_head = 64,
         heads = 2,
-        chunk_size = 16
+        chunk_size = 16,
+        gated_transition = gated_transition
     )
 
     seq = torch.randn(2, 48, 384)
