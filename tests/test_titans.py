@@ -220,16 +220,19 @@ def test_mac_sampling(
 @pytest.mark.parametrize('seq_len', (2, 64, 256))
 @pytest.mark.parametrize('prompt_len', (0, 65))
 @pytest.mark.parametrize('mem_chunk_size', (2, 32, 64))
+@pytest.mark.parametrize('gated_transition', (False, True))
 @torch_default_dtype(torch.float64)
 def test_neural_mem_inference(
     seq_len,
     prompt_len,
-    mem_chunk_size
+    mem_chunk_size,
+    gated_transition
 ):
 
     mem = NeuralMemory(
         dim = 384,
         chunk_size = mem_chunk_size,
+        gated_transition = gated_transition
     )
 
     seq = torch.randn(2, seq_len, 384)

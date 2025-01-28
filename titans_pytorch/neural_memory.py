@@ -66,12 +66,6 @@ def xnor(x, y):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def tuple_index_set(t: tuple, index, value):
-    klass = type(t)
-    t = list(t)
-    t[index] = value
-    return klass(*t)
-
 def safe_cat(inputs, dim = -2):
     inputs = tuple(filter(exists, inputs))
 
@@ -872,15 +866,20 @@ class NeuralMemory(Module):
             last_update, last_momentum = past_state
 
             if exists(gate):
-                weights = TensorDict({param_name: one_weight.lerp(one_last_update, gate) for (param_name, one_weight), (_, one_last_update) in zip(weights.items(), last_update.items())})
-            else:
-                weights = last_update
+                last_update = TensorDict({param_name: one_weight.lerp(one_last_update, gate) for (param_name, one_weight), (_, one_last_update) in zip(weights.items(), last_update.items())})
 
-            past_state = (weights, last_momentum)
-            next_neural_mem_state = tuple_index_set(next_neural_mem_state, -2, past_state)
-            next_neural_mem_state = tuple_index_set(next_neural_mem_state, 1, weights)
+            past_state = (last_update, last_momentum)
 
-        next_neural_mem_state = tuple_index_set(next_neural_mem_state, -1, updates)
+            # set weights to the last updated weights for the last minibatch
+
+            weights = last_update
+
+            next_neural_mem_state = next_neural_mem_state._replace(
+                weights = weights,
+                states = past_state,
+            )
+
+        next_neural_mem_state = next_neural_mem_state._replace(updates = updates)
 
         # retrieve
 
@@ -891,7 +890,8 @@ class NeuralMemory(Module):
             retrieve_chunk_size = 1
             need_pad = False
 
-            last_update, _ = past_state
+            last_update, _ = next_neural_mem_state.states
+
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
 
         retrieved = self.retrieve_memories(
