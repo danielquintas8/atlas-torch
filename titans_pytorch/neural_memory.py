@@ -564,7 +564,12 @@ class NeuralMemory(Module):
         # maybe add previous layer weight
 
         if exists(prev_weights):
-            prev_weights = prev_weights.apply(lambda t: t[:, -1:])
+
+            start_index = math.ceil(seq_index / chunk_size)
+            end_index = start_index + num_chunks
+
+            prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
+
             weights_for_surprise = weights_for_surprise + prev_weights
 
         # flatten batch and time if surprise depends on previous layer memory model

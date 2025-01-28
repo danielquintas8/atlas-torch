@@ -93,6 +93,34 @@ def test_neural_mem_chaining_chunks():
 
     assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved, third_retrieved), dim = 1), atol = 1e-5)
 
+def test_neural_mem_chaining_with_weight_residual():
+    mem  = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 64
+    )
+
+    mem2 = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 64
+    )
+
+    seq = torch.randn(2, 256, 384)
+
+    seq, state = mem(seq)
+
+    parallel_retrieved, _ = mem2(seq, prev_weights = state.updates)
+
+    seq_first, seq_second = seq[:, :128], seq[:, 128:]
+
+    first_retrieved, state1 = mem2(seq_first, prev_weights = state.updates)
+    second_retrieved, state2 = mem2(seq_second, state = state1, prev_weights = state.updates)
+
+    assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved), dim = 1), atol = 1e-6)
+
 def test_neural_mem_chaining_with_batch_size():
     mem  = NeuralMemory(
         dim = 384,
