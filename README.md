@@ -150,6 +150,6 @@ $ python train_mac.py
     eprint  = {2501.12352},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url = {https://arxiv.org/abs/2501.12352},
+    url     = {https://arxiv.org/abs/2501.12352},
 }
 ```
