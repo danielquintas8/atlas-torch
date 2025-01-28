@@ -858,6 +858,7 @@ class NeuralMemory(Module):
                 prev_weights = prev_weights
             )
 
+            weights = next_neural_mem_state.weights
             seq_index = next_neural_mem_state.seq_index
             past_state = next_neural_mem_state.states
 
@@ -871,8 +872,7 @@ class NeuralMemory(Module):
             last_update, _ = past_state
 
             if exists(gate):
-                curr_weights = next_neural_mem_state.updates.apply(lambda t: t[:, 0])
-                weights = TensorDict({param_name: v1.lerp(v2, gate) for (param_name, v1), (_, v2) in zip(curr_weights.items(), last_update.items())})
+                weights = TensorDict({param_name: v1.lerp(v2, gate) for (param_name, v1), (_, v2) in zip(weights.items(), last_update.items())})
             else:
                 weights = last_update
 
