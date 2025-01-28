@@ -587,7 +587,7 @@ class NeuralMemory(Module):
 
             prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
 
-            if exists(self.to_learned_weight_residual_mix):
+            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
                 mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
