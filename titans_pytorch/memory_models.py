@@ -36,10 +36,14 @@ class MemoryMLP(Module):
     def __init__(
         self,
         dim,
-        depth
+        depth,
+        expansion_factor = 4.
     ):
         super().__init__()
-        self.weights = ParameterList([Parameter(torch.randn(dim, dim)) for _ in range(depth)])
+        dim_hidden = int(dim * expansion_factor)
+        dims = (dim, *((dim_hidden,) * (depth - 1)), dim)
+
+        self.weights = ParameterList([Parameter(torch.randn(dim_in, dim_out)) for dim_in, dim_out in zip(dims[:-1], dims[1:])])
 
         self.ln = LayerNorm(dim)
 

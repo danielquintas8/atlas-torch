@@ -299,7 +299,8 @@ class NeuralMemory(Module):
         accept_weight_residual = False,
         gated_transition = False,
         default_model_kwargs: dict = dict(
-            depth = 2
+            depth = 2,
+            expansion_factor = 4.
         )
     ):
         super().__init__()
