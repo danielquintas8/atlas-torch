@@ -13,11 +13,7 @@ from torch.func import functional_call, vmap, grad
 
 from tensordict import TensorDict
 
-from titans_pytorch.associative_scan import (
-    associative_scan,
-    binary_operator,
-    pad_at_dim
-)
+from titans_pytorch.associative_scan import AssocScan
 
 from titans_pytorch.memory_models import(
     MemoryMLP
@@ -96,6 +92,11 @@ def round_down_multiple(seq, mult):
 
 def round_up_multiple(seq, mult):
     return math.ceil(seq / mult) * mult
+
+def pad_at_dim(t, pad, dim = -1, value = 0.):
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
 
 def pack_one_with_inverse(t, pattern):
     packed, packed_shape = pack([t], pattern)
@@ -196,72 +197,6 @@ class AttentionPool(Module):
         attn = attn_logits.softmax(dim = -2)
 
         return reduce(x * attn, 'b n c d -> b n d', 'sum')
-
-# associative scan wrapper
-
-class AssocScan(Module):
-    def __init__(
-        self,
-        use_accelerated = False
-    ):
-        super().__init__()
-        self.use_accelerated = use_accelerated
-
-    def forward(
-        self,
-        gates,
-        inputs,
-        prev = None,
-        remove_prev = None
-    ):
-        remove_prev = default(remove_prev, exists(prev))
-
-        inputs, inverse_pack_weight_shape = pack_one_with_inverse(inputs, 'b n *')
-        gates, _ = pack_one_with_inverse(gates, 'b n *')
-
-        if exists(prev):
-            prev, _ = pack_one_with_inverse(prev, 'b *')
-
-        if exists(prev):
-            inputs, _ = pack([prev, inputs], 'b * d')
-            gates = pad_at_dim(gates, (1, 0), value = 1., dim = -2)
-
-        if not self.use_accelerated:
-            _, out = associative_scan(binary_operator, (gates, inputs))
-
-            if remove_prev:
-                out = out[:, 1:]
-
-            return inverse_pack_weight_shape(out)
-
-        from accelerated_scan.triton import scan as triton_scan
-        from accelerated_scan.warp import scan as warp_scan
-
-        scan = triton_scan if gates.is_cuda else warp_scan
-
-        def accelerate_scan_fn(gates, inputs):
-            gates = gates.expand_as(inputs)
-            gates, inputs = tuple(rearrange(t, 'b n d -> b d n') for t in (gates, inputs))
-
-            seq_len = gates.shape[-1]
-            next_power_two_seq_len = 2 ** max(5, int(math.ceil(math.log2(seq_len))))
-
-            gates = F.pad(gates, (0, next_power_two_seq_len - seq_len))
-            inputs = F.pad(inputs, (0, next_power_two_seq_len - seq_len))
-
-            outputs = scan(gates.contiguous(), inputs.contiguous())
-
-            outputs = outputs[..., :seq_len]
-            outputs = rearrange(outputs, 'b d n -> b n d')
-
-            return outputs
-
-        out = accelerate_scan_fn(gates, inputs)
-
-        if remove_prev:
-            out = out[:, 1:]
-
-        return inverse_pack_weight_shape(out)
 
 # main neural memory
 
