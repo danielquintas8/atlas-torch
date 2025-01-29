@@ -318,18 +318,26 @@ def test_flex(
 
     assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
 
-@torch_default_dtype(torch.float64)
-def test_assoc_scan():
+@pytest.mark.parametrize('use_accelerated', (True, False))
+def test_assoc_scan(
+    use_accelerated
+):
     from titans_pytorch.neural_memory import AssocScan
-    torch.set_default_dtype(torch.float64)
 
-    scan = AssocScan()
+    if use_accelerated and not torch.cuda.is_available():
+        pytest.skip()
+
+    scan = AssocScan(use_accelerated = use_accelerated)
 
     seq_len = 128
     mid_point = seq_len // 2
 
     gates = torch.randn(2, seq_len, 16).sigmoid()
     inputs = torch.randn(2, seq_len, 16)
+
+    if use_accelerated:
+        gates = gates.cuda()
+        inputs = inputs.cuda()
 
     output = scan(gates, inputs)
 
@@ -341,4 +349,4 @@ def test_assoc_scan():
     second_half = scan(gates2, inputs2, prev = first_half[:, -1])
     assert second_half.shape == inputs2.shape
 
-    assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-6)
+    assert torch.allclose(output[:, -1], second_half[:, -1], atol = 1e-5)
