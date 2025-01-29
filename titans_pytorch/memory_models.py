@@ -103,8 +103,6 @@ class GatedResidualMemoryMLP(Module):
 
         self.final_proj = Parameter(torch.randn(dim, dim))
 
-        self.ln = LayerNorm(dim)
-
         for param in self.parameters():
             nn.init.xavier_uniform_(param)
 
@@ -145,8 +143,6 @@ class FactorizedMemoryMLP(Module):
             ]) for _ in range(depth)
         ])
 
-        self.ln = LayerNorm(dim)
-
         for weight1, weight2 in self.weights:
             nn.init.xavier_uniform_(weight1)
             nn.init.xavier_uniform_(weight2)
@@ -186,8 +182,6 @@ class MemoryAttention(Module):
             nn.Parameter(torch.randn(dim, dim_ff_hidden)), # ff w1
             nn.Parameter(torch.randn(dim_ff_hidden, dim)), # ff w2
         ])
-
-        self.ln = LayerNorm(dim)
 
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
