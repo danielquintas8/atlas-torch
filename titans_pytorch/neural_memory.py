@@ -652,13 +652,14 @@ class NeuralMemory(Module):
         next_last_update = TensorDict()
         next_last_momentum = TensorDict()
 
-        for (param_name, surprise), (_, last_update), (_, last_momentum) in zip(surprises.items(), past_last_update.items(), past_last_momentum.items()):
+        for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
 
             update = surprise
 
             # derive momentum with associative scan - eq (10)
 
             if has_momentum:
+                last_momentum = past_last_momentum[param_name]
                 update = self.assoc_scan(adaptive_momentum, surprise, prev = last_momentum) # momentum is S / surprise in the paper
                 momentum = update
                 next_last_momentum[param_name] = momentum[:, -1]
