@@ -162,6 +162,44 @@ class FactorizedMemoryMLP(Module):
 
         return x
 
+# an MLP modelled after the popular swiglu ff in modern transformers
+
+class MemorySwiGluMLP(Module):
+    def __init__(
+        self,
+        dim,
+        depth = 1, # default to 2 layer MLP from TTT, depth of 2 would be 4 layer MLP, but done as 2 feedforwards with residual
+        expansion_factor = 4.
+    ):
+        super().__init__()
+
+        dim_inner = int(dim * expansion_factor * 2 / 3)
+
+        weights = []
+
+        for _ in range(depth):
+            weights.append(ParameterList([
+                Parameter(torch.randn(dim, dim_inner * 2)),
+                Parameter(torch.randn(dim_inner, dim)),
+            ]))
+
+        self.weights = ParameterList(weights)
+
+    def forward(self, x):
+
+        for w1, w2 in self.weights:
+            residual = x
+
+            x, gates = (x @ w1).chunk(2, dim = -1)
+
+            x = x * F.gelu(gates)
+
+            x = x @ w2
+
+            x = x + residual
+
+        return x
+
 # improvised attention as memory module
 
 class MemoryAttention(Module):
@@ -175,12 +213,12 @@ class MemoryAttention(Module):
         self.scale = scale
         dim_ff_hidden = int(dim * expansion_factor)
 
-        self.weights = nn.ParameterList([
-            nn.Parameter(torch.randn(dim, dim)), # queries
-            nn.Parameter(torch.randn(dim, dim)), # keys
-            nn.Parameter(torch.randn(dim, dim)), # values
-            nn.Parameter(torch.randn(dim, dim_ff_hidden)), # ff w1
-            nn.Parameter(torch.randn(dim_ff_hidden, dim)), # ff w2
+        self.weights = ParameterList([
+            Parameter(torch.randn(dim, dim)), # queries
+            Parameter(torch.randn(dim, dim)), # keys
+            Parameter(torch.randn(dim, dim)), # values
+            Parameter(torch.randn(dim, dim_ff_hidden)), # ff w1
+            Parameter(torch.randn(dim_ff_hidden, dim)), # ff w2
         ])
 
         for weight in self.weights:

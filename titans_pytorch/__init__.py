@@ -6,6 +6,7 @@ from titans_pytorch.memory_models import (
     MemoryMLP,
     MemoryAttention,
     FactorizedMemoryMLP,
+    MemorySwiGluMLP,
     GatedResidualMemoryMLP
 )
 

@@ -76,6 +76,23 @@ def test_titans_attn_memory():
 
     assert seq.shape == retrieved.shape
 
+def test_swiglu_ff_memory():
+    from titans_pytorch.memory_models import MemorySwiGluMLP
+
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 2,
+        model = MemorySwiGluMLP(
+            dim = 16,
+            depth = 2
+        )
+    )
+
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+
+    assert seq.shape == retrieved.shape
+
 @pytest.mark.parametrize('gated_transition', (True, False))
 def test_neural_mem_chaining_chunks(
     gated_transition
