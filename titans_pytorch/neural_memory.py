@@ -27,6 +27,8 @@ from einops.layers.torch import Rearrange, Reduce
 """
 ein notation:
 b - batch
+h - heads
+bh - batch and heads
 n - sequence
 d - feature dimension
 c - intra-chunk
