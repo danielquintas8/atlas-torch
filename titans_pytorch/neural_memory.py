@@ -16,7 +16,8 @@ from tensordict import TensorDict
 from titans_pytorch.associative_scan import AssocScan
 
 from titans_pytorch.memory_models import(
-    MemoryMLP
+    MemoryMLP,
+    ResidualNorm
 )
 
 import einx
@@ -234,6 +235,7 @@ class NeuralMemory(Module):
         init_decay_bias = None,
         accept_weight_residual = False,
         gated_transition = False,
+        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
@@ -303,6 +305,9 @@ class NeuralMemory(Module):
             assert mem_model_output.shape == test_shape, 'output of memory model needs to be same shape as input'
 
         # the memory is the weights of the model
+
+        if mem_model_norm_add_residual:
+            model = ResidualNorm(dim = dim_head, model = model)
 
         self.memory_model = model
 
