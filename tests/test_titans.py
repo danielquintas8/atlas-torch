@@ -31,6 +31,7 @@ def torch_default_dtype(dtype):
 @pytest.mark.parametrize('qk_rmsnorm', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
+@pytest.mark.parametrize('per_head_learned_parameters', (False, True))
 def test_titans(
     seq_len,
     silu,
@@ -39,7 +40,8 @@ def test_titans(
     momentum,
     qk_rmsnorm,
     max_grad_norm,
-    per_parameter_lr_modulation
+    per_parameter_lr_modulation,
+    per_head_learned_parameters
 ):
     mem = NeuralMemory(
         dim = 16,
@@ -50,6 +52,7 @@ def test_titans(
         momentum = momentum,
         qk_rmsnorm = qk_rmsnorm,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
+        per_head_learned_parameters = per_head_learned_parameters
     )
 
     seq = torch.randn(2, seq_len, 16)

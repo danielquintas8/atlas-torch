@@ -8,7 +8,7 @@ from collections import namedtuple
 import torch
 from torch import nn, cat, tensor, Tensor
 import torch.nn.functional as F
-from torch.nn import Linear, Module, Parameter, ParameterList
+from torch.nn import Linear, Module, Parameter, ParameterList, ParameterDict
 from torch.func import functional_call, vmap, grad
 
 from tensordict import TensorDict
@@ -75,8 +75,8 @@ def safe_cat(inputs, dim = -2):
 def is_empty_tensor(t):
     return t.numel() == 0
 
-def dict_get_shape(td):
-    return {k: v.shape for k, v in td.items()}
+def dict_get_value_shapes(td):
+    return [v.shape for k, v in td.items()]
 
 def rearrange_dict_values(td, pattern, **kwargs):
     return td.apply(lambda t: rearrange(t, pattern, **kwargs))
@@ -220,6 +220,7 @@ class NeuralMemory(Module):
         default_step_transform_max_lr = 1.,
         per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
         max_mem_layer_modulation = 1., # max of 10.
+        per_head_learned_parameters = True,
         attn_pool_chunks = False,
         momentum = True,
         pre_rmsnorm = True,
@@ -305,9 +306,21 @@ class NeuralMemory(Module):
 
         self.memory_model = model
 
-        self.num_memory_parameter_tensors = len(set(model.parameters()))
+        mem_model_params = dict(model.named_parameters())
 
-        self.init_weight_shape = dict_get_shape(dict(model.named_parameters()))
+        self.num_memory_parameter_tensors = len(mem_model_params)
+
+        self.memory_model_parameter_names = [*mem_model_params.keys()]
+
+        memory_model_parameters = [*mem_model_params.values()]
+
+        if per_head_learned_parameters:
+            memory_model_parameters = [repeat(p, '... -> h ...', h = heads) for p in memory_model_parameters]
+
+        self.init_weight_shape = [p.shape for p in memory_model_parameters]
+
+        self.memory_model_parameters = ParameterList(memory_model_parameters)
+        self.per_head_learned_parameters = per_head_learned_parameters
 
         # the chunk size within the paper where adaptive step, momentum, weight decay are shared
 
@@ -423,21 +436,32 @@ class NeuralMemory(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+    @property
+    def memory_model_parameter_dict(self):
+        return TensorDict(dict(zip(self.memory_model_parameter_names, self.memory_model_parameters)))
+
     def init_weights(
         self,
         batch,
     ):
-        weights = TensorDict(dict(self.memory_model.named_parameters()))
-        weights = repeat_dict_values(weights, '... -> bh ...', bh = batch * self.heads)
+        if self.per_head_learned_parameters:
+            weights = repeat_dict_values(self.memory_model_parameter_dict, 'h ... -> (b h) ...', b = batch)
+        else:
+            weights = repeat_dict_values(self.memory_model_parameter_dict, '... -> bh ...', bh = batch * self.heads)
+
         return weights
 
     def init_momentum(
         self,
         batch,
     ):
-        weights = TensorDict(dict(self.memory_model.named_parameters()))
-        zeros = weights.clone().zero_()
-        zeros = repeat_dict_values(zeros, '... -> bh ...', bh = batch * self.heads)
+        zeros = self.memory_model_parameter_dict.clone().zero_()
+
+        if self.per_head_learned_parameters:
+            zeros = repeat_dict_values(zeros, 'h ... -> (b h) ...', b = batch)
+        else:
+            zeros = repeat_dict_values(zeros, '... -> bh ...', bh = batch * self.heads)
+
         return zeros
 
     def store_memories(
@@ -629,7 +653,7 @@ class NeuralMemory(Module):
     ):
         chunk_size = self.retrieve_chunk_size
 
-        weights_have_expanded_shape = dict_get_shape(weights) != self.init_weight_shape
+        weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
 
         batch, seq_len = seq.shape[:2]
 
