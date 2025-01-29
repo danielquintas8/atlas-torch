@@ -82,6 +82,7 @@ def test_swiglu_ff_memory():
     mem = NeuralMemory(
         dim = 16,
         chunk_size = 2,
+        mem_model_norm_add_residual = False,
         model = MemorySwiGluMLP(
             dim = 16,
             depth = 2

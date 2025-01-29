@@ -184,6 +184,7 @@ class MemorySwiGluMLP(Module):
             ]))
 
         self.weights = ParameterList(weights)
+        self.norm = LayerNorm(dim)
 
     def forward(self, x):
 
@@ -198,7 +199,7 @@ class MemorySwiGluMLP(Module):
 
             x = x + residual
 
-        return x
+        return self.norm(x)
 
 # improvised attention as memory module
 
