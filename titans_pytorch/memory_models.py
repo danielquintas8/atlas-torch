@@ -37,7 +37,7 @@ class MemoryMLP(Module):
         self,
         dim,
         depth,
-        expansion_factor = 4.
+        expansion_factor = 2.
     ):
         super().__init__()
         dim_hidden = int(dim * expansion_factor)

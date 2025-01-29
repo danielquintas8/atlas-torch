@@ -42,7 +42,7 @@ def test_titans(
     per_parameter_lr_modulation
 ):
     mem = NeuralMemory(
-        dim = 384,
+        dim = 16,
         chunk_size = chunk_size,
         activation = nn.SiLU() if silu else None,
         attn_pool_chunks = attn_pool_chunks,
@@ -52,7 +52,7 @@ def test_titans(
         per_parameter_lr_modulation = per_parameter_lr_modulation,
     )
 
-    seq = torch.randn(2, seq_len, 384)
+    seq = torch.randn(2, seq_len, 16)
     retrieved, _ = mem(seq)
 
     assert seq.shape == retrieved.shape
@@ -61,14 +61,14 @@ def test_titans_attn_memory():
     from titans_pytorch.memory_models import MemoryAttention
 
     mem = NeuralMemory(
-        dim = 384,
+        dim = 16,
         chunk_size = 64,
         model = MemoryAttention(
-            dim = 384
+            dim = 16
         )
     )
 
-    seq = torch.randn(2, 1024, 384)
+    seq = torch.randn(2, 1024, 16)
     retrieved, _ = mem(seq)
 
     assert seq.shape == retrieved.shape
@@ -78,14 +78,14 @@ def test_neural_mem_chaining_chunks(
     gated_transition
 ):
     mem  = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
+        dim = 16,
+        dim_head = 16,
         heads = 2,
         chunk_size = 16,
         gated_transition = gated_transition
     )
 
-    seq = torch.randn(2, 48, 384)
+    seq = torch.randn(2, 48, 16)
 
     parallel_retrieved, state = mem(seq)
 
@@ -99,21 +99,21 @@ def test_neural_mem_chaining_chunks(
 
 def test_neural_mem_chaining_with_weight_residual():
     mem  = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
+        dim = 16,
+        dim_head = 16,
         heads = 2,
         chunk_size = 64
     )
 
     mem2 = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
+        dim = 16,
+        dim_head = 16,
         heads = 2,
         chunk_size = 64,
         accept_weight_residual = True
     )
 
-    seq = torch.randn(2, 256, 384)
+    seq = torch.randn(2, 256, 16)
 
     seq, state = mem(seq)
 
@@ -128,14 +128,14 @@ def test_neural_mem_chaining_with_weight_residual():
 
 def test_neural_mem_chaining_with_batch_size():
     mem  = NeuralMemory(
-        dim = 384,
-        dim_head = 64,
+        dim = 16,
+        dim_head = 16,
         heads = 2,
         chunk_size = 16,
         batch_size = 64
     )
 
-    seq = torch.randn(2, 112, 384)
+    seq = torch.randn(2, 112, 16)
 
     parallel_retrieved, state = mem(seq)
 
@@ -169,7 +169,7 @@ def test_mac(
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
-        dim = 256,
+        dim = 16,
         depth = 2,
         num_persist_mem_tokens = num_persist_mem_tokens,
         num_longterm_mem_tokens = num_longterm_mem_tokens,
@@ -201,7 +201,7 @@ def test_mac_sampling(
 ):
     transformer = MemoryAsContextTransformer(
         num_tokens = 256,
-        dim = 256,
+        dim = 16,
         depth = 4,
         segment_len = 32,
         num_persist_mem_tokens = 4,
@@ -235,12 +235,12 @@ def test_neural_mem_inference(
 ):
 
     mem = NeuralMemory(
-        dim = 384,
+        dim = 16,
         chunk_size = mem_chunk_size,
         gated_transition = gated_transition
     )
 
-    seq = torch.randn(2, seq_len, 384)
+    seq = torch.randn(2, seq_len, 16)
     parallel_retrieved, _ = mem(seq)
 
     assert seq.shape == parallel_retrieved.shape
@@ -282,7 +282,7 @@ def test_flex(
         pytest.skip()
 
     attn = SegmentedAttention(
-        dim = 512,
+        dim = 16,
         segment_len = 32,
         num_persist_mem_tokens = 1,
         num_longterm_mem_tokens = 1,
@@ -290,7 +290,7 @@ def test_flex(
         sliding = sliding
     ).cuda()
 
-    seq = torch.randn(1, seq_len, 512).cuda()
+    seq = torch.randn(1, seq_len, 16).cuda()
 
     out_flex, _ = attn(seq)
     out_non_flex, _ = attn(seq, disable_flex_attn = True)
@@ -307,8 +307,8 @@ def test_assoc_scan():
     seq_len = 128
     mid_point = seq_len // 2
 
-    gates = torch.randn(2, seq_len, 512).sigmoid()
-    inputs = torch.randn(2, seq_len, 512)
+    gates = torch.randn(2, seq_len, 16).sigmoid()
+    inputs = torch.randn(2, seq_len, 16)
 
     output = scan(gates, inputs)
 
