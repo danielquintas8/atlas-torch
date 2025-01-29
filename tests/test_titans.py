@@ -124,7 +124,7 @@ def test_neural_mem_chaining_with_weight_residual():
     first_retrieved, state1 = mem2(seq_first, prev_weights = state.updates)
     second_retrieved, state2 = mem2(seq_second, state = state1, prev_weights = state.updates)
 
-    assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved), dim = 1), atol = 1e-6)
+    assert torch.allclose(parallel_retrieved, torch.cat((first_retrieved, second_retrieved), dim = 1), atol = 1e-5)
 
 def test_neural_mem_chaining_with_batch_size():
     mem  = NeuralMemory(

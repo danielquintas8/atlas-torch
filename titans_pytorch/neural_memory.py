@@ -690,16 +690,27 @@ class NeuralMemory(Module):
     def retrieve_memories(
         self,
         seq,
-        past_weights: dict[str, Tensor],
-        chunk_size = None,
-        need_pad = True
+        weights: dict[str, Tensor],
     ):
-        chunk_size = default(chunk_size, self.retrieve_chunk_size)
+        chunk_size = self.retrieve_chunk_size
+
+        weights_have_expanded_shape = dict_get_shape(weights) != self.init_weight_shape
+
         batch, seq_len = seq.shape[:2]
 
-        seq = self.retrieve_norm(seq)
+        # auto infer single token decoding, if there are only 1 set of weights and 1 token
 
-        need_pad = need_pad or chunk_size > 1
+        is_one_token = seq_len == 1
+        is_one_weight = (not weights_have_expanded_shape) or next(iter(weights.values())).shape[1] == 1
+
+        is_single_token_decode = is_one_token and is_one_weight
+
+        if is_single_token_decode:
+            chunk_size = 1
+
+        # padding related, for chunked processing
+
+        need_pad = chunk_size > 1 or not is_one_weight
 
         if need_pad:
             seq = pad_at_dim(seq, (1, 0), dim = 1)
@@ -714,7 +725,11 @@ class NeuralMemory(Module):
         # the parameters of the memory model stores the memories of the key / values
         # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
 
-        curr_weights = TensorDict(past_weights)
+        weights = TensorDict(weights)
+
+        # pre norm
+
+        seq = self.retrieve_norm(seq)
 
         # sequence Float['b n d'] to queries
 
@@ -730,14 +745,14 @@ class NeuralMemory(Module):
 
         # fetch values from memory model
 
-        if dict_get_shape(curr_weights) != self.init_weight_shape:
-            curr_weights = rearrange_dict_values(curr_weights, 'b n ... -> (b n) ...')
+        if weights_have_expanded_shape:
+            weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
         # forward functional call
 
-        values = functional_call(self.memory_model, dict(curr_weights), queries)
+        values = functional_call(self.memory_model, dict(weights), queries)
 
         # reconstitute batch dimension
 
@@ -885,22 +900,13 @@ class NeuralMemory(Module):
 
         # retrieve
 
-        need_pad = True
-        retrieve_chunk_size = None
-
         if is_single_token:
-            retrieve_chunk_size = 1
-            need_pad = False
-
             last_update, _ = next_neural_mem_state.states
-
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
 
         retrieved = self.retrieve_memories(
             seq,
-            updates,
-            chunk_size = retrieve_chunk_size,
-            need_pad = need_pad,
+            updates
         )
 
         return retrieved, next_neural_mem_state
