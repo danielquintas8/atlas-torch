@@ -10,7 +10,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from adam_atan2_pytorch import AdoptAtan2
 
-from titans_pytorch import MemoryAsContextTransformer, MemoryMLP
+from titans_pytorch import (
+    MemoryAsContextTransformer,
+    MemoryMLP,
+    MemoryAttention
+)
 
 # constants
 
@@ -35,6 +39,7 @@ NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
 NEURAL_MEM_QK_NORM = True
 NEURAL_MEM_MAX_LR = 1e-1
+USE_MEM_ATTENTION_MODEL = False
 WINDOW_SIZE = 32
 NEURAL_MEM_SEGMENT_LEN = 4                      # set smaller for more granularity for learning rate / momentum etc
 NEURAL_MEM_BATCH_SIZE = 128                     # set smaller to update the neural memory weights more often as it traverses the sequence
@@ -75,6 +80,18 @@ def decode_token(token):
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
+# memory model
+
+if USE_MEM_ATTENTION_MODEL:
+    neural_memory_model = MemoryAttention(
+        dim = 64
+    )
+else:
+    neural_memory_model = MemoryMLP(
+        dim = 64,
+        depth = NEURAL_MEMORY_DEPTH
+    )
+
 # instantiate memory-as-context transformer
 
 model = MemoryAsContextTransformer(
@@ -91,10 +108,7 @@ model = MemoryAsContextTransformer(
     neural_mem_weight_residual = NEURAL_MEM_WEIGHT_RESIDUAL,
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
-    neural_memory_model = MemoryMLP(
-        dim = 64,
-        depth = NEURAL_MEMORY_DEPTH
-    ),
+    neural_memory_model = neural_memory_model,
     neural_memory_kwargs = dict(
         dim_head = 64,
         heads = 4,
