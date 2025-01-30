@@ -627,9 +627,12 @@ class NeuralMemory(Module):
 
             if has_momentum:
                 last_momentum = past_last_momentum[param_name]
-                update = self.assoc_scan(adaptive_momentum, surprise, prev = last_momentum) # momentum is S / surprise in the paper
-                momentum = update
+                momentum = self.assoc_scan(adaptive_momentum, surprise, prev = last_momentum) # momentum is S / surprise in the paper
+
+                next_momentum[param_name] = momentum
                 next_last_momentum[param_name] = momentum[:, -1]
+
+                update = momentum
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
@@ -637,9 +640,6 @@ class NeuralMemory(Module):
             next_last_update[param_name] = update[:, -1]
 
             updates[param_name] = update
-
-            if has_momentum:
-                next_momentum[param_name] = momentum
 
         # determine next state for the storing of memories
 
