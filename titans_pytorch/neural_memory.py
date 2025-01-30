@@ -7,7 +7,7 @@ from itertools import zip_longest
 from collections import namedtuple
 
 import torch
-from torch import nn, cat, tensor, Tensor
+from torch import nn, stack, cat, tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, Parameter, ParameterList, ParameterDict
 from torch.func import functional_call, vmap, grad
@@ -230,6 +230,7 @@ class NeuralMemory(Module):
         momentum = True,
         momentum_order = 1,
         learned_momentum_combine = False,
+        learned_combine_include_zeroth = False,
         pre_rmsnorm = True,
         post_rmsnorm = False,
         qk_rmsnorm = False,
@@ -399,11 +400,16 @@ class NeuralMemory(Module):
             assert momentum
             assert momentum_order > 1, 'only second order momentum allowed for now, but may allow learned combination of zeroth'
 
+            if learned_combine_include_zeroth:
+                momentum_order += 1
+
             self.to_learned_momentum_combine = Sequential(
                 nn.Linear(dim, heads * momentum_order),
                 nn.Softmax(dim = -1),
                 Rearrange('b n (h o) -> o (b h) n', h = heads)
             )
+
+            self.learned_combine_include_zeroth = learned_combine_include_zeroth
 
         # per layer learning rate modulation
 
@@ -662,9 +668,13 @@ class NeuralMemory(Module):
 
                     momentums.append(momentum)
 
-                momentums = torch.stack(momentums)
+                momentums = stack(momentums)
 
                 next_last_momentum[param_name] = momentums[:, :, -1] # momentums shape is Float['o bh n 1']
+
+                if learned_combine and self.learned_combine_include_zeroth:
+                    # add the original surprise if learned combination of momentums
+                    momentums = cat((rearrange(surprise, '... -> 1 ...'), momentums), dim = 0)
 
                 if not learned_combine:
                     update = momentums[-1]

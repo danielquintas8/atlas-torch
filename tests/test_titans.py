@@ -61,8 +61,10 @@ def test_titans(
     assert seq.shape == retrieved.shape
 
 @pytest.mark.parametrize('learned_momentum_combine', (False, True))
+@pytest.mark.parametrize('learned_combine_include_zeroth', (False, True))
 def test_titans_second_order_momentum(
-    learned_momentum_combine
+    learned_momentum_combine,
+    learned_combine_include_zeroth
 ):
 
     mem  = NeuralMemory(
@@ -72,7 +74,8 @@ def test_titans_second_order_momentum(
         chunk_size = 1,
         batch_size = 2,
         momentum_order = 2,
-        learned_momentum_combine = learned_momentum_combine
+        learned_momentum_combine = learned_momentum_combine,
+        learned_combine_include_zeroth = learned_combine_include_zeroth
     )
 
     seq = torch.randn(2, 5, 384)
