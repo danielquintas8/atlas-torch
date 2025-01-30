@@ -493,10 +493,16 @@ class MemoryAsContextTransformer(Module):
         use_flex_attn = False,
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
+        token_emb: Module | None = None,
     ):
         super().__init__()
 
-        self.token_emb = nn.Embedding(num_tokens, dim)
+        if not exists(token_emb):
+            token_emb = nn.Embedding(num_tokens, dim)
+
+        self.token_emb = token_emb
+
+        # absolute positions
 
         self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
 
