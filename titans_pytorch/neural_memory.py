@@ -231,6 +231,7 @@ class NeuralMemory(Module):
         momentum_order = 1,
         learned_momentum_combine = False,
         learned_combine_include_zeroth = False,
+        kv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
         pre_rmsnorm = True,
         post_rmsnorm = False,
         qk_rmsnorm = False,
@@ -264,6 +265,10 @@ class NeuralMemory(Module):
         # associative scan
 
         self.assoc_scan = AssocScan(use_accelerated = use_accelerated_scan)
+
+        # key values receiving different views
+
+        self.kv_receives_diff_views = kv_receives_diff_views
 
         # norms
 
@@ -358,7 +363,9 @@ class NeuralMemory(Module):
 
         # keys and values for storing to the model
 
-        self.to_keys_values = Sequential(LinearNoBias(dim, dim_inner * 2), activation)
+        self.to_keys = Sequential(LinearNoBias(dim, dim_inner), activation)
+        self.to_values = Sequential(LinearNoBias(dim, dim_inner), activation)
+
         self.store_memory_loss_fn = store_memory_loss_fn
 
         # `chunk_size` refers to chunk size used for storing to memory model weights
@@ -504,7 +511,14 @@ class NeuralMemory(Module):
         seq_index = 0,
         prev_weights = None
     ):
-        batch, seq_len, heads, chunk_size = *seq.shape[:2], self.heads, self.store_chunk_size
+        if self.kv_receives_diff_views:
+            _, batch, seq_len = seq.shape[:3]
+        else:
+            batch, seq_len = seq.shape[:2]
+
+        # shapes and variables
+
+        heads, chunk_size = self.heads, self.store_chunk_size
 
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
@@ -512,7 +526,7 @@ class NeuralMemory(Module):
         round_down_seq_len = round_down_multiple(seq_len, chunk_size)
         num_chunks = round_down_seq_len // chunk_size
 
-        seq, remainder = seq[:, :round_down_seq_len], seq[:, round_down_seq_len:]
+        seq, remainder = seq[..., :round_down_seq_len, :], seq[..., round_down_seq_len:, :]
 
         next_seq_len_index = seq_index + round_down_seq_len
 
@@ -528,9 +542,18 @@ class NeuralMemory(Module):
 
         weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_chunks)
 
-        # derive learned hparams for optimization of memory network
+        # initial norm
 
         seq = self.store_norm(seq)
+
+        # handle keys and values coming from different sequences from hyper connection
+
+        values_seq = seq
+
+        if self.kv_receives_diff_views:
+            seq, values_seq = seq
+
+        # derive learned hparams for optimization of memory network
 
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
@@ -555,7 +578,8 @@ class NeuralMemory(Module):
 
         # keys and values
 
-        keys, values = self.to_keys_values(seq).chunk(2, dim = -1)
+        keys = self.to_keys(seq)
+        values = self.to_values(values_seq)
 
         # maybe multi head
 
@@ -914,6 +938,9 @@ class NeuralMemory(Module):
         if is_single_token:
             last_update, _ = next_neural_mem_state.states
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
+
+        if self.kv_receives_diff_views:
+            seq = seq[0]
 
         retrieved = self.retrieve_memories(
             seq,
