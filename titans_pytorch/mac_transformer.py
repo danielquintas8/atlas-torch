@@ -62,6 +62,7 @@ from rotary_embedding_torch import RotaryEmbedding
 # hyper connections / attend from x-transformers, which handles different queries and key lengths better
 
 from x_transformers.attend import Attend
+
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
 # proposed neural memory
@@ -515,7 +516,7 @@ class MemoryAsContextTransformer(Module):
 
         # hyper conection
 
-        init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
+        init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
 
         self.layers = ModuleList([])
 
@@ -553,7 +554,7 @@ class MemoryAsContextTransformer(Module):
             mem_hyper_conn = None
 
             if layer in neural_memory_layers:
-                mem_hyper_conn = init_hyper_conn(dim = dim, add_branch_out_to_residual = not neural_mem_gate_attn_output)
+                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output)
 
                 mem = NeuralMemory(
                     dim = dim,
@@ -571,8 +572,8 @@ class MemoryAsContextTransformer(Module):
             self.layers.append(ModuleList([
                 mem_hyper_conn,
                 mem,
-                init_hyper_conn(dim = dim, branch = attn),
-                init_hyper_conn(dim = dim, branch = ff)
+                init_hyper_conn(branch = attn),
+                init_hyper_conn(branch = ff)
             ]))
 
         self.norm = nn.RMSNorm(dim)
