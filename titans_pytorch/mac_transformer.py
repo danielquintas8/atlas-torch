@@ -483,7 +483,7 @@ class MemoryAsContextTransformer(Module):
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
         neural_memory_batch_size = None,
-        neural_memory_kv_receives_diff_views = False,
+        neural_memory_qkv_receives_diff_views = False,
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
@@ -561,14 +561,14 @@ class MemoryAsContextTransformer(Module):
             mem_hyper_conn = None
 
             if layer in neural_memory_layers:
-                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output, num_input_views = 2 if neural_memory_kv_receives_diff_views else 1)
+                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output, num_input_views = 3 if neural_memory_qkv_receives_diff_views else 1)
 
                 mem = NeuralMemory(
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
                     batch_size = neural_memory_batch_size,
                     model = deepcopy(neural_memory_model),
-                    kv_receives_diff_views = neural_memory_kv_receives_diff_views,
+                    qkv_receives_diff_views = neural_memory_qkv_receives_diff_views,
                     accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
                     **neural_memory_kwargs
                 )

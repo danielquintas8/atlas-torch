@@ -231,7 +231,7 @@ class NeuralMemory(Module):
         momentum_order = 1,
         learned_momentum_combine = False,
         learned_combine_include_zeroth = False,
-        kv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
+        qkv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
         pre_rmsnorm = True,
         post_rmsnorm = False,
         qk_rmsnorm = False,
@@ -268,7 +268,7 @@ class NeuralMemory(Module):
 
         # key values receiving different views
 
-        self.kv_receives_diff_views = kv_receives_diff_views
+        self.qkv_receives_diff_views = qkv_receives_diff_views
 
         # norms
 
@@ -511,7 +511,7 @@ class NeuralMemory(Module):
         seq_index = 0,
         prev_weights = None
     ):
-        if self.kv_receives_diff_views:
+        if self.qkv_receives_diff_views:
             _, batch, seq_len = seq.shape[:3]
         else:
             batch, seq_len = seq.shape[:2]
@@ -550,7 +550,7 @@ class NeuralMemory(Module):
 
         values_seq = seq
 
-        if self.kv_receives_diff_views:
+        if self.qkv_receives_diff_views:
             seq, values_seq = seq
 
         # derive learned hparams for optimization of memory network
@@ -820,10 +820,23 @@ class NeuralMemory(Module):
         state: NeuralMemState | None = None,
         prev_weights = None
     ):
-        if seq.ndim == 2:
-            seq = rearrange(seq, 'b d -> b 1 d')
+        is_multi_input = self.qkv_receives_diff_views
 
-        is_single_token = seq.shape[1] == 1
+        # handle single token
+
+        if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
+            seq = rearrange(seq, '... b d -> ... b 1 d')
+
+        is_single_token = seq.shape[-2] == 1
+
+        # if different views for qkv, then
+
+        if is_multi_input:
+            retrieve_seq, seq = seq[0], seq[1:]
+        else:
+            retrieve_seq = seq
+
+        # handle previous state init
 
         if not exists(state):
             state = (0, None, None, None, None)
@@ -838,8 +851,6 @@ class NeuralMemory(Module):
 
         if exists(cache_store_seq):
             store_seq = safe_cat((cache_store_seq, store_seq))
-
-        # functions
 
         # compute split sizes of sequence
         # for now manually update weights to last update at the correct boundaries
@@ -939,11 +950,8 @@ class NeuralMemory(Module):
             last_update, _ = next_neural_mem_state.states
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
 
-        if self.kv_receives_diff_views:
-            seq = seq[0]
-
         retrieved = self.retrieve_memories(
-            seq,
+            retrieve_seq,
             updates
         )
 

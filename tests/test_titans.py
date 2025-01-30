@@ -200,7 +200,7 @@ def test_neural_mem_chaining_with_batch_size():
 @pytest.mark.parametrize('neural_mem_segment_len', (8, 16))
 @pytest.mark.parametrize('neural_mem_weight_residual', (False, True))
 @pytest.mark.parametrize('neural_mem_batch_size', (None, 64))
-@pytest.mark.parametrize('neural_mem_kv_receives_diff_views', (False, True))
+@pytest.mark.parametrize('neural_mem_qkv_receives_diff_views', (False, True))
 @pytest.mark.parametrize('neural_mem_momentum', (False, True))
 def test_mac(
     seq_len,
@@ -210,7 +210,7 @@ def test_mac(
     neural_mem_segment_len,
     neural_mem_weight_residual,
     neural_mem_batch_size,
-    neural_mem_kv_receives_diff_views,
+    neural_mem_qkv_receives_diff_views,
     neural_mem_momentum
 ):
     transformer = MemoryAsContextTransformer(
@@ -223,7 +223,7 @@ def test_mac(
         neural_mem_gate_attn_output = neural_mem_gate_attn_output,
         neural_memory_segment_len = neural_mem_segment_len,
         neural_memory_batch_size = neural_mem_batch_size,
-        neural_memory_kv_receives_diff_views = neural_mem_kv_receives_diff_views,
+        neural_memory_qkv_receives_diff_views = neural_mem_qkv_receives_diff_views,
         neural_mem_weight_residual = neural_mem_weight_residual,
         neural_memory_kwargs = dict(
             momentum = neural_mem_momentum
