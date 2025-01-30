@@ -39,7 +39,7 @@ o - momentum orders
 
 LinearNoBias = partial(Linear, bias = False)
 
-NeuralMemCache = namedtuple('NeuralMemCache', [
+NeuralMemState = namedtuple('NeuralMemState', [
     'seq_index',
     'weights',
     'cache_store_segment',
@@ -629,7 +629,7 @@ class NeuralMemory(Module):
 
         if num_chunks == 0:
             updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
-            next_store_state = NeuralMemCache(next_seq_len_index, weights, remainder, past_state, updates)
+            next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
 
             output = (updates, next_store_state)
 
@@ -682,13 +682,11 @@ class NeuralMemory(Module):
 
         next_state = (next_last_update, next_last_momentum)
 
-        next_store_state = NeuralMemCache(next_seq_len_index, weights, remainder, next_state, updates)
+        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
 
-        # returns
+        # return updates to neural memory at all chunked timesteps + neural mem cache / state to be fed back
 
-        output = (updates, next_store_state)
-
-        return output
+        return updates, next_store_state
 
     def retrieve_memories(
         self,
@@ -785,7 +783,7 @@ class NeuralMemory(Module):
         self,
         seq,
         store_seq = None,
-        state: NeuralMemCache | None = None,
+        state: NeuralMemState | None = None,
         prev_weights = None
     ):
         if seq.ndim == 2:
