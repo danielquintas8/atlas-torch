@@ -60,6 +60,26 @@ def test_titans(
 
     assert seq.shape == retrieved.shape
 
+@pytest.mark.parametrize('learned_momentum_combine', (False, True))
+def test_titans_second_order_momentum(
+    learned_momentum_combine
+):
+
+    mem  = NeuralMemory(
+        dim = 384,
+        dim_head = 64,
+        heads = 2,
+        chunk_size = 1,
+        batch_size = 2,
+        momentum_order = 2,
+        learned_momentum_combine = learned_momentum_combine
+    )
+
+    seq = torch.randn(2, 5, 384)
+
+    parallel_retrieved, state = mem(seq)
+    assert seq.shape == parallel_retrieved.shape
+
 def test_titans_attn_memory():
     from titans_pytorch.memory_models import MemoryAttention
 

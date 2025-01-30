@@ -3,6 +3,7 @@ from typing import Callable
 
 import math
 from functools import partial
+from itertools import zip_longest
 from collections import namedtuple
 
 import torch
@@ -21,7 +22,7 @@ from titans_pytorch.memory_models import(
 )
 
 import einx
-from einops import rearrange, repeat, reduce, pack, unpack
+from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
 """
@@ -33,6 +34,7 @@ n - sequence
 d - feature dimension
 c - intra-chunk
 w - num memory network weight parameters
+o - momentum orders
 """
 
 LinearNoBias = partial(Linear, bias = False)
@@ -226,6 +228,8 @@ class NeuralMemory(Module):
         per_head_learned_parameters = True,
         attn_pool_chunks = False,
         momentum = True,
+        momentum_order = 1,
+        learned_momentum_combine = False,
         pre_rmsnorm = True,
         post_rmsnorm = False,
         qk_rmsnorm = False,
@@ -369,12 +373,7 @@ class NeuralMemory(Module):
         else:
             self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = chunk_size)
 
-        # learned adaptive learning rate and momentum
-
-        self.to_momentum = Sequential(
-            nn.Linear(dim, heads),
-            Rearrange('b n h -> (b h) n 1')
-        ) if momentum else None
+        # learned adaptive learning rate
 
         self.to_adaptive_step = Sequential(
             nn.Linear(dim, heads),
@@ -385,6 +384,26 @@ class NeuralMemory(Module):
             adaptive_step_transform = partial(default_adaptive_step_transform, max_lr = default_step_transform_max_lr)
 
         self.adaptive_step_transform = adaptive_step_transform
+
+        # momentum related
+
+        self.to_momentum = Sequential(
+            nn.Linear(dim, heads * momentum_order),
+            Rearrange('b n (h o) -> o (b h) n 1', o = momentum_order)
+        ) if momentum else None
+
+        self.momentum_order = momentum_order
+        self.to_learned_momentum_combine = None
+
+        if learned_momentum_combine:
+            assert momentum
+            assert momentum_order > 1, 'only second order momentum allowed for now, but may allow learned combination of zeroth'
+
+            self.to_learned_momentum_combine = Sequential(
+                nn.Linear(dim, heads * momentum_order),
+                nn.Softmax(dim = -1),
+                Rearrange('b n (h o) -> o (b h) n', h = heads)
+            )
 
         # per layer learning rate modulation
 
@@ -465,9 +484,9 @@ class NeuralMemory(Module):
         zeros = self.memory_model_parameter_dict.clone().zero_()
 
         if self.per_head_learned_parameters:
-            zeros = repeat_dict_values(zeros, 'h ... -> (b h) ...', b = batch)
+            zeros = repeat_dict_values(zeros, 'h ... -> o (b h) ...', b = batch, o = self.momentum_order)
         else:
-            zeros = repeat_dict_values(zeros, '... -> bh ...', bh = batch * self.heads)
+            zeros = repeat_dict_values(zeros, '... -> o bh ...', bh = batch * self.heads, o = self.momentum_order)
 
         return zeros
 
@@ -519,6 +538,11 @@ class NeuralMemory(Module):
 
         if has_momentum:
             adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
+
+            learned_combine = exists(self.to_learned_momentum_combine)
+
+            if learned_combine:
+                combine_momentums = self.to_learned_momentum_combine(chunked_seq)
 
         if need_layer_lr_mod:
             layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
@@ -587,7 +611,7 @@ class NeuralMemory(Module):
 
         # negative gradients, adaptive lr already applied as loss weight
 
-        surprises = grads.apply(lambda t: -t)
+        surprises = grads.mul(-1)
 
         # past states
 
@@ -613,7 +637,6 @@ class NeuralMemory(Module):
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
-        next_momentum = TensorDict() if has_momentum else None
         updates = TensorDict()
 
         next_last_update = TensorDict()
@@ -626,20 +649,34 @@ class NeuralMemory(Module):
             # derive momentum with associative scan - eq (10)
 
             if has_momentum:
+                momentum = surprise
+
+                momentums = [] # stores all momentum orders starting with first, to generalize to Nth order momentum
+
                 last_momentum = past_last_momentum[param_name]
-                momentum = self.assoc_scan(adaptive_momentum, surprise, prev = last_momentum) # momentum is S / surprise in the paper
 
-                next_momentum[param_name] = momentum
-                next_last_momentum[param_name] = momentum[:, -1]
+                # go from first order momentum all the way to the Nth
 
-                update = momentum
+                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
+                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
+
+                    momentums.append(momentum)
+
+                momentums = torch.stack(momentums)
+
+                next_last_momentum[param_name] = momentums[:, :, -1] # momentums shape is Float['o bh n 1']
+
+                if not learned_combine:
+                    update = momentums[-1]
+                else:
+                    update = einsum(combine_momentums, momentums, 'o b n, o b n ... -> b n ...')
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
             update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
-            next_last_update[param_name] = update[:, -1]
 
             updates[param_name] = update
+            next_last_update[param_name] = update[:, -1]
 
         # determine next state for the storing of memories
 
