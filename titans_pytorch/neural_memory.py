@@ -35,6 +35,7 @@ d - feature dimension
 c - intra-chunk
 w - num memory network weight parameters
 o - momentum orders
+u - key / value updates - allowing a token to emit multiple key / values
 """
 
 LinearNoBias = partial(Linear, bias = False)
@@ -231,6 +232,7 @@ class NeuralMemory(Module):
         momentum_order = 1,
         learned_momentum_combine = False,
         learned_combine_include_zeroth = False,
+        num_kv_per_token = 1, # whether a single token can do multiple updates to the memory model
         qkv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
         pre_rmsnorm = True,
         post_rmsnorm = False,
@@ -363,10 +365,21 @@ class NeuralMemory(Module):
 
         # keys and values for storing to the model
 
-        self.to_keys = Sequential(LinearNoBias(dim, dim_inner), activation)
-        self.to_values = Sequential(LinearNoBias(dim, dim_inner), activation)
+        assert num_kv_per_token > 0
+
+        self.to_keys = Sequential(
+            LinearNoBias(dim, dim_inner * num_kv_per_token),
+            activation,
+        )
+
+        self.to_values = Sequential(
+            LinearNoBias(dim, dim_inner * num_kv_per_token),
+            activation,
+        )
 
         self.store_memory_loss_fn = store_memory_loss_fn
+
+        self.num_kv_per_token = num_kv_per_token
 
         # `chunk_size` refers to chunk size used for storing to memory model weights
 
@@ -384,8 +397,8 @@ class NeuralMemory(Module):
         # learned adaptive learning rate
 
         self.to_adaptive_step = Sequential(
-            nn.Linear(dim, heads),
-            Rearrange('b n h -> (b h) n')
+            nn.Linear(dim, heads * num_kv_per_token),
+            Rearrange('b n (h u) -> (b h) (n u)', u = num_kv_per_token)
         )
 
         if not exists(adaptive_step_transform):
@@ -518,7 +531,7 @@ class NeuralMemory(Module):
 
         # shapes and variables
 
-        heads, chunk_size = self.heads, self.store_chunk_size
+        heads, chunk_size, num_updates = self.heads, self.store_chunk_size, self.num_kv_per_token
 
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
@@ -587,15 +600,17 @@ class NeuralMemory(Module):
 
         batch = keys.shape[0]
 
+        # take care of chunking
+
+        keys, values = tuple(rearrange(t, 'b h (n c) (u d) -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
+
         # maybe qk rmsnorm
 
         keys = self.k_norm(keys)
 
-        # take care of chunking
+        # adaptive lr
 
-        keys, values = tuple(rearrange(t, 'b h (n c) d -> (b h n) c d', c = chunk_size) for t in (keys, values))
-
-        adaptive_lr = rearrange(adaptive_lr, 'b (n c) -> (b n) c', c = chunk_size)
+        adaptive_lr = rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_updates)
 
         # maybe add previous layer weight
 

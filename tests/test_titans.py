@@ -30,6 +30,7 @@ def torch_default_dtype(dtype):
 @pytest.mark.parametrize('momentum', (False, True))
 @pytest.mark.parametrize('qk_rmsnorm', (False, True))
 @pytest.mark.parametrize('max_grad_norm', (None, 2.))
+@pytest.mark.parametrize('num_kv_per_token', (1, 2))
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 @pytest.mark.parametrize('per_head_learned_parameters', (False, True))
 def test_titans(
@@ -40,6 +41,7 @@ def test_titans(
     momentum,
     qk_rmsnorm,
     max_grad_norm,
+    num_kv_per_token,
     per_parameter_lr_modulation,
     per_head_learned_parameters
 ):
@@ -49,6 +51,7 @@ def test_titans(
         activation = nn.SiLU() if silu else None,
         attn_pool_chunks = attn_pool_chunks,
         max_grad_norm = max_grad_norm,
+        num_kv_per_token = num_kv_per_token,
         momentum = momentum,
         qk_rmsnorm = qk_rmsnorm,
         per_parameter_lr_modulation = per_parameter_lr_modulation,
