@@ -425,8 +425,8 @@ class NeuralMemory(Module):
 
             self.to_learned_momentum_combine = Sequential(
                 nn.Linear(dim, heads * momentum_order),
-                nn.Softmax(dim = -1),
-                Rearrange('b n (h o) -> o (b h) n', h = heads)
+                Rearrange('b n (h o) -> o (b h) n', h = heads),
+                nn.Softmax(dim = 0),
             )
 
             self.learned_combine_include_zeroth = learned_combine_include_zeroth
