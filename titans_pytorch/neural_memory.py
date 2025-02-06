@@ -289,6 +289,8 @@ class NeuralMemory(Module):
         self.heads = heads
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_kv_heads = Rearrange('b n (h u d) -> b h (n u) d', h = heads, u = num_kv_per_token)
+
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
         self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
 
@@ -596,17 +598,15 @@ class NeuralMemory(Module):
 
         # maybe multi head
 
-        keys, values = map(self.split_heads, (keys, values))
+        keys, values = map(self.split_kv_heads, (keys, values))
 
-        batch = keys.shape[0]
+        # maybe keys rmsnorm
+
+        keys = self.k_norm(keys)
 
         # take care of chunking
 
-        keys, values = tuple(rearrange(t, 'b h (n c) (u d) -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
-
-        # maybe qk rmsnorm
-
-        keys = self.k_norm(keys)
+        keys, values = tuple(rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
 
         # adaptive lr
 
