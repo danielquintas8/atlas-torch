@@ -34,6 +34,7 @@ def torch_default_dtype(dtype):
 @pytest.mark.parametrize('num_kv_per_token', (1, 2))
 @pytest.mark.parametrize('per_parameter_lr_modulation', (False, True))
 @pytest.mark.parametrize('per_head_learned_parameters', (False, True))
+@pytest.mark.parametrize('test_store_mask', (False, True))
 def test_titans(
     seq_len,
     silu,
@@ -45,7 +46,8 @@ def test_titans(
     max_grad_norm,
     num_kv_per_token,
     per_parameter_lr_modulation,
-    per_head_learned_parameters
+    per_head_learned_parameters,
+    test_store_mask
 ):
     mem = NeuralMemory(
         dim = 16,
@@ -62,7 +64,13 @@ def test_titans(
     )
 
     seq = torch.randn(2, seq_len, 16)
-    retrieved, _ = mem(seq)
+
+    store_mask = None
+
+    if test_store_mask:
+        store_mask = torch.randint(0, 2, (2, seq_len)).bool()
+
+    retrieved, _ = mem(seq, store_mask = store_mask)
 
     assert seq.shape == retrieved.shape
 

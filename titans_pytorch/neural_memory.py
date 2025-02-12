@@ -524,7 +524,8 @@ class NeuralMemory(Module):
         weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         seq_index = 0,
-        prev_weights = None
+        prev_weights = None,
+        mask: Tensor | None = None,
     ):
         if self.qkv_receives_diff_views:
             _, batch, seq_len = seq.shape[:3]
@@ -611,6 +612,14 @@ class NeuralMemory(Module):
         # adaptive lr
 
         adaptive_lr = rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_updates)
+
+        # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
+
+        if exists(mask):
+            mask = mask[..., :round_down_seq_len]
+            mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
+
+            adaptive_lr = torch.where(mask, adaptive_lr, 0.)
 
         # maybe add previous layer weight
 
@@ -833,7 +842,8 @@ class NeuralMemory(Module):
         seq,
         store_seq = None,
         state: NeuralMemState | None = None,
-        prev_weights = None
+        prev_weights = None,
+        store_mask: Tensor | None = None
     ):
         is_multi_input = self.qkv_receives_diff_views
 
@@ -910,6 +920,11 @@ class NeuralMemory(Module):
 
         store_seqs = store_seq.split(split_sizes, dim = -2)
 
+        if exists(store_mask):
+            store_masks = store_mask.split(split_sizes, dim = -1)
+        else:
+            store_masks = (None,) * len(split_sizes)
+
         # whether to allow network to slowly adjust from initial weight throughout (residual path) to fully updating weights every batch
 
         gate = None
@@ -917,7 +932,7 @@ class NeuralMemory(Module):
         if exists(self.transition_gate):
             gate = self.transition_gate.sigmoid()
 
-        for ind, store_seq_chunk in enumerate(store_seqs):
+        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
             is_last = ind == (len(store_seqs) - 1)
 
             # store
@@ -927,7 +942,8 @@ class NeuralMemory(Module):
                 weights,
                 seq_index = seq_index,
                 past_state = past_state,
-                prev_weights = prev_weights
+                prev_weights = prev_weights,
+                mask = maybe_store_mask
             )
 
             weights = next_neural_mem_state.weights
