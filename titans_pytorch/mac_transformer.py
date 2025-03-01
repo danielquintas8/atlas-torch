@@ -46,7 +46,7 @@ def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False
 
 # einstein notation related
 
-from einops import repeat, rearrange, pack, unpack
+from einops import repeat, rearrange, pack, unpack, einsum
 from einops.layers.torch import Rearrange
 
 # b - batch
@@ -521,9 +521,7 @@ class MemoryAsContextTransformer(Module):
         self.sliding_window_attn = sliding_window_attn
         self.attn_window_size = segment_len + num_longterm_mem_tokens
 
-        # hyper conection
-
-        assert not (num_residual_streams <= 1 and neural_memory_qkv_receives_diff_views), 'allow neural memory queries, keys, values to be derived from different combinations of the residual streams can only work if hyper connections has greater than 1 residual stream'
+        # hyper connection
 
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
 
@@ -560,17 +558,28 @@ class MemoryAsContextTransformer(Module):
             )
 
             mem = None
+            mem_qkv_layer_selector = None
             mem_hyper_conn = None
 
             if layer in neural_memory_layers:
-                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output, num_input_views = 3 if neural_memory_qkv_receives_diff_views else 1)
+                mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output)
+
+                if not is_first and neural_memory_qkv_receives_diff_views:
+                    num_layer_choices = (layer - 1) * 4 + 1 # for each layer, have memory input select from attn inp, attn out, ff inp, and ff out - plus one for the current point in the residual stream (memory input)
+
+                    mem_qkv_layer_selector = nn.Sequential(
+                        nn.RMSNorm(dim),
+                        nn.Linear(dim, 3 * num_layer_choices),
+                        Rearrange('... (views layers) -> views ... layers', views = 3),
+                        nn.Softmax(dim = -1)
+                    )
 
                 mem = NeuralMemory(
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
                     batch_size = neural_memory_batch_size,
                     model = deepcopy(neural_memory_model),
-                    qkv_receives_diff_views = neural_memory_qkv_receives_diff_views,
+                    qkv_receives_diff_views = True,
                     accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
                     **neural_memory_kwargs
                 )
@@ -581,9 +590,12 @@ class MemoryAsContextTransformer(Module):
 
             self.layers.append(ModuleList([
                 mem_hyper_conn,
+                init_hyper_conn(),
+                init_hyper_conn(),
+                mem_qkv_layer_selector,
                 mem,
-                init_hyper_conn(branch = attn),
-                init_hyper_conn(branch = ff)
+                attn,
+                ff,
             ]))
 
         self.norm = nn.RMSNorm(dim)
@@ -763,6 +775,10 @@ class MemoryAsContextTransformer(Module):
 
         mem_weight_residual = None
 
+        # layers for the neural mem to select the qkv inputs from
+
+        mem_input_layers = []
+
         # when inferencing, only do one token at a time
 
         if is_inferencing:
@@ -773,7 +789,7 @@ class MemoryAsContextTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for mem_hyper_conn, mem, attn, ff in self.layers:
+        for mem_hyper_conn, attn_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, attn, ff in self.layers:
 
             retrieved = None
             attn_out_gates = None
@@ -785,8 +801,19 @@ class MemoryAsContextTransformer(Module):
 
                 mem_input, add_residual = mem_hyper_conn(x)
 
+                if not exists(mem_qkv_layer_selector):
+                    qkv_mem_input = stack((mem_input, mem_input, mem_input))
+                else:
+                    layers_to_choose_from = stack((mem_input, *mem_input_layers))
+
+                    # let the current `mem_input` select the 3 layers for qkv
+
+                    selected = mem_qkv_layer_selector(mem_input)
+
+                    qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
+
                 retrieved, next_neural_mem_cache = mem.forward(
-                    mem_input,
+                    qkv_mem_input,
                     state = next(neural_mem_caches, None),
                     prev_weights = mem_weight_residual
                 )
@@ -801,8 +828,12 @@ class MemoryAsContextTransformer(Module):
 
             # attention
 
-            x, (values, next_kv_cache) = attn(
-                x,
+            attn_in, add_residual = attn_hyper_conn(x)
+
+            mem_input_layers.append(attn_in)
+
+            attn_out, (values, next_kv_cache) = attn(
+                attn_in,
                 value_residual = value_residual,
                 disable_flex_attn = disable_flex_attn,
                 flex_attn_fn = flex_attn_fn,
@@ -810,7 +841,11 @@ class MemoryAsContextTransformer(Module):
                 cache = next(kv_caches, None)
             )
 
+            mem_input_layers.append(attn_out)
+
             value_residual = default(value_residual, values)
+
+            x = add_residual(attn_out)
 
             # caches
 
@@ -819,7 +854,15 @@ class MemoryAsContextTransformer(Module):
 
             # feedforward
 
-            x = ff(x)
+            ff_in, add_ff_residual = ff_hyper_conn(x)
+
+            mem_input_layers.append(ff_in)
+
+            ff_out = ff(ff_in)
+
+            mem_input_layers.append(ff_out)
+
+            x = add_ff_residual(ff_out)
 
         # taking care of cache first
         # for early return when processing long term mem tokens during inference

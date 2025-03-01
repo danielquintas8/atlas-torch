@@ -48,6 +48,7 @@ SLIDING_WINDOWS = True
 STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
 MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
 NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributions from the weights of the previous neural mem layer brings about significant improvements. this was improvised and not in the paper, but inspired by the value residual learning free lunch paper
+NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
 
 # experiment related
 
@@ -107,6 +108,7 @@ model = MemoryAsContextTransformer(
     neural_memory_batch_size = NEURAL_MEM_BATCH_SIZE,
     neural_mem_gate_attn_output = NEURAL_MEM_GATE_ATTN_OUTPUT,
     neural_mem_weight_residual = NEURAL_MEM_WEIGHT_RESIDUAL,
+    neural_memory_qkv_receives_diff_views = NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW,
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
     neural_memory_model = neural_memory_model,
