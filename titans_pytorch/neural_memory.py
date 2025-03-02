@@ -353,11 +353,11 @@ class NeuralMemory(Module):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
             weighted_loss = loss * loss_weights
-            return weighted_loss.sum()
+            return weighted_loss.sum(), loss
 
         # two functions
 
-        grad_fn = grad(forward_and_loss)
+        grad_fn = grad(forward_and_loss, has_aux = True)
 
         self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
@@ -526,6 +526,7 @@ class NeuralMemory(Module):
         seq_index = 0,
         prev_weights = None,
         mask: Tensor | None = None,
+        return_surprises = True
     ):
         if self.qkv_receives_diff_views:
             _, batch, seq_len = seq.shape[:3]
@@ -645,9 +646,13 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
 
-        grads = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+        grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
+
+        # surprises
+
+        unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
 
         # maybe softclamp grad norm
 
@@ -687,7 +692,10 @@ class NeuralMemory(Module):
 
             output = (updates, next_store_state)
 
-            return output
+            if not return_surprises:
+                return output
+
+            return (*output, unweighted_mem_model_loss)
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
@@ -744,7 +752,10 @@ class NeuralMemory(Module):
 
         # return updates to neural memory at all chunked timesteps + neural mem cache / state to be fed back
 
-        return updates, next_store_state
+        if not return_surprises:
+            return updates, next_store_state
+
+        return updates, next_store_state, unweighted_mem_model_loss
 
     def retrieve_memories(
         self,
@@ -843,7 +854,8 @@ class NeuralMemory(Module):
         store_seq = None,
         state: NeuralMemState | None = None,
         prev_weights = None,
-        store_mask: Tensor | None = None
+        store_mask: Tensor | None = None,
+        return_surprises = False
     ):
         is_multi_input = self.qkv_receives_diff_views
 
@@ -927,6 +939,7 @@ class NeuralMemory(Module):
 
         # whether to allow network to slowly adjust from initial weight throughout (residual path) to fully updating weights every batch
 
+        surprises = None
         gate = None
 
         if exists(self.transition_gate):
@@ -937,13 +950,14 @@ class NeuralMemory(Module):
 
             # store
 
-            next_updates, next_neural_mem_state = self.store_memories(
+            next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
                 store_seq_chunk,
                 weights,
                 seq_index = seq_index,
                 past_state = past_state,
                 prev_weights = prev_weights,
-                mask = maybe_store_mask
+                mask = maybe_store_mask,
+                return_surprises = True
             )
 
             weights = next_neural_mem_state.weights
@@ -951,6 +965,8 @@ class NeuralMemory(Module):
             past_state = next_neural_mem_state.states
 
             updates = accum_updates(updates, next_updates)
+
+            surprises = safe_cat((surprises, chunk_surprises), dim = -1)
 
             if is_last and not update_after_final_store:
                 continue
@@ -986,4 +1002,9 @@ class NeuralMemory(Module):
             updates
         )
 
-        return retrieved, next_neural_mem_state
+        # returning
+
+        if not return_surprises:
+            return retrieved, next_neural_mem_state
+
+        return retrieved, next_neural_mem_state, surprises

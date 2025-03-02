@@ -74,6 +74,21 @@ def test_titans(
 
     assert seq.shape == retrieved.shape
 
+def test_return_surprises():
+
+    mem = NeuralMemory(
+        dim = 384,
+        chunk_size = 2,
+        dim_head = 64,
+        heads = 4,
+    )
+
+    seq = torch.randn(4, 64, 384)
+
+    _, _, surprises = mem(seq, return_surprises = True)
+
+    assert surprises.shape == (4, 4, 64)
+
 @pytest.mark.parametrize('learned_momentum_combine', (False, True))
 @pytest.mark.parametrize('learned_combine_include_zeroth', (False, True))
 def test_titans_second_order_momentum(
