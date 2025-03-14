@@ -867,7 +867,8 @@ class NeuralMemory(Module):
         detach_mem_state = False,
         prev_weights = None,
         store_mask: Tensor | None = None,
-        return_surprises = False
+        return_surprises = False,
+        ttt_batch_size: int | None = None
     ):
         is_multi_input = self.qkv_receives_diff_views
 
@@ -904,7 +905,7 @@ class NeuralMemory(Module):
         # compute split sizes of sequence
         # for now manually update weights to last update at the correct boundaries
 
-        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, self.batch_size
+        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, default(ttt_batch_size, self.batch_size)
 
         need_update_weights = exists(batch_size)
 
