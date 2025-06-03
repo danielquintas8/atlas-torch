@@ -153,3 +153,31 @@ $ python train_mac.py
     url     = {https://arxiv.org/abs/2501.12352},
 }
 ```
+
+```bibtex
+@misc{jordan2024muon,
+    author  = {Keller Jordan and Yuchen Jin and Vlado Boza and Jiacheng You and
+                    Franz Cesista and Laker Newhouse and Jeremy Bernstein},
+    title   = {Muon: An optimizer for hidden layers in neural networks},
+    year    = {2024},
+    url     = {https://kellerjordan.github.io/posts/muon/}
+}
+```
+
+```bibtex
+@inproceedings{Zhang2025TestTimeTD,
+    title   = {Test-Time Training Done Right},
+    author  = {Tianyuan Zhang and Sai Bi and Yicong Hong and Kai Zhang and Fujun Luan and Songlin Yang and Kalyan Sunkavalli and William T. Freeman and Hao Tan},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:279071244}
+}
+```
+
+```bibtex
+@inproceedings{Behrouz2025ATLASLT,
+    title  = {ATLAS: Learning to Optimally Memorize the Context at Test Time},
+    author = {Ali Behrouz and Ze-Minghui Li and Praneeth Kacham and Majid Daliri and Yuan Deng and Peilin Zhong and Meisam Razaviyayn and Vahab S. Mirrokni},
+    year   = {2025},
+    url    = {https://api.semanticscholar.org/CorpusID:278996373}
+}
+```

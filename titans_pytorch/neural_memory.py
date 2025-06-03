@@ -152,6 +152,30 @@ def softclamp_grad_norm(t, max_value):
     t = t * (clamped_norm / norm)
     return inverse(t)
 
+# spectral norming the surprise update w/ newton schulz matrix iter
+# Keller Jordan et al. from OSS w/ nanogpt, now being used for two works, Atlas and 'TTT done right'
+
+def newtonschulz5(
+    t,
+    steps = 5,
+    eps = 1e-7,
+    coefs = (3.4445, -4.7750, 2.0315)
+):
+    if t.ndim <= 3:
+        return t
+
+    t, inv_pack = pack_one_with_inverse(t, '* i j')
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+
+    a, b, c = coefs
+
+    for _ in range(steps):
+        A = t @ t.transpose(-1, -2)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+
+    return inv_pack(t)
+
 # multi head rmsnorm
 
 class MultiheadRMSNorm(Module):
@@ -254,6 +278,7 @@ class NeuralMemory(Module):
         init_momentum_bias = None,
         init_decay_bias = None,
         accept_weight_residual = False,
+        spectral_norm_surprises = False,
         gated_transition = False,
         mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         default_model_kwargs: dict = dict(
@@ -464,6 +489,10 @@ class NeuralMemory(Module):
         # allow for softclamp the gradient norms for storing memories
 
         self.max_grad_norm = max_grad_norm
+
+        # spectral norming the surprises before update, a la Muon from Jordan et al.
+
+        self.spectral_norm_surprises = spectral_norm_surprises
 
         # weight decay factor
 
@@ -747,6 +776,11 @@ class NeuralMemory(Module):
                     update = momentums[-1]
                 else:
                     update = einsum(combine_momentums, momentums, 'o b n, o b n ... -> b n ...')
+
+            # maybe spectral norm surprises
+
+            if self.spectral_norm_surprises:
+                update = newtonschulz5(update)
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 

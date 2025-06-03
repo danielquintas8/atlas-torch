@@ -49,6 +49,7 @@ STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooli
 MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
 NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributions from the weights of the previous neural mem layer brings about significant improvements. this was improvised and not in the paper, but inspired by the value residual learning free lunch paper
 NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
+NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon optimizer to surprise updates, by spectral norming the surprises
 
 # experiment related
 
@@ -121,7 +122,8 @@ model = MemoryAsContextTransformer(
         momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
         default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
-        per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR
+        per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
+        spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES
     )
 ).cuda()
 
