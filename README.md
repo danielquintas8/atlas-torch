@@ -1,3 +1,5 @@
+> **Note**: This branch (`titans-torch`) contains the original [Titans - PyTorch](https://gitlab.com/lucidrains/titans-pytorch) implementation by [Phil Wang (lucidrains)](https://gitlab.com/lucidrains), taken as-is from his GitLab repository (commit `714a14c`). All credit for this implementation goes to him. The `main` branch of this repo will contain our Atlas extensions (Omega Rule, polynomial features, Muon optimizer).
+
 <img src="./fig2.png" width="400px"></img>
 
 <img src="./fig1.png" width="400px"></img>
