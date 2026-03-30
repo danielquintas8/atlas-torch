@@ -428,3 +428,19 @@ def test_mem_state_detach():
         parallel_retrieved, state = mem(seq, state = state)
         state = mem_state_detach(state)
         parallel_retrieved.sum().backward()
+
+# atlas extensions
+
+def test_muon_custom_steps():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        spectral_norm_surprises = True,
+        muon_ns_steps = 3,
+        muon_ns_eps = 1e-6,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()

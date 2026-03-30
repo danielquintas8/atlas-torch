@@ -288,6 +288,8 @@ class NeuralMemory(Module):
         init_decay_bias = None,
         accept_weight_residual = False,
         spectral_norm_surprises = False,
+        muon_ns_steps = 5,
+        muon_ns_eps = 1e-7,
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -505,6 +507,8 @@ class NeuralMemory(Module):
         # spectral norming the surprises before update, a la Muon from Jordan et al.
 
         self.spectral_norm_surprises = spectral_norm_surprises
+        self.muon_ns_steps = muon_ns_steps
+        self.muon_ns_eps = muon_ns_eps
 
         # weight decay factor
 
@@ -799,7 +803,7 @@ class NeuralMemory(Module):
             # maybe spectral norm surprises
 
             if self.spectral_norm_surprises:
-                update = newtonschulz5(update)
+                update = newtonschulz5(update, steps = self.muon_ns_steps, eps = self.muon_ns_eps)
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
