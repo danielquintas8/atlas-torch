@@ -3,7 +3,7 @@ from typing import Callable
 
 import math
 from functools import partial
-from itertools import zip_longest
+from itertools import zip_longest, combinations_with_replacement
 from collections import namedtuple
 
 import torch
@@ -185,6 +185,76 @@ def newtonschulz5(
 
     return inv_pack(t)
 
+# polynomial feature mapping for Atlas
+# increases memory capacity from O(d_k) to O(d_k^p) by expanding keys/queries
+# with interaction terms before they enter the memory MLP
+
+class PolynomialFeatures(Module):
+    def __init__(
+        self,
+        dim,
+        degree = 2,
+        project_back = True,
+    ):
+        super().__init__()
+        assert degree >= 2, 'polynomial degree must be at least 2'
+
+        self.dim = dim
+        self.degree = degree
+
+        # for each degree d from 1 to p, the number of monomials is C(dim + d - 1, d)
+        # e.g. degree 1: dim, degree 2: dim*(dim+1)/2, degree 3: dim*(dim+1)*(dim+2)/6
+
+        expanded_dim = 0
+        index_groups = []
+
+        for d in range(1, degree + 1):
+            combos = list(combinations_with_replacement(range(dim), d))
+            indices = torch.tensor(combos, dtype = torch.long).T  # (d, num_combos)
+            self.register_buffer(f'indices_{d}', indices, persistent = False)
+            index_groups.append(len(combos))
+            expanded_dim += len(combos)
+
+        self.expanded_dim = expanded_dim
+        self.index_group_sizes = index_groups
+
+        # learnable coefficients from Taylor expansion of softmax: a_d = 1/d!
+
+        coefficients = [1.0 / math.factorial(d) for d in range(1, degree + 1)]
+        self.coefficients = Parameter(torch.tensor(coefficients))
+
+        # optional projection back to original dim
+        # project_back=True (default): compresses expanded features back to dim via learned linear
+        #   projection, keeping the memory MLP architecture unchanged. trades some capacity for
+        #   compatibility — the projection can only preserve dim independent directions out of expanded_dim.
+        # project_back=False: feeds the full expanded_dim directly into the memory MLP, giving
+        #   maximum O(d_k^p) capacity. requires a custom memory model that accepts expanded_dim as
+        #   input and outputs dim_head — none of the built-in MLP variants support this yet.
+
+        self.projection = LinearNoBias(self.expanded_dim, dim) if project_back else None
+
+    @property
+    def output_dim(self):
+        return self.dim if exists(self.projection) else self.expanded_dim
+
+    def forward(self, x):
+        features = []
+
+        for d in range(1, self.degree + 1):
+            indices = getattr(self, f'indices_{d}')  # (d, num_combos)
+            # gather dimensions and multiply: product of x[..., idx] for each idx in the combo
+            mono = x[..., indices[0]]
+            for i in range(1, d):
+                mono = mono * x[..., indices[i]]
+            features.append(self.coefficients[d - 1] * mono)
+
+        out = cat(features, dim = -1)
+
+        if exists(self.projection):
+            out = self.projection(out)
+
+        return out
+
 # multi head rmsnorm
 
 class MultiheadRMSNorm(Module):
@@ -290,6 +360,8 @@ class NeuralMemory(Module):
         spectral_norm_surprises = False,
         muon_ns_steps = 5,
         muon_ns_eps = 1e-7,
+        polynomial_degree: int | None = None,  # degree of polynomial feature mapping (e.g., 2 for quadratic). the Atlas paper does not specify the exact degree used — this is a hyperparameter to tune. None = disabled (linear, same as Titans).
+        poly_project_back = True,
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -510,6 +582,17 @@ class NeuralMemory(Module):
         self.muon_ns_steps = muon_ns_steps
         self.muon_ns_eps = muon_ns_eps
 
+        # polynomial feature mapping for increased memory capacity (Atlas, Section 3.1)
+
+        self.poly_features = None
+
+        if exists(polynomial_degree) and polynomial_degree >= 2:
+            self.poly_features = PolynomialFeatures(
+                dim = dim_head,
+                degree = polynomial_degree,
+                project_back = poly_project_back,
+            )
+
         # weight decay factor
 
         self.to_decay_factor = Sequential(
@@ -660,6 +743,11 @@ class NeuralMemory(Module):
         # maybe keys rmsnorm
 
         keys = self.k_norm(keys)
+
+        # maybe polynomial feature expansion (Atlas Section 3.1)
+
+        if exists(self.poly_features):
+            keys = self.poly_features(keys)
 
         # take care of chunking
 
@@ -880,6 +968,11 @@ class NeuralMemory(Module):
         # maybe qk rmsnorm
 
         queries = self.q_norm(queries)
+
+        # maybe polynomial feature expansion (Atlas Section 3.1)
+
+        if exists(self.poly_features):
+            queries = self.poly_features(queries)
 
         # fetch values from memory model
 
