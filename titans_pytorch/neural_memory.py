@@ -334,6 +334,24 @@ def default_loss_fn(pred, target):
     return (pred - target).pow(2).mean(dim = -1)
 
 class NeuralMemory(Module):
+
+    @classmethod
+    def atlas_config(cls, **overrides):
+        """Returns kwargs for Atlas-style configuration (all three extensions enabled).
+        Momentum and Muon (spectral norm) are confirmed in the paper (Table 1, Eq. 57-58).
+        omega_window=8 based on Figure 5 showing c=8 as the best performing context window.
+        polynomial_degree=2 is a reasonable default — the paper does not specify the exact degree.
+        """
+        defaults = dict(
+            momentum = True,
+            spectral_norm_surprises = True,
+            polynomial_degree = 2,
+            poly_project_back = True,
+            omega_window = 8,
+        )
+        defaults.update(overrides)
+        return defaults
+
     def __init__(
         self,
         dim,
