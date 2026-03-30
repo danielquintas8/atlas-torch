@@ -444,3 +444,41 @@ def test_muon_custom_steps():
     retrieved, _ = mem(seq)
     assert seq.shape == retrieved.shape
     retrieved.sum().backward()
+
+def test_polynomial_features():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        polynomial_degree = 2,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_polynomial_features_multihead():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        dim_head = 8,
+        heads = 2,
+        polynomial_degree = 2,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_polynomial_features_degree_3():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        polynomial_degree = 3,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
