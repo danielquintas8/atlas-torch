@@ -218,6 +218,14 @@ class PolynomialFeatures(Module):
         self.expanded_dim = expanded_dim
         self.index_group_sizes = index_groups
 
+        if expanded_dim > 100_000:
+            import warnings
+            warnings.warn(
+                f'PolynomialFeatures: expanded_dim={expanded_dim} with dim={dim}, degree={degree}. '
+                f'This will create large intermediate tensors and a projection with {expanded_dim * dim} parameters. '
+                f'Consider reducing degree or dim_head.'
+            )
+
         # learnable coefficients from Taylor expansion of softmax: a_d = 1/d!
 
         coefficients = [1.0 / math.factorial(d) for d in range(1, degree + 1)]
