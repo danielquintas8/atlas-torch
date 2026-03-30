@@ -534,3 +534,24 @@ def test_omega_with_momentum_backward():
     for p in mem.parameters():
         if p.requires_grad:
             assert p.grad is not None
+
+def test_atlas_config():
+    """all three Atlas extensions combined via atlas_config()"""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 4, **config)
+
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+    for p in mem.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
+
+def test_atlas_config_overrides():
+    """atlas_config() accepts overrides"""
+    config = NeuralMemory.atlas_config(omega_window = 2, polynomial_degree = 3)
+    assert config['omega_window'] == 2
+    assert config['polynomial_degree'] == 3
+    assert config['momentum'] == True  # default preserved
