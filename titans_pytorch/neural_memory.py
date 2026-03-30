@@ -370,6 +370,8 @@ class NeuralMemory(Module):
         muon_ns_eps = 1e-7,
         polynomial_degree: int | None = None,  # degree of polynomial feature mapping (e.g., 2 for quadratic). the Atlas paper does not specify the exact degree used — this is a hyperparameter to tune. None = disabled (linear, same as Titans).
         poly_project_back = True,
+        omega_window: int = 1,  # number of chunks per omega window (Atlas Section 3.2). 1 = per-chunk updates (Titans). >1 = joint optimization over multiple chunks.
+        omega_decay: float | None = None,  # exponential decay within omega window. None = uniform weighting.
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -388,6 +390,10 @@ class NeuralMemory(Module):
 
         if exists(batch_size):
             assert divisible_by(batch_size, self.store_chunk_size)
+
+            if omega_window > 1:
+                assert divisible_by(batch_size, self.store_chunk_size * omega_window), \
+                    f'batch_size ({batch_size}) must be divisible by chunk_size * omega_window ({self.store_chunk_size * omega_window})'
 
         self.batch_size = batch_size
 
@@ -601,6 +607,18 @@ class NeuralMemory(Module):
                 project_back = poly_project_back,
             )
 
+        # omega rule - window-based joint optimization (Atlas Section 3.2)
+
+        self.omega_window = omega_window
+
+        if omega_window > 1 and exists(omega_decay):
+            # gammas[i] = decay^(W-1-i): oldest chunk gets lowest weight, most recent gets 1.0
+            positions = torch.arange(omega_window).float()
+            gammas = omega_decay ** (omega_window - 1 - positions)
+            self.register_buffer('omega_gammas', gammas, persistent = False)
+        else:
+            self.omega_gammas = None
+
         # weight decay factor
 
         self.to_decay_factor = Sequential(
@@ -686,8 +704,18 @@ class NeuralMemory(Module):
         # curtail sequence by multiple of the chunk size
         # only a complete chunk of the sequence provides the memory for the next chunk
 
+        omega_window = self.omega_window
+
+        # round down to fit complete chunks, then complete omega windows
+
         round_down_seq_len = round_down_multiple(seq_len, chunk_size)
         num_chunks = round_down_seq_len // chunk_size
+
+        if omega_window > 1:
+            num_chunks = round_down_multiple(num_chunks, omega_window)
+            round_down_seq_len = num_chunks * chunk_size
+
+        num_windows = num_chunks // omega_window
 
         seq, remainder = seq[..., :round_down_seq_len, :], seq[..., round_down_seq_len:, :]
 
@@ -703,7 +731,7 @@ class NeuralMemory(Module):
 
         # allow for neural memory of a previous layer to influence surprise of current layer
 
-        weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_chunks)
+        weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_windows)
 
         # initial norm
 
@@ -721,11 +749,14 @@ class NeuralMemory(Module):
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
-        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
+        # pool at window level for momentum/decay when using omega rule
+
+        chunk_pool_size = chunk_size * omega_window
+        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_pool_size)
 
         decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
 
-        need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks > 0
+        need_layer_lr_mod = exists(self.to_layer_modulation) and num_windows > 0
         has_momentum = exists(self.to_momentum)
 
         if has_momentum:
@@ -757,19 +788,27 @@ class NeuralMemory(Module):
         if exists(self.poly_features):
             keys = self.poly_features(keys)
 
-        # take care of chunking
+        # take care of chunking — group by omega windows
 
-        keys, values = tuple(rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
+        window_tokens = chunk_size * omega_window * num_updates
+
+        keys, values = tuple(rearrange(t, 'b h (w wt) d -> (b h w) wt d', wt = window_tokens) for t in (keys, values))
 
         # adaptive lr
 
-        adaptive_lr = rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_updates)
+        adaptive_lr = rearrange(adaptive_lr, 'b (w wt) -> (b w) wt', wt = window_tokens)
+
+        # apply intra-window decay weighting if omega_decay is set
+
+        if exists(self.omega_gammas):
+            gammas = repeat(self.omega_gammas, 'ow -> (ow cu)', cu = chunk_size * num_updates)
+            adaptive_lr = adaptive_lr * gammas
 
         # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
 
         if exists(mask):
             mask = mask[..., :round_down_seq_len]
-            mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
+            mask = repeat(mask, 'b (w wt) -> (b h w) (wt u)', h = heads, u = num_updates, wt = chunk_size * omega_window)
 
             adaptive_lr = torch.where(mask, adaptive_lr, 0.)
 
@@ -779,12 +818,16 @@ class NeuralMemory(Module):
 
         if exists(prev_weights):
 
-            start_index = math.ceil(seq_index / chunk_size)
-            end_index = start_index + num_chunks
+            # NOTE: assumes prev_weights (from a previous NeuralMemory layer) uses the same
+            # chunk_size and omega_window. If layers have different omega_window values,
+            # the temporal granularity won't match and indexing will be wrong.
+
+            start_index = math.ceil(seq_index / (chunk_size * omega_window))
+            end_index = start_index + num_windows
 
             prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
 
-            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
+            if exists(self.to_learned_weight_residual_mix) and num_windows > 0:
                 mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
@@ -810,8 +853,8 @@ class NeuralMemory(Module):
 
         # surprises
 
-        adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
-        unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
+        adaptive_lr = rearrange(adaptive_lr, '(b h w) c -> b h (w c)', b = batch, h = heads)
+        unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h w) c -> b h (w c)', b = batch, h = heads)
 
         # maybe softclamp grad norm
 
@@ -845,7 +888,7 @@ class NeuralMemory(Module):
 
         # early return if sequence length less than chunk size
 
-        if num_chunks == 0:
+        if num_windows == 0:
             updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
             next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
 
