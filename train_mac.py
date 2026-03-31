@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from adam_atan2_pytorch import AdoptAtan2
 
 from titans_pytorch import (
+    NeuralMemory,
     MemoryAsContextTransformer,
     MemoryMLP,
     MemoryAttention
@@ -63,10 +64,14 @@ NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory t
 NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon optimizer to surprise updates, by spectral norming the surprises
 NEURAL_MEM_STORE_WITH_LOOKAHEAD_VALUE = False   # store with values from next timestep - Sakana AI finding
 
+# atlas extensions — set USE_ATLAS to True to enable polynomial features, omega rule, and Muon defaults
+
+USE_ATLAS = False
+
 # experiment related
 
-PROJECT_NAME = 'titans-mac-transformer'
-RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+PROJECT_NAME = 'atlas-torch'
+RUN_NAME = f'{"atlas" if USE_ATLAS else "titans"}-mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
@@ -136,9 +141,13 @@ model = MemoryAsContextTransformer(
         use_accelerated_scan = USE_ACCELERATED_SCAN,
         per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
         spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES,
-        store_with_lookahead_value = NEURAL_MEM_STORE_WITH_LOOKAHEAD_VALUE
+        store_with_lookahead_value = NEURAL_MEM_STORE_WITH_LOOKAHEAD_VALUE,
+        **(NeuralMemory.atlas_config() if USE_ATLAS else {})
     )
 ).cuda()
+
+param_count = sum(p.numel() for p in model.parameters())
+print(f'model: {RUN_NAME} | parameters: {param_count:,}')
 
 # prepare enwik8 data
 
