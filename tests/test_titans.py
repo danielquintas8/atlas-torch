@@ -444,3 +444,114 @@ def test_muon_custom_steps():
     retrieved, _ = mem(seq)
     assert seq.shape == retrieved.shape
     retrieved.sum().backward()
+
+def test_polynomial_features():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        polynomial_degree = 2,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_polynomial_features_multihead():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        dim_head = 8,
+        heads = 2,
+        polynomial_degree = 2,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_polynomial_features_degree_3():
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        polynomial_degree = 3,
+    )
+
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_omega_window_1_equals_baseline():
+    """omega_window=1 must produce identical results to default (no omega rule)"""
+    torch.manual_seed(42)
+    mem = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 1)
+    seq = torch.randn(2, 32, 16)
+    out1, _ = mem(seq)
+
+    torch.manual_seed(42)
+    mem2 = NeuralMemory(dim = 16, chunk_size = 4)
+    out2, _ = mem2(seq)
+
+    assert torch.allclose(out1, out2, atol = 1e-5)
+
+def test_omega_rule_changes_output():
+    """omega_window > 1 must produce different results than per-chunk updates"""
+    torch.manual_seed(42)
+    mem1 = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 1)
+    seq = torch.randn(2, 64, 16)
+    out1, _ = mem1(seq)
+
+    torch.manual_seed(42)
+    mem2 = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 2)
+    out2, _ = mem2(seq)
+
+    assert out1.shape == out2.shape
+    assert not torch.allclose(out1, out2, atol = 1e-5), 'omega_window > 1 should produce different output'
+
+def test_omega_decay_changes_output():
+    """omega_decay should produce different results than uniform weighting"""
+    torch.manual_seed(42)
+    mem1 = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 2)
+    seq = torch.randn(2, 64, 16)
+    out1, _ = mem1(seq)
+
+    torch.manual_seed(42)
+    mem2 = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 2, omega_decay = 0.9)
+    out2, _ = mem2(seq)
+
+    assert not torch.allclose(out1, out2, atol = 1e-5), 'omega_decay should affect output'
+
+def test_omega_with_momentum_backward():
+    """omega rule + momentum must support gradient flow"""
+    mem = NeuralMemory(dim = 16, chunk_size = 4, omega_window = 2, momentum = True)
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    retrieved.sum().backward()
+
+    # verify gradients exist on learnable params
+    for p in mem.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
+
+def test_atlas_config():
+    """all three Atlas extensions combined via atlas_config()"""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 4, **config)
+
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+    for p in mem.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
+
+def test_atlas_config_overrides():
+    """atlas_config() accepts overrides"""
+    config = NeuralMemory.atlas_config(omega_window = 2, polynomial_degree = 3)
+    assert config['omega_window'] == 2
+    assert config['polynomial_degree'] == 3
+    assert config['momentum'] == True  # default preserved
