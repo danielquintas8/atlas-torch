@@ -1046,6 +1046,18 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if weights_have_expanded_shape:
+            # when using omega rule, each window's weights cover omega_window chunks.
+            # updates shape is (batch*heads, num_windows + 1, ...) where +1 is the initial weight.
+            # retrieve expects one weight per retrieve chunk + 1 initial.
+            # split off the initial, repeat the windows, then prepend the initial back.
+
+            omega_window = self.omega_window
+            if omega_window > 1:
+                init_weight = weights.apply(lambda t: t[:, :1])
+                window_weights = weights.apply(lambda t: t[:, 1:])
+                window_weights = repeat_dict_values(window_weights, 'b n ... -> b (n ow) ...', ow = omega_window)
+                weights = TensorDict({k: cat((init_weight[k], window_weights[k]), dim=1) for k in weights.keys()})
+
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)

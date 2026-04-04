@@ -112,6 +112,25 @@ else:
         depth = NEURAL_MEMORY_DEPTH
     )
 
+# neural memory kwargs
+
+neural_memory_kwargs = dict(
+    dim_head = 64,
+    heads = 4,
+    attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
+    qk_rmsnorm = NEURAL_MEM_QK_NORM,
+    momentum = NEURAL_MEM_MOMENTUM,
+    momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
+    default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
+    use_accelerated_scan = USE_ACCELERATED_SCAN,
+    per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
+    spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES,
+    store_with_lookahead_value = NEURAL_MEM_STORE_WITH_LOOKAHEAD_VALUE,
+)
+
+if USE_ATLAS:
+    neural_memory_kwargs.update(NeuralMemory.atlas_config())
+
 # instantiate memory-as-context transformer
 
 model = MemoryAsContextTransformer(
@@ -130,20 +149,7 @@ model = MemoryAsContextTransformer(
     use_flex_attn = USE_FLEX_ATTN,
     sliding_window_attn = SLIDING_WINDOWS,
     neural_memory_model = neural_memory_model,
-    neural_memory_kwargs = dict(
-        dim_head = 64,
-        heads = 4,
-        attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
-        qk_rmsnorm = NEURAL_MEM_QK_NORM,
-        momentum = NEURAL_MEM_MOMENTUM,
-        momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
-        default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
-        use_accelerated_scan = USE_ACCELERATED_SCAN,
-        per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR,
-        spectral_norm_surprises = NEURAL_MEM_SPEC_NORM_SURPRISES,
-        store_with_lookahead_value = NEURAL_MEM_STORE_WITH_LOOKAHEAD_VALUE,
-        **(NeuralMemory.atlas_config() if USE_ATLAS else {})
-    )
+    neural_memory_kwargs = neural_memory_kwargs,
 ).cuda()
 
 param_count = sum(p.numel() for p in model.parameters())
