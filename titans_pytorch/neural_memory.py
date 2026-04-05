@@ -643,6 +643,15 @@ class NeuralMemory(Module):
                 mask[i, start:i+1] = 1.0
             self.register_buffer('omega_mask', mask, persistent = False)
 
+            # learned per-window-position context gates γ_i^(t) (Section 3.2, page 8)
+            # for each position t, produces c gates ∈ [0,1] weighting each token in the window
+            # effective weight for token i in position t's window = adaptive_lr_i × γ_k^(t)
+
+            self.to_context_gates = Sequential(
+                nn.Linear(dim, heads * omega_context),
+                Rearrange('b n (h c) -> (b h) n c', h = heads, c = omega_context),
+            )
+
         # weight decay factor
 
         self.to_decay_factor = Sequential(
@@ -863,11 +872,44 @@ class NeuralMemory(Module):
             grads = TensorDict(grads)
             # grads shape: (batch*heads*num_chunks, chunk_size, *weight_shape)
 
-            # apply sliding window mask M_s via einsum
-            grads = TensorDict({
-                name: einsum(self.omega_mask, g, 'i j, bhn j ... -> bhn i ...')
-                for name, g in grads.items()
-            })
+            # apply gamma-weighted sliding window (Section 3.2, Eq 9)
+            # for each position i, G_i = Σ_{k=0}^{c-1} γ_k^(i) · grad[i - c + 1 + k]
+            # gamma gates: c learned weights per position, input-dependent
+
+            omega_c = self.omega_context
+            context_gates = self.to_context_gates(seq).sigmoid()  # (bh, num_tokens, c)
+            context_gates = rearrange(context_gates, 'bh (n b) c -> (bh n) b c', b = chunk_size)
+            # context_gates: (bh*num_chunks, chunk_size, omega_context)
+
+            windowed_grads = TensorDict()
+
+            for name, g in grads.items():
+                # g: (bhn, chunk_size, ...)
+                windowed = torch.zeros_like(g)
+
+                for k in range(omega_c):
+                    offset = omega_c - 1 - k  # k=0 → oldest (largest shift), k=c-1 → newest (no shift)
+                    gamma_k = context_gates[..., k]  # (bhn, chunk_size)
+
+                    if offset == 0:
+                        shifted = g
+                    else:
+                        # shift right by offset along dim 1 (chunk_size), zero-pad start
+                        shifted = F.pad(
+                            g[:, offset:],
+                            (0,) * (2 * (g.ndim - 2)) + (offset, 0)
+                        )
+
+                    # broadcast gamma over all trailing weight dimensions
+                    gamma_expanded = gamma_k
+                    for _ in range(g.ndim - 2):
+                        gamma_expanded = gamma_expanded.unsqueeze(-1)
+
+                    windowed = windowed + shifted * gamma_expanded
+
+                windowed_grads[name] = windowed
+
+            grads = windowed_grads
 
             # reshape from (bh*num_chunks, chunk_size, ...) to (bh, num_tokens, ...)
             # so momentum/decay scan runs per-position (Eqs 37-39)
