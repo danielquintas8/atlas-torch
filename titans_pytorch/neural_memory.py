@@ -640,12 +640,11 @@ class NeuralMemory(Module):
             assert omega_context <= self.store_chunk_size, \
                 f'omega_context ({omega_context}) must be <= chunk_size ({self.store_chunk_size})'
 
-            # sliding window mask M_s (Section 3.3): banded lower-triangular, bandwidth c
-            mask = torch.zeros(self.store_chunk_size, self.store_chunk_size)
-            for i in range(self.store_chunk_size):
-                start = max(0, i - omega_context + 1)
-                mask[i, start:i+1] = 1.0
-            self.register_buffer('omega_mask', mask, persistent = False)
+            # NOTE: the paper's M_s mask (Section 3.3) is a banded lower-triangular matrix
+            # that enforces which tokens fall within each position's window. In our implementation,
+            # this hard boundary is implicitly enforced by zero-padding in the shift-based gamma
+            # gate computation — tokens outside the window produce zero-padded shifted gradients,
+            # so no explicit M_s buffer is needed.
 
             # learned per-window-position context gates γ_i^(t) (Section 3.2, page 8)
             # for each position t, produces c gates ∈ [0,1] weighting each token in the window
