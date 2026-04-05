@@ -497,6 +497,24 @@ class NeuralMemory(Module):
 
         self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
+        # per-token gradient function for Omega Rule (Atlas Section 3.3)
+        # computes one gradient per token within each chunk, all w.r.t. same chunk-start weights
+
+        if omega_context > 1:
+            def single_token_forward_and_loss(params, single_input, single_lr, single_target):
+                pred = functional_call(self.memory_model, params, single_input.unsqueeze(0))
+                loss = self.store_memory_loss_fn(pred, single_target.unsqueeze(0))
+                weighted_loss = loss * single_lr
+                return weighted_loss.sum(), loss.sum()
+
+            single_grad_fn = grad(single_token_forward_and_loss, has_aux = True)
+
+            # inner vmap: over tokens within a chunk. params shared (in_dims=None) — same M_{t'}
+            per_token_in_chunk_grad_fn = vmap(single_grad_fn, in_dims = (None, 0, 0, 0))
+
+            # outer vmap: over chunks. params vary per chunk (in_dims=0)
+            self.per_token_grad_fn = vmap(per_token_in_chunk_grad_fn, in_dims = (0, 0, 0, 0))
+
         # queries for retrieving from the model
 
         self.to_queries = Sequential(LinearNoBias(dim, dim_inner), activation)
@@ -745,7 +763,15 @@ class NeuralMemory(Module):
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
-        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
+        use_omega = self.omega_context > 1
+
+        # derive per-chunk or per-token representations for momentum/decay/lr params
+        # omega rule requires per-token granularity (Section 5.1, Eqs 37-39)
+
+        if use_omega:
+            chunked_seq = seq  # per-token: no pooling
+        else:
+            chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
 
         decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
 
@@ -826,25 +852,48 @@ class NeuralMemory(Module):
             keys = keys[..., :-1, :]
             values = values[..., 1:, :]
 
-        # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
+        # get grads and extra auxiliary loss
 
-        grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+        if use_omega:
+            # omega rule: per-token gradients within each chunk, all w.r.t. same M_{t'}
+            # then apply sliding window mask M_s (Section 3.3)
 
-        grads = TensorDict(grads)
+            grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
 
-        # surprises
+            grads = TensorDict(grads)
+            # grads shape: (batch*heads*num_chunks, chunk_size, *weight_shape)
 
-        adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
-        unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
+            # apply sliding window mask M_s via einsum
+            grads = TensorDict({
+                name: einsum(self.omega_mask, g, 'i j, bhn j ... -> bhn i ...')
+                for name, g in grads.items()
+            })
+
+            # reshape from (bh*num_chunks, chunk_size, ...) to (bh, num_tokens, ...)
+            # so momentum/decay scan runs per-position (Eqs 37-39)
+            grads = rearrange_dict_values(grads, '(b n) c ... -> b (n c) ...', b = batch * heads)
+
+            # surprises
+            adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
+            unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
+
+        else:
+            # standard Titans path: one gradient per chunk
+            grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+
+            grads = TensorDict(grads)
+
+            # surprises
+            adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
+            unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
+
+            # restore batch and sequence dimension
+            grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
 
         # maybe softclamp grad norm
 
         if exists(self.max_grad_norm):
             grads = grads.apply(lambda t: softclamp_grad_norm(t, self.max_grad_norm))
-
-        # restore batch and sequence dimension
-
-        grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
 
         # maybe per layer modulation
 
@@ -1009,6 +1058,14 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if weights_have_expanded_shape:
+            # when omega_context > 1, updates have per-token granularity but retrieve
+            # uses per-chunk approximation (Phase 1): subsample at chunk boundaries
+            if self.omega_context > 1:
+                init_w = weights.apply(lambda t: t[:, :1])
+                token_w = weights.apply(lambda t: t[:, 1:])
+                subsampled = token_w.apply(lambda t: t[:, self.store_chunk_size - 1::self.store_chunk_size])
+                weights = TensorDict({k: cat((init_w[k], subsampled[k]), dim = 1) for k in weights.keys()})
+
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
