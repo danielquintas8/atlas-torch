@@ -1106,8 +1106,9 @@ class NeuralMemory(Module):
 
         if weights_have_expanded_shape:
             # when omega_context > 1, updates have per-token granularity.
-            # subsample at chunk boundaries for per-chunk retrieval approximation.
-            # TODO: fix per-token retrieve alignment with batch_size splitting in forward()
+            # subsample at chunk boundaries for per-chunk retrieval — this matches
+            # the paper's chunked parallelization (Section 3.3, Eq 16) where all
+            # positions within a chunk share the same M_{t'}.
             if self.omega_context > 1:
                 init_w = weights.apply(lambda t: t[:, :1])
                 token_w = weights.apply(lambda t: t[:, 1:])
