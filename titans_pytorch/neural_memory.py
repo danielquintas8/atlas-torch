@@ -393,9 +393,10 @@ class NeuralMemory(Module):
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
-        # omega rule produces per-token weight updates but retrieve operates per-chunk.
-        # subsample at chunk boundaries in retrieve_memories: use the last token's weight
-        # within each chunk. this matches the same granularity as non-omega Titans retrieve.
+        # omega rule produces per-token weight updates (Eq 41: M_t = M_{t-1} + S'_t).
+        # the paper implies per-position M_t for retrieval, but per-token retrieve has
+        # alignment issues with batch_size splitting in forward(). using per-chunk
+        # approximation (subsample at chunk boundaries in retrieve_memories) for now.
 
         # batch size
 
