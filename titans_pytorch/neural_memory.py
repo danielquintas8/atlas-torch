@@ -355,6 +355,7 @@ class NeuralMemory(Module):
             poly_project_back = True,
             omega_context = 8,
             short_conv_size = 4,
+            qk_rmsnorm = True,
         )
         defaults.update(overrides)
         return defaults
