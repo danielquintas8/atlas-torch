@@ -394,8 +394,10 @@ class NeuralMemory(Module):
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
         # per-token retrieve for omega rule (Phase 3)
-        if omega_context > 1:
-            self.retrieve_chunk_size = 1
+        # TODO: per-token retrieve (retrieve_chunk_size=1) has alignment issues with
+        # the batch_size splitting in forward(). Using per-chunk approximation for now.
+        # if omega_context > 1:
+        #     self.retrieve_chunk_size = 1
 
         # batch size
 
@@ -1103,6 +1105,15 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if weights_have_expanded_shape:
+            # when omega_context > 1, updates have per-token granularity.
+            # subsample at chunk boundaries for per-chunk retrieval approximation.
+            # TODO: fix per-token retrieve alignment with batch_size splitting in forward()
+            if self.omega_context > 1:
+                init_w = weights.apply(lambda t: t[:, :1])
+                token_w = weights.apply(lambda t: t[:, 1:])
+                subsampled = token_w.apply(lambda t: t[:, self.store_chunk_size - 1::self.store_chunk_size])
+                weights = TensorDict({k: cat((init_w[k], subsampled[k]), dim = 1) for k in weights.keys()})
+
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
