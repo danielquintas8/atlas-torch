@@ -393,11 +393,9 @@ class NeuralMemory(Module):
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
-        # per-token retrieve for omega rule (Phase 3)
-        # TODO: per-token retrieve (retrieve_chunk_size=1) has alignment issues with
-        # the batch_size splitting in forward(). Using per-chunk approximation for now.
-        # if omega_context > 1:
-        #     self.retrieve_chunk_size = 1
+        # omega rule produces per-token weight updates but retrieve operates per-chunk.
+        # subsample at chunk boundaries in retrieve_memories: use the last token's weight
+        # within each chunk. this matches the same granularity as non-omega Titans retrieve.
 
         # batch size
 
@@ -849,7 +847,9 @@ class NeuralMemory(Module):
             prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
 
             if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
-                mix = self.to_learned_weight_residual_mix(chunked_seq)
+                # weight residual operates at chunk granularity (prev_weights is per-chunk)
+                chunked_seq_for_mix = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size) if use_omega else chunked_seq
+                mix = self.to_learned_weight_residual_mix(chunked_seq_for_mix)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 
