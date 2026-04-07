@@ -195,6 +195,8 @@ class CausalDepthwiseConv1d(Module):
         self.conv = nn.Conv1d(channels, channels, kernel_size, groups = channels, bias = False)
 
     def forward(self, x):
+        if x.shape[1] == 0:
+            return x
         x = x.transpose(1, 2)
         x = F.pad(x, (self.pad, 0))
         x = self.conv(x)
@@ -411,6 +413,11 @@ class NeuralMemory(Module):
         assert not (heads == 1 and dim_head != dim)
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
+
+        # omega rule incompatibilities
+        if omega_context > 1:
+            assert num_kv_per_token == 1, 'omega rule requires num_kv_per_token == 1 (context gates assume chunk_size tokens, not chunk_size * num_kv_per_token)'
+            assert not store_with_lookahead_value, 'omega rule is incompatible with store_with_lookahead_value (lookahead trims keys to chunk_size - 1, mismatching context gate dimensions)'
 
         # omega rule produces per-token weight updates (Eq 41: M_t = M_{t-1} + S'_t).
         # per-token retrieve (retrieve_chunk_size=1) is correct per the paper — each y_t = M_t(q_t).
