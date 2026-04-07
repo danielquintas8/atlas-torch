@@ -394,9 +394,9 @@ class NeuralMemory(Module):
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
         # omega rule produces per-token weight updates (Eq 41: M_t = M_{t-1} + S'_t).
-        # the paper implies per-position M_t for retrieval, but per-token retrieve has
-        # alignment issues with batch_size splitting in forward(). using per-chunk
-        # approximation (subsample at chunk boundaries in retrieve_memories) for now.
+        # per-token retrieve: each query token t uses its own M_t.
+        if omega_context > 1:
+            self.retrieve_chunk_size = 1
 
         # batch size
 
@@ -1106,15 +1106,18 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if weights_have_expanded_shape:
-            # when omega_context > 1, updates have per-token granularity.
-            # subsample at chunk boundaries for per-chunk retrieval — this matches
-            # the paper's chunked parallelization (Section 3.3, Eq 16) where all
-            # positions within a chunk share the same M_{t'}.
             if self.omega_context > 1:
-                init_w = weights.apply(lambda t: t[:, :1])
-                token_w = weights.apply(lambda t: t[:, 1:])
-                subsampled = token_w.apply(lambda t: t[:, self.store_chunk_size - 1::self.store_chunk_size])
-                weights = TensorDict({k: cat((init_w[k], subsampled[k]), dim = 1) for k in weights.keys()})
+                # per-token retrieve: use full per-token weight updates, no subsampling.
+                # pad for remainder tokens that store_memories didn't process (due to
+                # round_down_multiple). the last M_t is the correct state — remainder
+                # tokens come after all processed tokens.
+                n_weights = next(iter(weights.values())).shape[1]
+                n_needed = seq_len_plus_one
+                if n_weights < n_needed:
+                    diff = n_needed - n_weights
+                    weights = weights.apply(
+                        lambda t: cat((t, t[:, -1:].expand(-1, diff, *t.shape[2:])), dim = 1)
+                    )
 
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
