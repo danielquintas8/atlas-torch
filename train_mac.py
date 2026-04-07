@@ -133,6 +133,8 @@ if USE_ATLAS:
     NEURAL_MEM_SEGMENT_LEN = max(NEURAL_MEM_SEGMENT_LEN, neural_memory_kwargs.get('omega_context', 1))
     neural_memory_kwargs['attn_pool_chunks'] = False  # omega rule uses per-token params, no chunk pooling
     neural_memory_kwargs['per_parameter_lr_modulation'] = False  # TODO: fix shape mismatch with omega per-token grads
+    NEURAL_MEM_WEIGHT_RESIDUAL = False  # TODO: fix shape mismatch between per-token mix and per-chunk prev_weights
+    NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = False  # simplify for omega sanity check
 
     assert NEURAL_MEM_BATCH_SIZE % NEURAL_MEM_SEGMENT_LEN == 0, \
         f'NEURAL_MEM_BATCH_SIZE ({NEURAL_MEM_BATCH_SIZE}) must be divisible by NEURAL_MEM_SEGMENT_LEN ({NEURAL_MEM_SEGMENT_LEN})'
