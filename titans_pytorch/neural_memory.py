@@ -185,6 +185,21 @@ def newtonschulz5(
 
     return inv_pack(t)
 
+# short causal depthwise convolution on keys/queries (paper p.13)
+# provides local mixing before memory read/write
+
+class CausalDepthwiseConv1d(Module):
+    def __init__(self, channels, kernel_size = 4):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.conv = nn.Conv1d(channels, channels, kernel_size, groups = channels, bias = False)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = F.pad(x, (self.pad, 0))
+        x = self.conv(x)
+        return x.transpose(1, 2)
+
 # polynomial feature mapping for Atlas (Section 3.1)
 # increases memory capacity from O(d_k) to O(d_k^p) by expanding keys/queries
 # with interaction terms before they enter the memory MLP
@@ -339,6 +354,8 @@ class NeuralMemory(Module):
             polynomial_degree = 2,
             poly_project_back = True,
             omega_context = 8,
+            short_conv_size = 4,
+            qk_rmsnorm = True,
         )
         defaults.update(overrides)
         return defaults
@@ -379,7 +396,8 @@ class NeuralMemory(Module):
         polynomial_degree: int | None = None,
         poly_project_back = True,
         omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. must be <= store_chunk_size.
-        per_token_retrieve: bool = False,  # per-token retrieve (Eq 41: y_t = M_t(q_t)). correct per paper but requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
+        per_token_retrieve: bool = False,  # per-token retrieve: each y_t = M_t(q_t) using per-token weights from Eq 41. requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
+        short_conv_size: int = 0,  # causal depthwise conv on keys/queries (paper p.13, kernel size). 0 = disabled.
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -542,6 +560,11 @@ class NeuralMemory(Module):
             LinearNoBias(dim, dim_inner * num_kv_per_token),
             activation,
         )
+
+        # short causal convolution on keys/queries (paper p.13)
+
+        self.key_conv = CausalDepthwiseConv1d(dim_inner * num_kv_per_token, short_conv_size) if short_conv_size > 0 else None
+        self.query_conv = CausalDepthwiseConv1d(dim_inner, short_conv_size) if short_conv_size > 0 else None
 
         self.store_with_lookahead_value = store_with_lookahead_value
 
@@ -811,6 +834,11 @@ class NeuralMemory(Module):
 
         keys = self.to_keys(seq)
         values = self.to_values(values_seq)
+
+        # maybe short causal conv
+
+        if exists(self.key_conv):
+            keys = self.key_conv(keys)
 
         # maybe multi head
 
@@ -1094,6 +1122,11 @@ class NeuralMemory(Module):
         # sequence Float['b n d'] to queries
 
         queries = self.to_queries(seq)
+
+        # maybe short causal conv
+
+        if exists(self.query_conv):
+            queries = self.query_conv(queries)
 
         # maybe multihead
 
