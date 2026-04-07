@@ -379,6 +379,7 @@ class NeuralMemory(Module):
         polynomial_degree: int | None = None,
         poly_project_back = True,
         omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. must be <= store_chunk_size.
+        per_token_retrieve: bool = False,  # per-token retrieve (Eq 41: y_t = M_t(q_t)). correct per paper but requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -394,8 +395,12 @@ class NeuralMemory(Module):
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
         # omega rule produces per-token weight updates (Eq 41: M_t = M_{t-1} + S'_t).
-        # per-token retrieve: each query token t uses its own M_t.
-        if omega_context > 1:
+        # per-token retrieve (retrieve_chunk_size=1) is correct per the paper — each y_t = M_t(q_t).
+        # however, it requires ~chunk_size× more autograd memory (one weight set per token in the
+        # computation graph, held for backward across all layers). defaults to per-chunk approximation
+        # (subsample at chunk boundaries, same as Titans) which works on single GPU.
+        # enable per_token_retrieve=True when hardware supports it (multi-GPU, model parallelism).
+        if omega_context > 1 and per_token_retrieve:
             self.retrieve_chunk_size = 1
 
         # batch size
@@ -1107,17 +1112,25 @@ class NeuralMemory(Module):
 
         if weights_have_expanded_shape:
             if self.omega_context > 1:
-                # per-token retrieve: use full per-token weight updates, no subsampling.
-                # pad for remainder tokens that store_memories didn't process (due to
-                # round_down_multiple). the last M_t is the correct state — remainder
-                # tokens come after all processed tokens.
-                n_weights = next(iter(weights.values())).shape[1]
-                n_needed = seq_len_plus_one
-                if n_weights < n_needed:
-                    diff = n_needed - n_weights
-                    weights = weights.apply(
-                        lambda t: cat((t, t[:, -1:].expand(-1, diff, *t.shape[2:])), dim = 1)
-                    )
+                if chunk_size == 1:
+                    # per-token retrieve: use full per-token weights, no subsampling.
+                    # pad for remainder tokens (those not processed by store_memories due
+                    # to round_down_multiple). the last M_t is the correct state.
+                    n_weights = next(iter(weights.values())).shape[1]
+                    n_needed = seq_len_plus_one
+                    if n_weights < n_needed:
+                        diff = n_needed - n_weights
+                        weights = weights.apply(
+                            lambda t: cat((t, t[:, -1:].expand(-1, diff, *t.shape[2:])), dim = 1)
+                        )
+                else:
+                    # per-chunk retrieve approximation: subsample per-token weights at chunk
+                    # boundaries. uses last token's M_t within each chunk. same granularity
+                    # as non-omega Titans retrieve. costs less autograd memory than per-token.
+                    init_w = weights.apply(lambda t: t[:, :1])
+                    token_w = weights.apply(lambda t: t[:, 1:])
+                    subsampled = token_w.apply(lambda t: t[:, self.store_chunk_size - 1::self.store_chunk_size])
+                    weights = TensorDict({k: cat((init_w[k], subsampled[k]), dim = 1) for k in weights.keys()})
 
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
