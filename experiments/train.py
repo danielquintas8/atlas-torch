@@ -171,6 +171,8 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--per-device-batch-size", type=int, default=4)
+    p.add_argument("--seq-len", type=int, default=None, help="Override training sequence length")
+    p.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -179,6 +181,8 @@ def main():
     args = parse_args()
     config = get_config(args.model, args.variant, args.ablation)
     train_cfg = config["training"]
+    if args.seq_len:
+        train_cfg["seq_len"] = args.seq_len
     seq_len = train_cfg["seq_len"]
 
     run_name = args.run_name or (
@@ -190,7 +194,7 @@ def main():
     # Gradient accumulation: match 0.5M token batch target
     num_gpus = int(os.environ.get("WORLD_SIZE", "1"))
     tokens_per_micro = num_gpus * args.per_device_batch_size * seq_len
-    grad_accum = max(1, train_cfg["batch_tokens"] // tokens_per_micro)
+    grad_accum = args.grad_accum or max(1, train_cfg["batch_tokens"] // tokens_per_micro)
     batch_tokens = tokens_per_micro * grad_accum
 
     total_steps = args.max_steps or int(train_cfg["total_tokens"] // batch_tokens)

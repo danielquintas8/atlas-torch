@@ -61,7 +61,7 @@ MAC_DEFAULTS = dict(
     ff_mult=4,
     sliding_window_attn=True,
     use_flex_attn=True,
-    neural_memory_batch_size=128,   # split sequence into segments for memory processing
+    neural_memory_batch_size=1024,  # larger = fewer segments = less retained memory with detach_segment_memory
 )
 
 # ---------------------------------------------------------------------------
@@ -88,6 +88,7 @@ MEMORY_CONFIGS = {
         default_step_transform_max_lr=1e-1,
         per_parameter_lr_modulation=True,
         use_accelerated_scan=False,
+        detach_segment_memory=True, # truncated outer-loop backprop across segments (memory optimization)
     ),
 }
 
@@ -114,8 +115,12 @@ ABLATIONS = {
 
 
 def get_memory_layers(depth: int) -> tuple[int, ...]:
-    """Every other layer starting from 2."""
-    return tuple(range(2, depth + 1, 2))
+    """Every 4th layer. 3 memory layers for depth=12, 6 for depth=24.
+
+    The omega rule's per-token gradients + associative scans use ~23 GB per
+    memory layer in the autograd graph. Fewer layers = fits on fewer GPUs.
+    """
+    return tuple(range(4, depth + 1, 4))
 
 
 def get_config(
@@ -159,7 +164,7 @@ def get_config(
     neural_memory_segment_len = max(8, omega_context)
 
     memory_kwargs["dim_head"] = dim_head
-    memory_kwargs["heads"] = model_arch["heads"]
+    memory_kwargs["heads"] = model_arch["heads"]  # Table 7: same heads for attention and memory
 
     # Model config (kwargs for MemoryAsContextTransformer)
     model_config = dict(
