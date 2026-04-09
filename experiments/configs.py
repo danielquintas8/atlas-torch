@@ -89,6 +89,7 @@ MEMORY_CONFIGS = {
         per_parameter_lr_modulation=True,
         use_accelerated_scan=False,
         detach_segment_memory=True, # truncated outer-loop backprop across segments (memory optimization)
+        use_sequential_scan=True,  # O(1) memory scan instead of O(n log n) parallel scan
     ),
 }
 
@@ -115,12 +116,13 @@ ABLATIONS = {
 
 
 def get_memory_layers(depth: int) -> tuple[int, ...]:
-    """Every 4th layer. 3 memory layers for depth=12, 6 for depth=24.
-
-    The omega rule's per-token gradients + associative scans use ~23 GB per
-    memory layer in the autograd graph. Fewer layers = fits on fewer GPUs.
+    """Memory on 2 layers — spaced evenly. Each omega memory layer uses ~12 GB
+    in autograd (vmap/grad outputs + scan I/O), and torch.utils.checkpoint is
+    incompatible with torch.func.grad, so all layers' intermediates are held
+    simultaneously. 2 layers fits on 1×H100 64GB with room for batch>1.
     """
-    return tuple(range(4, depth + 1, 4))
+    third = depth // 3
+    return (third, depth)
 
 
 def get_config(
