@@ -400,6 +400,7 @@ class NeuralMemory(Module):
         omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. must be <= store_chunk_size.
         per_token_retrieve: bool = False,  # per-token retrieve: each y_t = M_t(q_t) using per-token weights from Eq 41. requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
         short_conv_size: int = 0,  # causal depthwise conv on keys/queries (paper p.13, kernel size). 0 = disabled.
+        detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -574,6 +575,7 @@ class NeuralMemory(Module):
         self.query_conv = CausalDepthwiseConv1d(dim_inner, short_conv_size) if short_conv_size > 0 else None
 
         self.store_with_lookahead_value = store_with_lookahead_value
+        self.detach_segment_memory = detach_segment_memory
 
         self.store_memory_loss_fn = store_memory_loss_fn
 
@@ -826,6 +828,9 @@ class NeuralMemory(Module):
         need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks > 0
         has_momentum = exists(self.to_momentum)
 
+        adaptive_momentum = None
+        combine_momentums = None
+
         if has_momentum:
             adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
 
@@ -1033,23 +1038,22 @@ class NeuralMemory(Module):
             if has_momentum:
                 momentum = surprise
 
-                momentums = [] # stores all momentum orders starting with first, to generalize to Nth order momentum
+                momentums = []
 
                 last_momentum = past_last_momentum[param_name]
 
                 # go from first order momentum all the way to the Nth
 
                 for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
+                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum)
 
                     momentums.append(momentum)
 
                 momentums = stack(momentums)
 
-                next_last_momentum[param_name] = momentums[:, :, -1] # momentums shape is Float['o bh n 1']
+                next_last_momentum[param_name] = momentums[:, :, -1]
 
                 if learned_combine and self.learned_combine_include_zeroth:
-                    # add the original surprise if learned combination of momentums
                     momentums = cat((rearrange(surprise, '... -> 1 ...'), momentums), dim = 0)
 
                 if not learned_combine:
@@ -1276,15 +1280,11 @@ class NeuralMemory(Module):
             split_sizes = (store_seq_len,)
             update_after_final_store = False
 
-        # accumulate updates
+        # collect segment updates — concatenated once at the end to avoid O(n²)
+        # autograd memory from incremental cat (each intermediate concat is retained
+        # for backward, holding all prior segments simultaneously)
 
-        updates = None
-
-        def accum_updates(past_updates, future_updates):
-            if not exists(past_updates):
-                return future_updates
-
-            return TensorDict({param_name: cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
+        all_segment_updates = []
 
         # loop through chunks of store sequences
 
@@ -1310,19 +1310,31 @@ class NeuralMemory(Module):
 
             next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
                 store_seq_chunk,
-                weights,
-                seq_index = seq_index,
+                weights = weights,
                 past_state = past_state,
+                seq_index = seq_index,
                 prev_weights = prev_weights,
                 mask = maybe_store_mask,
-                return_surprises = True
+                return_surprises = True,
             )
 
-            weights = next_neural_mem_state.weights
             seq_index = next_neural_mem_state.seq_index
-            past_state = next_neural_mem_state.states
 
-            updates = accum_updates(updates, next_updates)
+            # optionally detach intermediate segments to reduce autograd memory from
+            # O(segments) to O(1). trade-off: outer-loop (LM loss) gradients for store-side
+            # parameters (to_keys, adaptive step, momentum, decay) come only from the last
+            # segment. inner-loop surprise gradients are unaffected. this is a standard
+            # approximation in TTT literature (see TTT-E2E for the non-truncated alternative).
+            # enable via detach_segment_memory=True when memory is constrained.
+            if self.detach_segment_memory and not is_last:
+                next_updates = next_updates.apply(lambda t: t.detach())
+                weights = next_neural_mem_state.weights.apply(lambda t: t.detach())
+                past_state = tree_map(lambda t: t.detach() if is_tensor(t) else t, next_neural_mem_state.states)
+            else:
+                weights = next_neural_mem_state.weights
+                past_state = next_neural_mem_state.states
+
+            all_segment_updates.append(next_updates)
 
             surprises = tuple(safe_cat(args, dim = -1) for args in zip(surprises, chunk_surprises))
 
@@ -1346,6 +1358,21 @@ class NeuralMemory(Module):
                 weights = weights,
                 states = past_state,
             )
+
+        # single cat of all segment updates — drop last entry of each segment except
+        # the final one (boundary overlap: next segment's first entry is the gated
+        # version of the previous segment's last entry, matching original accum_updates)
+
+        if len(all_segment_updates) == 1:
+            updates = all_segment_updates[0]
+        else:
+            trimmed = [
+                s.apply(lambda t: t[:, :-1]) for s in all_segment_updates[:-1]
+            ] + [all_segment_updates[-1]]
+            updates = TensorDict({
+                name: cat([s[name] for s in trimmed], dim=1)
+                for name in all_segment_updates[0].keys()
+            })
 
         next_neural_mem_state = next_neural_mem_state._replace(updates = updates)
 

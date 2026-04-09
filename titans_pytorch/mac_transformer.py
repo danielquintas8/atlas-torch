@@ -275,10 +275,10 @@ class SegmentedAttention(Module):
 
         pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
 
-        # persistent memory
+        # persistent memory (cast to match q/k dtype for bf16 autocast compatibility)
 
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        k = cat((pmk.to(k.dtype), k), dim = -2)
+        v = cat((pmv.to(v.dtype), v), dim = -2)
 
         # attention
 
@@ -333,10 +333,10 @@ class SegmentedAttention(Module):
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-        # persistent memory
+        # persistent memory (cast to match q/k dtype for bf16 autocast compatibility)
 
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        k = cat((pmk.to(k.dtype), k), dim = -2)
+        v = cat((pmv.to(v.dtype), v), dim = -2)
 
         # prep flex attention
 

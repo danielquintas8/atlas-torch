@@ -1,4 +1,40 @@
-> **Note**: This branch (`titans-torch`) contains the original [Titans - PyTorch](https://gitlab.com/lucidrains/titans-pytorch) implementation by [Phil Wang (lucidrains)](https://gitlab.com/lucidrains), taken as-is from his GitLab repository (commit `714a14c`). All credit for this implementation goes to him. The `main` branch of this repo will contain our Atlas extensions (Omega Rule, polynomial features, Muon optimizer).
+# Atlas-Torch
+
+First open-source implementation of [Atlas — Learning to Memorize at Test Time](https://arxiv.org/abs/2505.23735), built on top of [lucidrains' titans-pytorch](https://github.com/lucidrains/titans-pytorch) (commit `714a14c`, preserved on the `titans-torch` branch).
+
+## Changes from lucidrains' Titans
+
+### Atlas Extensions (arXiv:2505.23735)
+
+| Component | File | Description |
+|-----------|------|-------------|
+| Polynomial Features | `neural_memory.py` | `PolynomialFeatures` class — exact monomial expansion via `combinations_with_replacement`, learnable coefficients (1/d!), optional `project_back` (Section 3.1) |
+| Omega Rule | `neural_memory.py` | Per-token gradients via nested `vmap(vmap(grad))`, gamma-weighted sliding window with learned context gates, per-position momentum/decay scan (Sections 3.2-3.3) |
+| Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 57-58) |
+| Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/queries (paper p.13, Figure 3) |
+| `atlas_config()` | `neural_memory.py` | Convenience classmethod returning recommended Atlas defaults |
+
+### Bug Fixes
+
+| Fix | File | Description |
+|-----|------|-------------|
+| bf16 dtype mismatch | `mac_transformer.py` | Cast persistent memory to match query dtype for flex_attention compatibility under autocast |
+| O(n²) autograd memory | `neural_memory.py` | Replace incremental `cat` in `accum_updates` with single-cat — reduces autograd memory from O(segments²) to O(segments) |
+| Conv empty sequence | `neural_memory.py` | Guard `CausalDepthwiseConv1d` against 0-length input during autoregressive inference |
+| Omega incompatibility guards | `neural_memory.py` | Assertions preventing omega with `num_kv_per_token > 1` or `store_with_lookahead_value` |
+
+### Configuration
+
+```python
+from titans_pytorch import NeuralMemory
+
+config = NeuralMemory.atlas_config()
+mem = NeuralMemory(dim=768, chunk_size=8, heads=16, **config)
+```
+
+---
+
+> **Note**: The `titans-torch` branch contains the original [Titans - PyTorch](https://gitlab.com/lucidrains/titans-pytorch) implementation by [Phil Wang (lucidrains)](https://gitlab.com/lucidrains), taken as-is from his GitLab repository (commit `714a14c`). All credit for this implementation goes to him.
 
 <img src="./fig2.png" width="400px"></img>
 
