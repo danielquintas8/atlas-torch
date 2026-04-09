@@ -114,6 +114,40 @@ def pad_at_dim(t, pad, dim = -1, value = 0.):
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
+def sequential_scan(gates, inputs, prev = None, remove_prev = True):
+    """Sequential associative scan: state[t] = gates[t] * state[t-1] + inputs[t].
+
+    Drop-in replacement for AssocScan that uses O(1) forward memory instead of
+    O(n log n). Slower (sequential vs parallel) but allows standard autograd
+    backward without TorchScript intermediate retention.
+
+    Gates shape (b, n, ...) is broadcast to match inputs shape (b, n, *weight_shape).
+    """
+
+    seq_len = inputs.shape[1]
+    if seq_len == 0:
+        if not remove_prev and exists(prev):
+            return prev.unsqueeze(1)
+        return inputs[:, :0]
+    state = prev if exists(prev) else torch.zeros_like(inputs[:, 0])
+    outputs = []
+
+    if not remove_prev:
+        outputs.append(state)
+
+    # broadcast gates to match input weight dimensions
+    gate_expand = gates.ndim < inputs.ndim
+    extra_dims = inputs.ndim - gates.ndim
+
+    for i in range(seq_len):
+        g = gates[:, i]
+        if gate_expand:
+            g = g.reshape(g.shape + (1,) * extra_dims)
+        state = g * state + inputs[:, i]
+        outputs.append(state)
+
+    return stack(outputs, dim = 1)
+
 def pack_one_with_inverse(t, pattern):
     packed, packed_shape = pack([t], pattern)
 
@@ -401,6 +435,7 @@ class NeuralMemory(Module):
         per_token_retrieve: bool = False,  # per-token retrieve: each y_t = M_t(q_t) using per-token weights from Eq 41. requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
         short_conv_size: int = 0,  # causal depthwise conv on keys/queries (paper p.13, kernel size). 0 = disabled.
         detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
+        use_sequential_scan: bool = False,  # use sequential scan for momentum/decay instead of parallel associative scan. O(1) forward memory vs O(n log n). slower but drastically reduces GPU memory for large sequences.
         gated_transition = False,
         mem_model_norm_add_residual = True,  # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         store_with_lookahead_value = False,  # Tianyu Zhao and Llion Jones - https://arxiv.org/abs/2601.00671 - they use the values from the next timestep for the gradients for storing, showing much better performance
@@ -576,6 +611,7 @@ class NeuralMemory(Module):
 
         self.store_with_lookahead_value = store_with_lookahead_value
         self.detach_segment_memory = detach_segment_memory
+        self.use_sequential_scan = use_sequential_scan
 
         self.store_memory_loss_fn = store_memory_loss_fn
 
@@ -1024,6 +1060,8 @@ class NeuralMemory(Module):
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
 
+        scan_fn = sequential_scan if self.use_sequential_scan else self.assoc_scan
+
         updates = TensorDict()
 
         next_last_update = TensorDict()
@@ -1045,7 +1083,7 @@ class NeuralMemory(Module):
                 # go from first order momentum all the way to the Nth
 
                 for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum)
+                    momentum = scan_fn(one_adaptive_momentum, momentum, prev = one_last_momentum)
 
                     momentums.append(momentum)
 
@@ -1068,7 +1106,7 @@ class NeuralMemory(Module):
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
+            update = scan_fn(1. - decay_factor, update, prev = last_update, remove_prev = False)
 
             updates[param_name] = update
             next_last_update[param_name] = update[:, -1]
