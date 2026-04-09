@@ -116,13 +116,14 @@ ABLATIONS = {
 
 
 def get_memory_layers(depth: int) -> tuple[int, ...]:
-    """Memory on 2 layers — spaced evenly. Each omega memory layer uses ~12 GB
-    in autograd (vmap/grad outputs + scan I/O), and torch.utils.checkpoint is
-    incompatible with torch.func.grad, so all layers' intermediates are held
-    simultaneously. 2 layers fits on 1×H100 64GB with room for batch>1.
+    """Memory on 2 layers — at 1/3 and end of network. Each omega memory layer
+    uses ~12 GB in autograd (vmap/grad outputs + scan I/O), and
+    torch.utils.checkpoint is incompatible with torch.func.grad, so all
+    layers' intermediates are held simultaneously. 2 layers fits on 1×H100
+    64GB with room for batch>1.
     """
-    third = depth // 3
-    return (third, depth)
+    first = max(1, depth // 3)
+    return (first, depth)
 
 
 def get_config(

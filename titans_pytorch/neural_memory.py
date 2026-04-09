@@ -125,6 +125,10 @@ def sequential_scan(gates, inputs, prev = None, remove_prev = True):
     """
 
     seq_len = inputs.shape[1]
+    if seq_len == 0:
+        if not remove_prev and exists(prev):
+            return prev.unsqueeze(1)
+        return inputs[:, :0]
     state = prev if exists(prev) else torch.zeros_like(inputs[:, 0])
     outputs = []
 
