@@ -23,7 +23,7 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 
 # allow running from repo root: `python experiments/train.py`
@@ -173,6 +173,8 @@ def parse_args():
     p.add_argument("--per-device-batch-size", type=int, default=4)
     p.add_argument("--seq-len", type=int, default=None, help="Override training sequence length")
     p.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps")
+    p.add_argument("--peak-lr", type=float, default=None, help="Override peak learning rate")
+    p.add_argument("--warmup-steps", type=int, default=None, help="Override warmup steps (0 to skip warmup)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -183,6 +185,8 @@ def main():
     train_cfg = config["training"]
     if args.seq_len:
         train_cfg["seq_len"] = args.seq_len
+    if args.peak_lr:
+        train_cfg["peak_lr"] = args.peak_lr
     seq_len = train_cfg["seq_len"]
 
     run_name = args.run_name or (
@@ -197,15 +201,25 @@ def main():
     grad_accum = args.grad_accum or max(1, train_cfg["batch_tokens"] // tokens_per_micro)
     batch_tokens = tokens_per_micro * grad_accum
 
-    total_steps = args.max_steps or int(train_cfg["total_tokens"] // batch_tokens)
-    warmup_steps = train_cfg["warmup_steps"]
+    schedule_steps = int(train_cfg["total_tokens"] // batch_tokens)
+    max_steps = args.max_steps or schedule_steps
+    if args.warmup_steps is not None:
+        warmup_steps = args.warmup_steps
+    elif args.resume:
+        warmup_steps = 0
+    else:
+        warmup_steps = train_cfg["warmup_steps"]
 
     # Accelerator
+    # find_unused_parameters=True needed because vmap(vmap(grad)) in the omega
+    # rule uses a functional interface that bypasses DDP's autograd tracking
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accum,
         log_with="wandb" if args.wandb else None,
         project_dir=output_dir,
         mixed_precision="bf16" if train_cfg["bf16"] else "no",
+        kwargs_handlers=[ddp_kwargs],
     )
     set_seed(args.seed)
 
@@ -218,7 +232,7 @@ def main():
         f"grad_accum={grad_accum}  batch_tokens={batch_tokens/1e6:.2f}M"
     )
     accelerator.print(
-        f"total_steps={total_steps:,}  warmup={warmup_steps}  "
+        f"max_steps={max_steps:,}  schedule_steps={schedule_steps:,}  warmup={warmup_steps}  "
         f"lr={train_cfg['peak_lr']}  wd={train_cfg['weight_decay']}"
     )
 
@@ -238,7 +252,7 @@ def main():
         lr=train_cfg["peak_lr"],
         weight_decay=train_cfg["weight_decay"],
     )
-    scheduler = cosine_with_warmup(optimizer, warmup_steps, total_steps)
+    scheduler = cosine_with_warmup(optimizer, warmup_steps, schedule_steps)
 
     # Prepare
     model, optimizer, train_loader, scheduler = accelerator.prepare(
@@ -259,7 +273,7 @@ def main():
                 "model_size": args.model,
                 "variant": args.variant,
                 "ablation": args.ablation,
-                "total_steps": total_steps,
+                "max_steps": max_steps,
                 "batch_tokens": batch_tokens,
                 "peak_lr": train_cfg["peak_lr"],
                 "params": param_count,
@@ -289,7 +303,7 @@ def main():
     loss_count = 0
     t0 = time.time()
 
-    while global_step < total_steps:
+    while global_step < max_steps:
         try:
             batch = next(train_iter)
         except StopIteration:
