@@ -543,7 +543,11 @@ class NeuralMemory(Module):
         memory_model_parameters = [*mem_model_params.values()]
 
         if per_head_learned_parameters:
-            memory_model_parameters = [repeat(p, '... -> h ...', h = heads) for p in memory_model_parameters]
+            # NOTE: .contiguous() materializes storage so each head owns its slice.
+            # Without it, repeat() returns an expanded view; the resulting Parameter
+            # shares storage across heads and load_state_dict() fails with
+            # "more than one element of the written-to tensor refers to a single memory location."
+            memory_model_parameters = [repeat(p, '... -> h ...', h = heads).contiguous() for p in memory_model_parameters]
 
         self.init_weight_shape = [p.shape for p in memory_model_parameters]
 
