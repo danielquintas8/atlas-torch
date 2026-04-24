@@ -22,6 +22,7 @@ export PROJECT_ROOT="/gpfs/projects/eporaif01/atlas-torch"
 export DATA_DIR="/gpfs/projects/eporaif01/data/fineweb-t5"
 export CONTAINER="/gpfs/projects/eporaif01/containers/atlas-torch"
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Offline HF: dataset + tokenizer + hub entirely from local cache
 export HF_HOME="${PROJECT_ROOT}/hf_cache"
