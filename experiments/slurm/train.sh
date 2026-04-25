@@ -65,6 +65,9 @@ fi
 
 RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}"
 
+# rename job to match variant (SBATCH --job-name is hardcoded; static directives can't use env vars)
+scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
+
 cd ${PROJECT_ROOT}
 mkdir -p runs
 
