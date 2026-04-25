@@ -543,7 +543,15 @@ class NeuralMemory(Module):
         memory_model_parameters = [*mem_model_params.values()]
 
         if per_head_learned_parameters:
-            memory_model_parameters = [repeat(p, '... -> h ...', h = heads) for p in memory_model_parameters]
+            # NOTE: .clone() materializes storage so each head owns its slice.
+            # Without it, repeat() returns an expanded view; the resulting Parameter
+            # shares storage across heads (stride 0 on the head dim). Consequences:
+            #   - load_state_dict() fails: "more than one element of the written-to
+            #     tensor refers to a single memory location"
+            #   - AdamW in-place updates broadcast identically across heads, so all
+            #     H heads stay bit-identical across training — a paper-fidelity
+            #     regression since Section 3 requires independent per-head weights.
+            memory_model_parameters = [repeat(p, '... -> h ...', h = heads).clone() for p in memory_model_parameters]
 
         self.init_weight_shape = [p.shape for p in memory_model_parameters]
 
