@@ -555,3 +555,38 @@ def test_atlas_config_overrides():
     assert config['omega_context'] == 4
     assert config['polynomial_degree'] == 3
     assert config['momentum'] == True
+
+def test_atlas_config_enables_per_token_retrieve():
+    """atlas_config() must default to per_token_retrieve=True. The constructor
+    default is False (paper-deviating per-chunk approximation); atlas_config()
+    is the only place we promise paper-faithful behavior, so this default
+    matters for every Atlas run that goes through it."""
+    config = NeuralMemory.atlas_config()
+    assert config['per_token_retrieve'] is True, (
+        'atlas_config() must enable per_token_retrieve — Eq 41 / Section 3.3 '
+        'requires y_t = M_t(q_t), retrieval at every token. Falling back to '
+        'per-chunk retrieve silently re-runs Titans on the retrieve side.'
+    )
+
+def test_atlas_config_produces_per_token_retrieve_chunk_size():
+    """When atlas_config() is applied to NeuralMemory, the constructor must
+    actually set retrieve_chunk_size=1 (the wire form of per-token retrieve)."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    assert mem.retrieve_chunk_size == 1, (
+        f'expected retrieve_chunk_size=1 with atlas_config + omega_context>1, '
+        f'got {mem.retrieve_chunk_size}'
+    )
+
+def test_atlas_config_per_token_retrieve_forward_backward():
+    """End-to-end: atlas_config defaults must produce a working forward +
+    backward through the per-token retrieve path."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+    for p in mem.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
