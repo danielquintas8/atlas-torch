@@ -2,7 +2,7 @@
 #SBATCH --job-name=atlas_train
 #SBATCH --account=eporaif01
 #SBATCH --qos=acc_ehpc
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --tasks-per-node=1
