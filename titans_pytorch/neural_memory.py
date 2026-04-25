@@ -383,6 +383,10 @@ class NeuralMemory(Module):
         Momentum and Muon confirmed in paper Table 1, Eq. 57-58.
         omega_context=8 based on Figure 5 (best for OmegaNet).
         polynomial_degree=2 — paper does not specify exact degree.
+        per_token_retrieve=True is paper-faithful: Eq 41 / Section 3.3 /
+        Appendix D.4 specify y_t = M_t(q_t), retrieval at every token using
+        the per-token memory state. Disabling this falls back to a per-chunk
+        retrieve approximation that is structurally Titans-grade, not Atlas.
         """
         defaults = dict(
             momentum = True,
@@ -390,6 +394,7 @@ class NeuralMemory(Module):
             polynomial_degree = 2,
             poly_project_back = True,
             omega_context = 8,
+            per_token_retrieve = True,
             short_conv_size = 4,
             qk_rmsnorm = True,
         )
