@@ -572,3 +572,74 @@ def test_per_head_learned_parameters_own_storage():
             f'memory_model_parameters.{name} has stride 0 on the head dim '
             f'— heads share storage. Expected independent per-head slices.'
         )
+
+def test_polynomial_features_includes_constant_term():
+    """φ(x) must include the degree-0 (constant) Taylor term — without it the
+    Taylor approximation of softmax (Section 3.1) is missing the leading 1.
+    expanded_dim must be 1 + Sigma_{d=1..p} C(d+dim-1, d)."""
+    from titans_pytorch.neural_memory import PolynomialFeatures
+    poly = PolynomialFeatures(dim = 16, degree = 2, project_back = False)
+    # degree-0: 1, degree-1: 16, degree-2: C(17,2) = 136 -> total 1 + 16 + 136 = 153
+    assert poly.expanded_dim == 153, f'expected 1 + 16 + 136 = 153, got {poly.expanded_dim}'
+    assert poly.coefficients.shape == (3,), f'expected coefficients length degree+1=3, got {poly.coefficients.shape}'
+    # init values: 1/0!, 1/1!, 1/2!
+    assert torch.allclose(poly.coefficients, torch.tensor([1.0, 1.0, 0.5]))
+
+def test_polynomial_features_constant_in_forward_output():
+    """Forward output's first element along the feature dim must be the
+    degree-0 constant feature (broadcast from coefficients[0] init=1)."""
+    from titans_pytorch.neural_memory import PolynomialFeatures
+    poly = PolynomialFeatures(dim = 16, degree = 2, project_back = False)
+    x = torch.randn(2, 5, 16)
+    out = poly(x)
+    assert out.shape == (2, 5, 153)
+    # The first feature-dim slot is the degree-0 constant: 1 * coefficients[0] = 1.0 at init.
+    assert torch.allclose(out[..., 0], torch.full((2, 5), 1.0))
+
+def test_atlas_config_uses_paper_faithful_polynomial():
+    """atlas_config() must default poly_project_back=False so the memory MLP
+    consumes phi(k) directly (Eq 56-57). project_back=True is paper-deviating
+    -- it collapses Proposition 2's O(d^p) capacity argument."""
+    config = NeuralMemory.atlas_config()
+    assert config.get('poly_project_back') is False, (
+        'atlas_config() must set poly_project_back=False -- Eq 56-57 has the memory '
+        'MLP consume phi(k) directly. project_back compresses phi(k) back to dim_head '
+        'and neuters Proposition 2.'
+    )
+
+def test_atlas_config_asymmetric_memory_mlp_path():
+    """End-to-end: atlas_config() must produce a NeuralMemory whose memory MLP
+    accepts poly_features.expanded_dim and emits dim_head. Forward + backward
+    must run without dimension errors. Per-param grad coverage is asserted
+    elsewhere; here we only verify the asymmetric path runs."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    # poly_features should be present and project_back disabled.
+    assert mem.poly_features is not None, 'poly_features must be constructed'
+    assert mem.poly_features.projection is None, 'poly_features must NOT project back'
+    # ResidualNorm is auto-disabled in the asymmetric path, so no norm.gamma
+    # entry exists. memory_model_parameters[0] is the first MLP weight
+    # (heads, dim_in, dim_hidden); its second-to-last dim is dim_in.
+    first_mlp_weight = mem.memory_model_parameters[0]
+    assert first_mlp_weight.shape[-2] == mem.poly_features.expanded_dim, (
+        f'memory MLP first weight in_dim must equal poly_features.expanded_dim '
+        f'({mem.poly_features.expanded_dim}), got {first_mlp_weight.shape[-2]}'
+    )
+    # Forward + backward succeed
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert retrieved.shape == seq.shape
+    retrieved.sum().backward()
+
+def test_memory_mlp_asymmetric_dim_in_dim_out():
+    """MemoryMLP must accept distinct dim_in and dim_out for the asymmetric
+    Atlas path (input = poly.expanded_dim, output = dim_head)."""
+    from titans_pytorch.memory_models import MemoryMLP
+    mlp = MemoryMLP(dim = 16, depth = 2, dim_in = 153, dim_out = 16)
+    # weights[0]: (153, hidden=32), weights[1]: (32, 16)
+    assert mlp.weights[0].shape == (153, 32), f'first weight shape {tuple(mlp.weights[0].shape)}'
+    assert mlp.weights[1].shape == (32, 16), f'last weight shape {tuple(mlp.weights[1].shape)}'
+    x = torch.randn(2, 5, 153)
+    out = mlp(x)
+    assert out.shape == (2, 5, 16)
+    out.sum().backward()
