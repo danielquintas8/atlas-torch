@@ -643,3 +643,47 @@ def test_memory_mlp_asymmetric_dim_in_dim_out():
     out = mlp(x)
     assert out.shape == (2, 5, 16)
     out.sum().backward()
+
+def test_atlas_muon_actually_applies_to_matrix_surprises():
+    """Regression guard: an adversarial review (2026-04-28) raised the concern
+    that newtonschulz5's `if ndim <= 3: return t` early-return might silently
+    skip Muon on per-head Atlas surprises. Empirically the surprise tensor in
+    the per_head_learned_parameters path is 4D — (batch*heads, num_tokens,
+    in, out) for matrix params after vmap(grad) — so Muon DOES fire.
+    This test asserts at least one matrix surprise is transformed by
+    newtonschulz5 during a real Atlas forward+backward, so any future refactor
+    that drops a dim (and silently disables Muon) trips immediately.
+    Vector params (e.g. norm.gamma → 3D surprise) correctly skip Muon per
+    the standard Muon convention (Muon is for matrices, not vectors)."""
+    import titans_pytorch.neural_memory as nm
+    orig_ns5 = nm.newtonschulz5
+    matrix_call_count = 0
+    matrix_transform_count = 0
+    try:
+        def spy_ns5(t, **kwargs):
+            nonlocal matrix_call_count, matrix_transform_count
+            out = orig_ns5(t, **kwargs)
+            if t.ndim >= 4:  # matrix params, the ones Muon should hit
+                matrix_call_count += 1
+                if not torch.allclose(t, out):
+                    matrix_transform_count += 1
+            return out
+        nm.newtonschulz5 = spy_ns5
+
+        config = NeuralMemory.atlas_config()
+        mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+        seq = torch.randn(2, 64, 16)
+        retrieved, _ = mem(seq)
+        retrieved.sum().backward()
+    finally:
+        nm.newtonschulz5 = orig_ns5
+
+    assert matrix_call_count > 0, (
+        'newtonschulz5 was never called with a 4D matrix surprise tensor — '
+        'Muon path may have been refactored away. Atlas requires Muon (Eq 57).'
+    )
+    assert matrix_transform_count == matrix_call_count, (
+        f'newtonschulz5 returned its input unchanged on {matrix_call_count - matrix_transform_count} '
+        f'of {matrix_call_count} matrix calls. Muon is silently no-op-ing on Atlas matrix surprises. '
+        f'Check the early-return condition and the surprise tensor shape.'
+    )
