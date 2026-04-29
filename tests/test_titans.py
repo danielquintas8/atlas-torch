@@ -572,3 +572,50 @@ def test_per_head_learned_parameters_own_storage():
             f'memory_model_parameters.{name} has stride 0 on the head dim '
             f'— heads share storage. Expected independent per-head slices.'
         )
+
+def test_detach_segment_memory_truncates_outer_loop_grad():
+    """detach_segment_memory=True must actually truncate the autograd graph
+    across segments. Verify by comparing gradient norms on store-side params
+    (to_keys, to_values, to_adaptive_step, etc.) between the detach=True and
+    detach=False paths under identical seeds and inputs.
+
+    With detach=True, gradients on store-side params should be substantially
+    smaller because they only receive contributions from each segment's direct
+    forward — not from the cross-segment chain through the per-segment memory
+    state. If detach is silently a no-op (e.g., a future refactor moves the
+    detach call out of the loop), the two grad-norm dicts would be identical.
+
+    Same runtime-spy methodology as test_atlas_muon_actually_applies — the
+    code can't tell us the detach is firing, but the gradient norms can.
+    """
+    def grad_norms(detach):
+        torch.manual_seed(42)
+        mem = NeuralMemory(
+            dim = 16, dim_head = 8, heads = 2,
+            chunk_size = 4, batch_size = 16,
+            detach_segment_memory = detach,
+        )
+        torch.manual_seed(0)
+        seq = torch.randn(2, 64, 16)  # 64 tokens / batch_size=16 = 4 segments
+        out, _ = mem(seq)
+        out.sum().backward()
+        return {
+            n: p.grad.norm().item()
+            for n, p in mem.named_parameters()
+            if p.requires_grad and p.grad is not None
+        }
+
+    norms_detach = grad_norms(detach = True)
+    norms_full = grad_norms(detach = False)
+
+    store_side_params = ['to_keys.weight', 'to_values.weight', 'to_adaptive_step.0.weight']
+    for param_name in store_side_params:
+        d, f = norms_detach[param_name], norms_full[param_name]
+        # detach=True should produce STRICTLY SMALLER gradient (cross-segment
+        # path is cut). A 2× ratio is the looser regression bound; in practice
+        # we observe ~30-50× shrinkage for these params.
+        assert d < f * 0.5, (
+            f'{param_name}: detach_segment_memory=True did not measurably reduce '
+            f'gradient norm (detach={d:.4f}, full={f:.4f}, ratio={d/f:.3f}). '
+            f'Detach may be silently a no-op.'
+        )
