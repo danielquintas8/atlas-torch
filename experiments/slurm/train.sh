@@ -2,7 +2,7 @@
 #SBATCH --job-name=atlas_train
 #SBATCH --account=eporaif01
 #SBATCH --qos=acc_ehpc
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --tasks-per-node=1
@@ -64,6 +64,9 @@ if [ -n "${WARMUP_STEPS}" ]; then
 fi
 
 RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}"
+
+# rename job to match variant (SBATCH --job-name is hardcoded; static directives can't use env vars)
+scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
 
 cd ${PROJECT_ROOT}
 mkdir -p runs

@@ -556,6 +556,23 @@ def test_atlas_config_overrides():
     assert config['polynomial_degree'] == 3
     assert config['momentum'] == True
 
+def test_per_head_learned_parameters_own_storage():
+    """Per-head memory parameters must have independent storage, not a stride-0
+    broadcast view. Shared storage causes load_state_dict to fail and makes all
+    heads stay bit-identical under AdamW updates (paper-fidelity regression)."""
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        dim_head = 8,
+        heads = 16,
+        per_head_learned_parameters = True,
+    )
+    for name, p in mem.memory_model_parameters.named_parameters():
+        assert p.stride(0) != 0, (
+            f'memory_model_parameters.{name} has stride 0 on the head dim '
+            f'— heads share storage. Expected independent per-head slices.'
+        )
+
 def test_atlas_config_enables_per_token_retrieve():
     """atlas_config() must default to per_token_retrieve=True. The constructor
     default is False (paper-deviating per-chunk approximation); atlas_config()
