@@ -56,13 +56,23 @@ class MemoryMLP(Module):
         self,
         dim,
         depth,
-        expansion_factor = 2.
+        expansion_factor = 2.,
+        dim_in = None,
+        dim_out = None,
     ):
+        """`dim` controls the hidden dim (= dim * expansion_factor) and is the
+        default for both input and output. Pass `dim_in` / `dim_out` to make
+        the MLP asymmetric — required by Atlas's polynomial feature path
+        (Section 3.1) where the memory MLP must consume O(d^p)-dim φ(k)
+        directly without a project-back compression.
+        """
         super().__init__()
+        dim_in = dim_in if dim_in is not None else dim
+        dim_out = dim_out if dim_out is not None else dim
         dim_hidden = int(dim * expansion_factor)
-        dims = (dim, *((dim_hidden,) * (depth - 1)), dim)
+        dims = (dim_in, *((dim_hidden,) * (depth - 1)), dim_out)
 
-        self.weights = ParameterList([Parameter(torch.randn(dim_in, dim_out)) for dim_in, dim_out in zip(dims[:-1], dims[1:])])
+        self.weights = ParameterList([Parameter(torch.randn(d_in, d_out)) for d_in, d_out in zip(dims[:-1], dims[1:])])
 
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
