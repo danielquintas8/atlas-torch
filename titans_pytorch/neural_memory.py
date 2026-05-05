@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Callable
 
 import math
+import os
 from functools import partial
 from itertools import zip_longest, combinations_with_replacement
 from collections import namedtuple
@@ -1043,6 +1044,20 @@ class NeuralMemory(Module):
 
             windowed_grads = TensorDict()
 
+            # One-shot memory instrumentation: print the cost of the omega-windowed
+            # gradient accumulation on the first call only. Provides a concrete
+            # baseline for what FSDP / model parallelism would have to beat. Set
+            # ATLAS_LOG_OMEGA_MEM=1 to enable; off by default to keep production
+            # logs clean.
+            log_omega_mem = (
+                os.environ.get('ATLAS_LOG_OMEGA_MEM', '0') == '1'
+                and not getattr(self, '_logged_omega_mem', False)
+                and torch.cuda.is_available()
+            )
+            if log_omega_mem:
+                first_g = next(iter(grads.values()))
+                pre_alloc_gb = torch.cuda.memory_allocated() / 1e9
+
             for name, g in grads.items():
                 # g: (bhn, chunk_size, ...)
                 windowed = torch.zeros_like(g)
@@ -1068,6 +1083,18 @@ class NeuralMemory(Module):
                     windowed = windowed + shifted * gamma_expanded
 
                 windowed_grads[name] = windowed
+
+            if log_omega_mem:
+                post_alloc_gb = torch.cuda.memory_allocated() / 1e9
+                first_shape = tuple(first_g.shape)
+                num_params = len(grads)
+                print(
+                    f"OMEGA_MEM: pre={pre_alloc_gb:.2f}GB post={post_alloc_gb:.2f}GB "
+                    f"delta={post_alloc_gb - pre_alloc_gb:.2f}GB "
+                    f"first_grad_shape={first_shape} omega_c={omega_c} num_param_tensors={num_params}",
+                    flush = True,
+                )
+                self._logged_omega_mem = True
 
             grads = windowed_grads
 
