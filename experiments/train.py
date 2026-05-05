@@ -412,6 +412,13 @@ def main():
     # Final save
     save_checkpoint(accelerator, global_step, output_dir)
 
+    # Peak GPU memory — used by Phase 0 smoke runs to verify the asymmetric
+    # MLP path fits comfortably under the H100 budget before committing to a
+    # full retrain. Logs from rank 0 only.
+    if torch.cuda.is_available() and accelerator.is_main_process:
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        accelerator.print(f"PEAK_GPU_MEM_GB: {peak_gb:.2f}")
+
     if args.wandb:
         accelerator.end_training()
 
