@@ -415,9 +415,22 @@ def main():
     # Peak GPU memory — used by Phase 0 smoke runs to verify the asymmetric
     # MLP path fits comfortably under the H100 budget before committing to a
     # full retrain. Logs from rank 0 only.
+    #
+    # If peak exceeds ATLAS_PEAK_MEM_FAIL_GB (default 60 on H100 64GB), exit
+    # non-zero so SLURM marks the job FAILED with a clear message — catches
+    # configurations that "barely" fit on the smoke but would OOM at scale,
+    # before we commit days of compute to the full retrain.
     if torch.cuda.is_available() and accelerator.is_main_process:
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         accelerator.print(f"PEAK_GPU_MEM_GB: {peak_gb:.2f}")
+        peak_fail_gb = float(os.environ.get("ATLAS_PEAK_MEM_FAIL_GB", "60"))
+        if peak_gb > peak_fail_gb:
+            accelerator.print(
+                f"PEAK_GPU_MEM_FAIL: peak {peak_gb:.2f}GB exceeds threshold "
+                f"{peak_fail_gb}GB — retrain at scale will OOM. Set "
+                f"ATLAS_PEAK_MEM_FAIL_GB to override the threshold."
+            )
+            sys.exit(2)
 
     if args.wandb:
         accelerator.end_training()
