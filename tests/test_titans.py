@@ -687,3 +687,85 @@ def test_atlas_muon_actually_applies_to_matrix_surprises():
         f'of {matrix_call_count} matrix calls. Muon is silently no-op-ing on Atlas matrix surprises. '
         f'Check the early-return condition and the surprise tensor shape.'
     )
+
+def test_atlas_config_enables_per_token_retrieve():
+    """atlas_config() must default to per_token_retrieve=True. The constructor
+    default is False (paper-deviating per-chunk approximation); atlas_config()
+    is the only place we promise paper-faithful behavior, so this default
+    matters for every Atlas run that goes through it."""
+    config = NeuralMemory.atlas_config()
+    assert config['per_token_retrieve'] is True, (
+        'atlas_config() must enable per_token_retrieve — Eq 41 / Section 3.3 '
+        'requires y_t = M_t(q_t), retrieval at every token. Falling back to '
+        'per-chunk retrieve silently re-runs Titans on the retrieve side.'
+    )
+
+def test_atlas_config_produces_per_token_retrieve_chunk_size():
+    """When atlas_config() is applied to NeuralMemory, the constructor must
+    actually set retrieve_chunk_size=1 (the wire form of per-token retrieve)."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    assert mem.retrieve_chunk_size == 1, (
+        f'expected retrieve_chunk_size=1 with atlas_config + omega_context>1, '
+        f'got {mem.retrieve_chunk_size}'
+    )
+
+def test_atlas_config_per_token_retrieve_forward_backward():
+    """End-to-end: atlas_config defaults must produce a working forward +
+    backward through the per-token retrieve path."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+    for p in mem.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
+
+def test_detach_segment_memory_truncates_outer_loop_grad():
+    """detach_segment_memory=True must actually truncate the autograd graph
+    across segments. Verify by comparing gradient norms on store-side params
+    (to_keys, to_values, to_adaptive_step, etc.) between the detach=True and
+    detach=False paths under identical seeds and inputs.
+
+    With detach=True, gradients on store-side params should be substantially
+    smaller because they only receive contributions from each segment's direct
+    forward — not from the cross-segment chain through the per-segment memory
+    state. If detach is silently a no-op (e.g., a future refactor moves the
+    detach call out of the loop), the two grad-norm dicts would be identical.
+
+    Same runtime-spy methodology as test_atlas_muon_actually_applies — the
+    code can't tell us the detach is firing, but the gradient norms can.
+    """
+    def grad_norms(detach):
+        torch.manual_seed(42)
+        mem = NeuralMemory(
+            dim = 16, dim_head = 8, heads = 2,
+            chunk_size = 4, batch_size = 16,
+            detach_segment_memory = detach,
+        )
+        torch.manual_seed(0)
+        seq = torch.randn(2, 64, 16)  # 64 tokens / batch_size=16 = 4 segments
+        out, _ = mem(seq)
+        out.sum().backward()
+        return {
+            n: p.grad.norm().item()
+            for n, p in mem.named_parameters()
+            if p.requires_grad and p.grad is not None
+        }
+
+    norms_detach = grad_norms(detach = True)
+    norms_full = grad_norms(detach = False)
+
+    store_side_params = ['to_keys.weight', 'to_values.weight', 'to_adaptive_step.0.weight']
+    for param_name in store_side_params:
+        d, f = norms_detach[param_name], norms_full[param_name]
+        # detach=True should produce STRICTLY SMALLER gradient (cross-segment
+        # path is cut). A 2× ratio is the looser regression bound; in practice
+        # we observe ~30-50× shrinkage for these params.
+        assert d < f * 0.5, (
+            f'{param_name}: detach_segment_memory=True did not measurably reduce '
+            f'gradient norm (detach={d:.4f}, full={f:.4f}, ratio={d/f:.3f}). '
+            f'Detach may be silently a no-op.'
+        )

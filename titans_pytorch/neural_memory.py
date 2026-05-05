@@ -408,6 +408,10 @@ class NeuralMemory(Module):
         and collapses Proposition 2's O(d^p) capacity argument. NeuralMemory
         constructs the default memory_model asymmetrically when this is
         False (input dim = poly_features.expanded_dim, output dim = dim_head).
+        per_token_retrieve=True is paper-faithful: Eq 41 / Section 3.3 /
+        Appendix D.4 specify y_t = M_t(q_t), retrieval at every token using
+        the per-token memory state. Disabling this falls back to a per-chunk
+        retrieve approximation that is structurally Titans-grade, not Atlas.
         """
         defaults = dict(
             momentum = True,
@@ -415,6 +419,7 @@ class NeuralMemory(Module):
             polynomial_degree = 2,
             poly_project_back = False,
             omega_context = 8,
+            per_token_retrieve = True,
             short_conv_size = 4,
             qk_rmsnorm = True,
         )
@@ -607,6 +612,19 @@ class NeuralMemory(Module):
             #     H heads stay bit-identical across training — a paper-fidelity
             #     regression since Section 3 requires independent per-head weights.
             memory_model_parameters = [repeat(p, '... -> h ...', h = heads).clone() for p in memory_model_parameters]
+
+            # Strip the originals from self.memory_model so they don't appear as
+            # orphan params in .parameters() — functional_call will provide the
+            # active per-head versions from self.memory_model_parameters at every
+            # call site, and the originals are never read after this point.
+            # Without this, the originals show up in .parameters() but never
+            # receive gradients (gradient flows only through the per-head copies).
+            for name in self.memory_model_parameter_names:
+                parts = name.split('.')
+                parent = self.memory_model
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                del parent._parameters[parts[-1]]
 
         self.init_weight_shape = [p.shape for p in memory_model_parameters]
 
