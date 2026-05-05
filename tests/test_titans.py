@@ -573,6 +573,121 @@ def test_per_head_learned_parameters_own_storage():
             f'— heads share storage. Expected independent per-head slices.'
         )
 
+def test_polynomial_features_includes_constant_term():
+    """φ(x) must include the degree-0 (constant) Taylor term — without it the
+    Taylor approximation of softmax (Section 3.1) is missing the leading 1.
+    expanded_dim must be 1 + Sigma_{d=1..p} C(d+dim-1, d)."""
+    from titans_pytorch.neural_memory import PolynomialFeatures
+    poly = PolynomialFeatures(dim = 16, degree = 2, project_back = False)
+    # degree-0: 1, degree-1: 16, degree-2: C(17,2) = 136 -> total 1 + 16 + 136 = 153
+    assert poly.expanded_dim == 153, f'expected 1 + 16 + 136 = 153, got {poly.expanded_dim}'
+    assert poly.coefficients.shape == (3,), f'expected coefficients length degree+1=3, got {poly.coefficients.shape}'
+    # init values: 1/0!, 1/1!, 1/2!
+    assert torch.allclose(poly.coefficients, torch.tensor([1.0, 1.0, 0.5]))
+
+def test_polynomial_features_constant_in_forward_output():
+    """Forward output's first element along the feature dim must be the
+    degree-0 constant feature (broadcast from coefficients[0] init=1)."""
+    from titans_pytorch.neural_memory import PolynomialFeatures
+    poly = PolynomialFeatures(dim = 16, degree = 2, project_back = False)
+    x = torch.randn(2, 5, 16)
+    out = poly(x)
+    assert out.shape == (2, 5, 153)
+    # The first feature-dim slot is the degree-0 constant: 1 * coefficients[0] = 1.0 at init.
+    assert torch.allclose(out[..., 0], torch.full((2, 5), 1.0))
+
+def test_atlas_config_uses_paper_faithful_polynomial():
+    """atlas_config() must default poly_project_back=False so the memory MLP
+    consumes phi(k) directly (Eq 56-57). project_back=True is paper-deviating
+    -- it collapses Proposition 2's O(d^p) capacity argument."""
+    config = NeuralMemory.atlas_config()
+    assert config.get('poly_project_back') is False, (
+        'atlas_config() must set poly_project_back=False -- Eq 56-57 has the memory '
+        'MLP consume phi(k) directly. project_back compresses phi(k) back to dim_head '
+        'and neuters Proposition 2.'
+    )
+
+def test_atlas_config_asymmetric_memory_mlp_path():
+    """End-to-end: atlas_config() must produce a NeuralMemory whose memory MLP
+    accepts poly_features.expanded_dim and emits dim_head. Forward + backward
+    must run without dimension errors. Per-param grad coverage is asserted
+    elsewhere; here we only verify the asymmetric path runs."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    # poly_features should be present and project_back disabled.
+    assert mem.poly_features is not None, 'poly_features must be constructed'
+    assert mem.poly_features.projection is None, 'poly_features must NOT project back'
+    # ResidualNorm is auto-disabled in the asymmetric path, so no norm.gamma
+    # entry exists. memory_model_parameters[0] is the first MLP weight
+    # (heads, dim_in, dim_hidden); its second-to-last dim is dim_in.
+    first_mlp_weight = mem.memory_model_parameters[0]
+    assert first_mlp_weight.shape[-2] == mem.poly_features.expanded_dim, (
+        f'memory MLP first weight in_dim must equal poly_features.expanded_dim '
+        f'({mem.poly_features.expanded_dim}), got {first_mlp_weight.shape[-2]}'
+    )
+    # Forward + backward succeed
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert retrieved.shape == seq.shape
+    retrieved.sum().backward()
+
+def test_memory_mlp_asymmetric_dim_in_dim_out():
+    """MemoryMLP must accept distinct dim_in and dim_out for the asymmetric
+    Atlas path (input = poly.expanded_dim, output = dim_head)."""
+    from titans_pytorch.memory_models import MemoryMLP
+    mlp = MemoryMLP(dim = 16, depth = 2, dim_in = 153, dim_out = 16)
+    # weights[0]: (153, hidden=32), weights[1]: (32, 16)
+    assert mlp.weights[0].shape == (153, 32), f'first weight shape {tuple(mlp.weights[0].shape)}'
+    assert mlp.weights[1].shape == (32, 16), f'last weight shape {tuple(mlp.weights[1].shape)}'
+    x = torch.randn(2, 5, 153)
+    out = mlp(x)
+    assert out.shape == (2, 5, 16)
+    out.sum().backward()
+
+def test_atlas_muon_actually_applies_to_matrix_surprises():
+    """Regression guard: an adversarial review (2026-04-28) raised the concern
+    that newtonschulz5's `if ndim <= 3: return t` early-return might silently
+    skip Muon on per-head Atlas surprises. Empirically the surprise tensor in
+    the per_head_learned_parameters path is 4D — (batch*heads, num_tokens,
+    in, out) for matrix params after vmap(grad) — so Muon DOES fire.
+    This test asserts at least one matrix surprise is transformed by
+    newtonschulz5 during a real Atlas forward+backward, so any future refactor
+    that drops a dim (and silently disables Muon) trips immediately.
+    Vector params (e.g. norm.gamma → 3D surprise) correctly skip Muon per
+    the standard Muon convention (Muon is for matrices, not vectors)."""
+    import titans_pytorch.neural_memory as nm
+    orig_ns5 = nm.newtonschulz5
+    matrix_call_count = 0
+    matrix_transform_count = 0
+    try:
+        def spy_ns5(t, **kwargs):
+            nonlocal matrix_call_count, matrix_transform_count
+            out = orig_ns5(t, **kwargs)
+            if t.ndim >= 4:  # matrix params, the ones Muon should hit
+                matrix_call_count += 1
+                if not torch.allclose(t, out):
+                    matrix_transform_count += 1
+            return out
+        nm.newtonschulz5 = spy_ns5
+
+        config = NeuralMemory.atlas_config()
+        mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+        seq = torch.randn(2, 64, 16)
+        retrieved, _ = mem(seq)
+        retrieved.sum().backward()
+    finally:
+        nm.newtonschulz5 = orig_ns5
+
+    assert matrix_call_count > 0, (
+        'newtonschulz5 was never called with a 4D matrix surprise tensor — '
+        'Muon path may have been refactored away. Atlas requires Muon (Eq 57).'
+    )
+    assert matrix_transform_count == matrix_call_count, (
+        f'newtonschulz5 returned its input unchanged on {matrix_call_count - matrix_transform_count} '
+        f'of {matrix_call_count} matrix calls. Muon is silently no-op-ing on Atlas matrix surprises. '
+        f'Check the early-return condition and the surprise tensor shape.'
+    )
+
 def test_atlas_config_enables_per_token_retrieve():
     """atlas_config() must default to per_token_retrieve=True. The constructor
     default is False (paper-deviating per-chunk approximation); atlas_config()

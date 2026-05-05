@@ -241,6 +241,18 @@ class CausalDepthwiseConv1d(Module):
 # with interaction terms before they enter the memory MLP
 
 class PolynomialFeatures(Module):
+    """Taylor approximation of softmax (Atlas Section 3.1).
+
+    φ_p(x) ≈ Σ_{d=0..p} a_d · x^⊗d, where the coefficients are initialized to
+    1/d! to match exp(⟨q,k⟩) = Σ ⟨q,k⟩^d/d!. The d=0 (constant) term is the
+    leading-order kernel piece and must be included for the Taylor-softmax
+    motivation to hold.
+
+    For each degree d ≥ 1 the feature is the multiset of distinct monomials
+    x_{i_1} … x_{i_d} (combinations_with_replacement) — symmetric monomials,
+    not all d-tuples, since e.g. x_i x_j == x_j x_i.
+    """
+
     def __init__(
         self,
         dim,
@@ -253,8 +265,10 @@ class PolynomialFeatures(Module):
         self.dim = dim
         self.degree = degree
 
-        expanded_dim = 0
-        index_groups = []
+        # degree-0 constant feature contributes 1 dimension (the leading 1 in
+        # the Taylor expansion), independent of `dim`.
+        expanded_dim = 1
+        index_groups = [1]
 
         for d in range(1, degree + 1):
             combos = list(combinations_with_replacement(range(dim), d))
@@ -274,13 +288,17 @@ class PolynomialFeatures(Module):
                 f'Consider reducing degree or dim_head.'
             )
 
-        coefficients = [1.0 / math.factorial(d) for d in range(1, degree + 1)]
+        # Learnable Taylor coefficients init at 1/d! for d in 0..degree.
+        coefficients = [1.0 / math.factorial(d) for d in range(0, degree + 1)]
         self.coefficients = Parameter(torch.tensor(coefficients))
 
-        # project_back=True (default): compresses expanded features back to dim via learned linear
-        #   projection, keeping the memory MLP architecture unchanged.
-        # project_back=False: feeds the full expanded_dim directly into the memory MLP, giving
-        #   maximum O(d_k^p) capacity. requires a custom memory model that accepts expanded_dim.
+        # project_back=True: compresses the full O(d^p)-dim φ(k) back to `dim` via a learned
+        #   linear, keeping the memory MLP architecture unchanged. PAPER-DEVIATING — collapses
+        #   Proposition 2's capacity argument since the MLP only ever sees a `dim`-rank
+        #   compression of φ(k) instead of φ(k) itself.
+        # project_back=False: feeds the full expanded_dim directly into the memory MLP. Paper-
+        #   faithful per Eq 56-57 (M(φ(k))). Requires the surrounding NeuralMemory to construct
+        #   a memory_model with input dim = self.expanded_dim.
 
         self.projection = LinearNoBias(self.expanded_dim, dim) if project_back else None
 
@@ -289,14 +307,16 @@ class PolynomialFeatures(Module):
         return self.dim if exists(self.projection) else self.expanded_dim
 
     def forward(self, x):
-        features = []
+        # degree-0 constant: shape (..., 1) — broadcast a learnable scalar.
+        const_feature = self.coefficients[0].expand(*x.shape[:-1], 1)
+        features = [const_feature]
 
         for d in range(1, self.degree + 1):
             indices = getattr(self, f'indices_{d}')
             mono = x[..., indices[0]]
             for i in range(1, d):
                 mono = mono * x[..., indices[i]]
-            features.append(self.coefficients[d - 1] * mono)
+            features.append(self.coefficients[d] * mono)
 
         out = cat(features, dim = -1)
 
@@ -383,6 +403,11 @@ class NeuralMemory(Module):
         Momentum and Muon confirmed in paper Table 1, Eq. 57-58.
         omega_context=8 based on Figure 5 (best for OmegaNet).
         polynomial_degree=2 — paper does not specify exact degree.
+        poly_project_back=False is paper-faithful: Eq 56-57 has the memory
+        MLP consume φ(k) directly. Project-back compresses φ(k) to dim_head
+        and collapses Proposition 2's O(d^p) capacity argument. NeuralMemory
+        constructs the default memory_model asymmetrically when this is
+        False (input dim = poly_features.expanded_dim, output dim = dim_head).
         per_token_retrieve=True is paper-faithful: Eq 41 / Section 3.3 /
         Appendix D.4 specify y_t = M_t(q_t), retrieval at every token using
         the per-token memory state. Disabling this falls back to a per-chunk
@@ -392,7 +417,7 @@ class NeuralMemory(Module):
             momentum = True,
             spectral_norm_surprises = True,
             polynomial_degree = 2,
-            poly_project_back = True,
+            poly_project_back = False,
             omega_context = 8,
             per_token_retrieve = True,
             short_conv_size = 4,
@@ -512,29 +537,59 @@ class NeuralMemory(Module):
             nn.Sigmoid()
         ) if heads > 1 else None
 
-        # memory model
+        # polynomial feature mapping (Atlas Section 3.1) — constructed early so its
+        # expanded_dim can size the default memory model's input dim when
+        # poly_project_back=False (paper-faithful path: the MLP consumes φ(k) directly).
+
+        self.poly_features = None
+
+        if exists(polynomial_degree) and polynomial_degree >= 2:
+            self.poly_features = PolynomialFeatures(
+                dim = dim_head,
+                degree = polynomial_degree,
+                project_back = poly_project_back,
+            )
+
+        # memory model — when poly_features feeds the MLP directly (no project_back),
+        # the MLP must accept input dim = poly.expanded_dim and emit dim_head.
+
+        feeds_poly_features_directly = exists(self.poly_features) and not exists(self.poly_features.projection)
+        mem_model_input_dim = self.poly_features.expanded_dim if feeds_poly_features_directly else dim_head
 
         if not exists(model):
-            model = MemoryMLP(dim_head, **default_model_kwargs)
+            if feeds_poly_features_directly:
+                # asymmetric MLP: in=expanded_dim, hidden=dim_head*expansion, out=dim_head
+                model = MemoryMLP(dim_head, dim_in = mem_model_input_dim, dim_out = dim_head, **default_model_kwargs)
+            else:
+                model = MemoryMLP(dim_head, **default_model_kwargs)
 
-        # validate memory model
+        # validate memory model — input shape depends on whether poly_features feeds it.
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
 
-        test_shape = (3, 2, dim_head)
+        test_input_shape = (3, 2, mem_model_input_dim)
+        test_output_shape = (3, 2, dim_head)
 
         with torch.no_grad():
             try:
-                test_input = torch.randn(test_shape)
+                test_input = torch.randn(test_input_shape)
                 mem_model_output = model(test_input)
             except:
-                raise RuntimeError(f'memory model unable to accept a tensor of shape {test_shape}')
+                raise RuntimeError(f'memory model unable to accept a tensor of shape {test_input_shape}')
 
-            assert mem_model_output.shape == test_shape, 'output of memory model needs to be same shape as input'
+            assert mem_model_output.shape == test_output_shape, (
+                f'memory model must emit shape {test_output_shape}, got {tuple(mem_model_output.shape)}. '
+                f'When poly_features feeds the MLP directly (poly_project_back=False), input dim must be '
+                f'{mem_model_input_dim} (poly_features.expanded_dim).'
+            )
 
         # the memory is the weights of the model
 
-        if mem_model_norm_add_residual:
+        # ResidualNorm (TTT-paper convention) does `norm(model(x)) + x`, which requires
+        # input_dim == output_dim. Auto-disable for the asymmetric Atlas path where the
+        # MLP consumes φ(k) (expanded_dim) and emits dim_head — the residual makes no
+        # sense there and the paper's M(φ(k)) is the direct output anyway.
+        if mem_model_norm_add_residual and not feeds_poly_features_directly:
             model = ResidualNorm(dim = dim_head, model = model)
 
         self.memory_model = model
@@ -721,16 +776,8 @@ class NeuralMemory(Module):
         self.muon_ns_steps = muon_ns_steps
         self.muon_ns_eps = muon_ns_eps
 
-        # polynomial feature mapping for increased memory capacity (Atlas Section 3.1)
-
-        self.poly_features = None
-
-        if exists(polynomial_degree) and polynomial_degree >= 2:
-            self.poly_features = PolynomialFeatures(
-                dim = dim_head,
-                degree = polynomial_degree,
-                project_back = poly_project_back,
-            )
+        # poly_features was constructed earlier (before the memory model) so its
+        # expanded_dim can size an asymmetric MLP for the paper-faithful path.
 
         # omega rule — sliding window context (Atlas Section 3.2)
 
