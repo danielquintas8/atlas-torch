@@ -404,11 +404,17 @@ class NeuralMemory(Module):
         Momentum and Muon confirmed in paper Table 1, Eq. 57-58.
         omega_context=8 based on Figure 5 (best for OmegaNet).
         polynomial_degree=2 — paper does not specify exact degree.
-        poly_project_back=False is paper-faithful: Eq 56-57 has the memory
-        MLP consume φ(k) directly. Project-back compresses φ(k) to dim_head
-        and collapses Proposition 2's O(d^p) capacity argument. NeuralMemory
-        constructs the default memory_model asymmetrically when this is
-        False (input dim = poly_features.expanded_dim, output dim = dim_head).
+        poly_project_back=True is the documented production tradeoff. Strict
+        Eq 56-57 reading is `M(φ(k))` with the MLP consuming `expanded_dim`
+        directly (project_back=False), but Phase 0 OOM evidence (job
+        40049757) showed the omega-windowed gradient accumulation saturates
+        a single H100 at 64 GB on the 170M / seq_len=1024 / chunk_size=8
+        config — the asymmetric MLP path is not viable at this scale without
+        FSDP/model parallelism. With project_back=True the polynomial
+        features still feed φ(k) → learned linear → dim_head into the MLP,
+        retaining the Taylor-init learnable coefficients but capping
+        effective capacity at O(dim_hidden). Treat the project_back=False
+        path as a Phase 3+ scaling question (see GitHub issue #17).
         per_token_retrieve=True is paper-faithful: Eq 41 / Section 3.3 /
         Appendix D.4 specify y_t = M_t(q_t), retrieval at every token using
         the per-token memory state. Disabling this falls back to a per-chunk
@@ -418,7 +424,7 @@ class NeuralMemory(Module):
             momentum = True,
             spectral_norm_surprises = True,
             polynomial_degree = 2,
-            poly_project_back = False,
+            poly_project_back = True,
             omega_context = 8,
             per_token_retrieve = True,
             short_conv_size = 4,

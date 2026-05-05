@@ -596,34 +596,35 @@ def test_polynomial_features_constant_in_forward_output():
     # The first feature-dim slot is the degree-0 constant: 1 * coefficients[0] = 1.0 at init.
     assert torch.allclose(out[..., 0], torch.full((2, 5), 1.0))
 
-def test_atlas_config_uses_paper_faithful_polynomial():
-    """atlas_config() must default poly_project_back=False so the memory MLP
-    consumes phi(k) directly (Eq 56-57). project_back=True is paper-deviating
-    -- it collapses Proposition 2's O(d^p) capacity argument."""
+def test_atlas_config_poly_project_back_default():
+    """atlas_config() defaults poly_project_back=True as the documented
+    production tradeoff. The strict Eq 56-57 reading would have the MLP
+    consume phi(k) directly (project_back=False), but Phase 0 OOM evidence
+    (job 40049757) showed the asymmetric path saturates H100 at the
+    omega-windowed gradient accumulation. project_back=True keeps the
+    polynomial features (Taylor-init coefficients, including the degree-0
+    constant) but compresses phi(k) -> dim_head before the MLP, capping
+    capacity at O(dim_hidden). Tracked as a Phase 3+ scaling question in
+    GitHub issue #17."""
     config = NeuralMemory.atlas_config()
-    assert config.get('poly_project_back') is False, (
-        'atlas_config() must set poly_project_back=False -- Eq 56-57 has the memory '
-        'MLP consume phi(k) directly. project_back compresses phi(k) back to dim_head '
-        'and neuters Proposition 2.'
+    assert config.get('poly_project_back') is True, (
+        'atlas_config() defaults to poly_project_back=True per the documented '
+        'production tradeoff. Override with atlas_config(poly_project_back=False) '
+        'when running on FSDP / model-parallel infrastructure that can absorb '
+        'the asymmetric MLP memory cost.'
     )
 
-def test_atlas_config_asymmetric_memory_mlp_path():
-    """End-to-end: atlas_config() must produce a NeuralMemory whose memory MLP
-    accepts poly_features.expanded_dim and emits dim_head. Forward + backward
-    must run without dimension errors. Per-param grad coverage is asserted
-    elsewhere; here we only verify the asymmetric path runs."""
+def test_atlas_config_project_back_path_runs():
+    """End-to-end: atlas_config() must produce a NeuralMemory whose
+    poly_features projects expanded_dim back to dim_head (the production
+    path), and forward + backward run without dimension errors."""
     config = NeuralMemory.atlas_config()
     mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
-    # poly_features should be present and project_back disabled.
+    # poly_features should be present and project_back enabled.
     assert mem.poly_features is not None, 'poly_features must be constructed'
-    assert mem.poly_features.projection is None, 'poly_features must NOT project back'
-    # ResidualNorm is auto-disabled in the asymmetric path, so no norm.gamma
-    # entry exists. memory_model_parameters[0] is the first MLP weight
-    # (heads, dim_in, dim_hidden); its second-to-last dim is dim_in.
-    first_mlp_weight = mem.memory_model_parameters[0]
-    assert first_mlp_weight.shape[-2] == mem.poly_features.expanded_dim, (
-        f'memory MLP first weight in_dim must equal poly_features.expanded_dim '
-        f'({mem.poly_features.expanded_dim}), got {first_mlp_weight.shape[-2]}'
+    assert mem.poly_features.projection is not None, (
+        'poly_features.projection must be present (poly_project_back=True). '
+        'See atlas_config docstring for why this is the documented default.'
     )
     # Forward + backward succeed
     seq = torch.randn(2, 64, 16)
