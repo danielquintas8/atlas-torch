@@ -50,7 +50,17 @@ VARIANT=${VARIANT:-atlas-mac}
 MAX_STEPS=${MAX_STEPS:-200}    # 200 * 0.5M tok/step = 100M tokens
 SEQ_LEN=${SEQ_LEN:-1024}
 
-RUN_NAME="${MODEL}-${VARIANT}-smoke"
+# Optional ablation: no-muon, no-poly, no-omega (passes through to train.py).
+# Useful for runtime sanity ablations alongside the main smoke — e.g. submit
+# both VARIANT=atlas-mac and VARIANT=atlas-mac ABLATION=no-muon, then compare
+# their loss curves to verify Muon meaningfully changes the dynamics (not just
+# fires per the regression test).
+ABLATION_FLAG=""
+if [ -n "${ABLATION}" ]; then
+    ABLATION_FLAG="--ablation ${ABLATION}"
+fi
+
+RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}-smoke"
 
 scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
 
@@ -72,6 +82,7 @@ singularity exec --nv \
             --main_process_port ${MASTER_PORT} \
             experiments/train.py \
                 --model ${MODEL} \
+                ${ABLATION_FLAG} \
                 --variant ${VARIANT} \
                 --data-dir ${DATA_DIR} \
                 --output-dir ${PROJECT_ROOT}/runs \
