@@ -12,6 +12,8 @@ First open-source implementation of [Atlas — Learning to Memorize at Test Time
 | Omega Rule | `neural_memory.py` | Per-token gradients via nested `vmap(vmap(grad))`, gamma-weighted sliding window with learned context gates, per-position momentum/decay scan (Sections 3.2-3.3) |
 | Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 57-58) |
 | Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/queries (paper p.13, Figure 3) |
+| Sequential Scan | `neural_memory.py` | O(1) forward memory alternative to parallel AssocScan for momentum/decay |
+| Detach Segment Memory | `neural_memory.py` | Truncated outer-loop backprop across segments — standard TTT approximation for memory efficiency |
 | `atlas_config()` | `neural_memory.py` | Convenience classmethod returning recommended Atlas defaults |
 
 ### Bug Fixes
