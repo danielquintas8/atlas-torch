@@ -88,12 +88,19 @@ singularity exec --nv \
                 --output-dir ${PROJECT_ROOT}/runs \
                 --run-name ${RUN_NAME} \
                 --per-device-batch-size 1 \
+                --grad-accum 1 \
                 --max-steps ${MAX_STEPS} \
                 --warmup-steps 50 \
                 --save-every 10000 \
                 --validate-every 50 \
                 --seq-len ${SEQ_LEN} \
                 --log-every 10"
+
+# NOTE: --grad-accum 1 is intentional for the smoke. The default would be
+# 488 (= 0.5M batch_tokens / 1024 seq_len, single-GPU), making each macro
+# step take >1 hour with per_token_retrieve enabled. The smoke verifies
+# memory + dynamics work, not that the model converges at production
+# batch_tokens. The Atlas 8B retrain (train.sh) restores the 0.5M target.
 
 # train.py prints PEAK_GPU_MEM_GB at the end of training. Grep the log to
 # extract it after the run completes:
