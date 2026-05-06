@@ -252,7 +252,17 @@ def main():
         lr=train_cfg["peak_lr"],
         weight_decay=train_cfg["weight_decay"],
     )
-    scheduler = cosine_with_warmup(optimizer, warmup_steps, schedule_steps)
+
+    # AcceleratedScheduler advances num_processes times per .step() call (default
+    # split_batches=False). Without compensation, configs.py warmup_steps in
+    # global-step units gets reached at global_step = warmup_steps / num_processes
+    # — e.g. on 4 GPUs warmup=2000 actually ends at global_step=500, ramping LR
+    # 4× faster than intended. Empirically caused a loss spike at step ~290 in
+    # job 40107853. Fix: scale the scheduler-internal warmup and total step
+    # counts by num_processes so they match the user-intended global-step units.
+    scheduler_warmup = warmup_steps * accelerator.num_processes
+    scheduler_total = schedule_steps * accelerator.num_processes
+    scheduler = cosine_with_warmup(optimizer, scheduler_warmup, scheduler_total)
 
     # Prepare
     model, optimizer, train_loader, scheduler = accelerator.prepare(
