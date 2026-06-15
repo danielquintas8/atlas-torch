@@ -29,7 +29,8 @@ Step 3 — Transfer to BSC:
     rsync -avz /tmp/fineweb-parquet/ transfer1.bsc.es:/gpfs/projects/YOUR_BSC_ACCOUNT/data/fineweb-parquet/
     rsync -avz /tmp/t5-tokenizer/ transfer1.bsc.es:/gpfs/projects/YOUR_BSC_ACCOUNT/data/t5-tokenizer/
 
-Step 4 — Tokenize on BSC (submit SLURM job):
+Step 4 — Tokenize on BSC (copy the example launcher, fill in your account, submit):
+    cp experiments/slurm/prepare_data.example.sh experiments/slurm/prepare_data.sh
     sbatch experiments/slurm/prepare_data.sh
 """
 

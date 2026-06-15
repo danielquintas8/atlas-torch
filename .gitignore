@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Cluster launch scripts with real account/paths — copy from *.example.sh
+experiments/slurm/train.sh
+experiments/slurm/smoke.sh
+experiments/slurm/prepare_data.sh
