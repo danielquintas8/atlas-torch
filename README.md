@@ -1,6 +1,8 @@
 # Atlas-Torch
 
-First open-source implementation of [Atlas — Learning to Memorize at Test Time](https://arxiv.org/abs/2505.23735), built on top of [lucidrains' titans-pytorch](https://github.com/lucidrains/titans-pytorch) (commit `714a14c`, preserved on the `titans-torch` branch).
+First open-source implementation of [ATLAS: Learning to Optimally Memorize the Context at Test Time](https://arxiv.org/abs/2505.23735) (Behrouz et al., 2025), built on top of [lucidrains' titans-pytorch](https://github.com/lucidrains/titans-pytorch) (commit `714a14c`, preserved on the `titans-torch` branch).
+
+It is a working, paper-faithful port. The three Atlas additions (the Omega Rule, polynomial feature mapping, and Muon-style spectral normalization) are implemented and checked against the paper, with runtime tests in `tests/test_titans.py` that assert the paper-mandated transformations actually fire. Several correctness bugs in the underlying memory code are also fixed. The table below lists exactly what was added and what was fixed.
 
 ## Changes from lucidrains' Titans
 
@@ -28,11 +30,36 @@ First open-source implementation of [Atlas — Learning to Memorize at Test Time
 ### Configuration
 
 ```python
+import torch
 from titans_pytorch import NeuralMemory
 
-config = NeuralMemory.atlas_config()
-mem = NeuralMemory(dim=768, chunk_size=8, heads=16, **config)
+config = NeuralMemory.atlas_config()          # Omega Rule + polynomial features + Muon-normalized surprise
+mem = NeuralMemory(dim=768, dim_head=48, heads=16, chunk_size=8, **config).cuda()
+
+seq = torch.randn(2, 1024, 768).cuda()
+retrieved, _ = mem(seq)
+assert retrieved.shape == seq.shape           # (2, 1024, 768)
 ```
+
+The snippet requires a CUDA GPU. For a full MAC-transformer training example, see the `USE_ATLAS` toggle in `train_mac.py`.
+
+## Install
+
+This fork is not published to PyPI. Install it from source:
+
+```bash
+git clone https://github.com/danielquintas8/atlas-torch
+cd atlas-torch
+pip install -e .
+```
+
+The `pip install titans-pytorch` line in the inherited section below installs Phil Wang's upstream package, not this fork.
+
+## Status and scope
+
+This repository is an implementation, not a research result. I used it for small-scale experiments at 170M parameters, and those runs did not reach a scale where the model has measurable long-context capability, so they produced no conclusions about Atlas's long-context behavior. The value here is the code and the documented fixes and limitations, not a finding.
+
+Two known limitations are worth reading before building on this at scale: the polynomial memory capacity bound under the default configuration (tracked in the [issues](https://github.com/danielquintas8/atlas-torch/issues)), and an autograd memory constraint (the per-token gradient path is incompatible with gradient checkpointing) that caps how many memory layers fit on a single GPU.
 
 ---
 
