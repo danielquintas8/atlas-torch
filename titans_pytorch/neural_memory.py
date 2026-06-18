@@ -1081,13 +1081,33 @@ class NeuralMemory(Module):
             keys = keys[..., :-1, :]
             values = values[..., 1:, :]
 
+        # The adaptive learning rate η is applied OUTSIDE Newton-Schulz for the Atlas
+        # (omega + Muon) path, matching paper Table 1: M_t = α M_{t-1} − η_t·NS-5(S_t) with
+        # the raw gradient inside S_t. newtonschulz5 normalizes its input by norm and is
+        # therefore scale-invariant, so folding η into the surprise (as the grad loss weight)
+        # would cancel it. We feed the grad fn the store mask only (raw, masked gradient) and
+        # re-apply η per output token after NS-5. Other paths keep η as the loss weight —
+        # correct there, since without NS-5 there is nothing to cancel it.
+        #
+        # NOTE: a non-omega + Muon config would still wash η out, but no shipped config hits
+        # it (Muon always travels with omega here; the no-muon ablation turns Muon off, not
+        # omega) and a per-chunk η has no clean paper form, so we do not apply η-outside there.
+        # Only test_muon_custom_steps exercises that combination, for NS-step plumbing.
+
+        apply_eta_outside = use_omega and self.spectral_norm_surprises
+        eta_for_update = None
+
+        if apply_eta_outside:
+            store_mask_weight = mask.to(adaptive_lr.dtype) if exists(mask) else torch.ones_like(adaptive_lr)
+            eta_for_update = rearrange(adaptive_lr, '(b n) c -> b (n c)', b = batch * heads)
+
         # get grads and extra auxiliary loss
 
         if use_omega:
             # omega rule: per-token gradients within each chunk, all w.r.t. same M_{t'}
             # then apply sliding window mask M_s (Section 3.3)
 
-            grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+            grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, store_mask_weight if apply_eta_outside else adaptive_lr, values)
 
             grads = TensorDict(grads)
             # grads shape: (batch*heads*num_chunks, chunk_size, *weight_shape)
@@ -1206,6 +1226,11 @@ class NeuralMemory(Module):
 
             if self.spectral_norm_surprises:
                 update = newtonschulz5(update, steps = self.muon_ns_steps, eps = self.muon_ns_eps)
+
+                if apply_eta_outside:
+                    # paper Table 1: η_t scales the spectrally-normalized surprise (outside NS-5).
+                    # NS-5 is scale-invariant, so this is where the adaptive lr actually takes effect.
+                    update = einx.multiply('bh m, bh m ... -> bh m ...', eta_for_update, update)
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
