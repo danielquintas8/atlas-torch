@@ -1,9 +1,10 @@
 [project]
-name = "titans-pytorch"
-version = "0.5.3"
-description = "Titans"
+name = "atlas-torch"
+version = "0.1.0"
+description = "First open-source implementation of Atlas (Behrouz et al. 2025), built on lucidrains' titans-pytorch"
 authors = [
-    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+    { name = "Phil Wang", email = "lucidrains@gmail.com" },
+    { name = "Daniel Quintas", email = "daniel.quintas.lopes@gmail.com" }
 ]
 readme = "README.md"
 requires-python = ">= 3.9"
@@ -33,14 +34,15 @@ dependencies = [
     "Ninja",
     "rotary-embedding-torch",
     "tensordict",
-    "torch>=2.8",
+    "torch>=2.5",
     "tqdm",
     "x-transformers"
 ]
 
 [project.urls]
-Homepage = "https://pypi.org/project/titans-pytorch/"
-Repository = "https://github.com/lucidrains/titans-pytorch"
+Homepage = "https://github.com/danielquintas8/atlas-torch"
+Repository = "https://github.com/danielquintas8/atlas-torch"
+Upstream = "https://github.com/lucidrains/titans-pytorch"
 
 [project.optional-dependencies]
 

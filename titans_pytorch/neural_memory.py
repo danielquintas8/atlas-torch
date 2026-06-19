@@ -2,7 +2,6 @@ from __future__ import annotations
 from typing import Callable
 
 import math
-import os
 from functools import partial
 from itertools import zip_longest, combinations_with_replacement
 from collections import namedtuple
@@ -219,6 +218,60 @@ def newtonschulz5(
         t = t.transpose(-1, -2)
 
     return inv_pack(t)
+
+
+def apply_omega_window(
+    grads: TensorDict,
+    context_gates: Tensor,
+    omega_context: int
+) -> TensorDict:
+    """Apply the Atlas Omega Rule's gamma-weighted sliding window to per-token grads.
+
+    For each position i the windowed gradient is a causal, gamma-weighted sum over
+    the last `omega_context` (= c) per-token gradients (paper Section 3.2, Eq 9):
+
+        G_i = Σ_{k=0}^{c-1} γ_k^(i) · grad[i - c + 1 + k]
+
+    where the γ gates are input-dependent (c learned weights per position).
+
+    Args:
+        grads: per-token gradients; each value has shape (bhn, chunk_size, *weight_shape).
+        context_gates: gamma gates, shape (bhn, chunk_size, omega_context).
+        omega_context: sliding window size c.
+
+    Returns:
+        TensorDict of windowed gradients, with the same keys and shapes as `grads`.
+    """
+    windowed_grads = TensorDict()
+
+    for name, g in grads.items():
+        # g: (bhn, chunk_size, *weight_shape)
+        windowed = torch.zeros_like(g)
+
+        for k in range(omega_context):
+            offset = omega_context - 1 - k  # k=0 → oldest (largest shift), k=c-1 → newest (no shift)
+            gamma_k = context_gates[..., k]  # (bhn, chunk_size)
+
+            if offset == 0:
+                shifted = g
+            else:
+                # shift right by `offset` along the chunk (time) axis, zero-pad the start
+                shifted = F.pad(
+                    g[:, offset:],
+                    (0,) * (2 * (g.ndim - 2)) + (offset, 0)
+                )
+
+            # broadcast gamma over all trailing weight dimensions
+            gamma_expanded = gamma_k
+            for _ in range(g.ndim - 2):
+                gamma_expanded = gamma_expanded.unsqueeze(-1)
+
+            windowed = windowed + shifted * gamma_expanded
+
+        windowed_grads[name] = windowed
+
+    return windowed_grads
+
 
 # short causal depthwise convolution on keys/queries (paper p.13)
 # provides local mixing before memory read/write
@@ -1028,81 +1081,45 @@ class NeuralMemory(Module):
             keys = keys[..., :-1, :]
             values = values[..., 1:, :]
 
+        # The adaptive learning rate η is applied OUTSIDE Newton-Schulz for the Atlas
+        # (omega + Muon) path, matching paper Table 1: M_t = α M_{t-1} − η_t·NS-5(S_t) with
+        # the raw gradient inside S_t. newtonschulz5 normalizes its input by norm and is
+        # therefore scale-invariant, so folding η into the surprise (as the grad loss weight)
+        # would cancel it. We feed the grad fn the store mask only (raw, masked gradient) and
+        # re-apply η per output token after NS-5. Other paths keep η as the loss weight —
+        # correct there, since without NS-5 there is nothing to cancel it.
+        #
+        # NOTE: a non-omega + Muon config would still wash η out, but no shipped config hits
+        # it (Muon always travels with omega here; the no-muon ablation turns Muon off, not
+        # omega) and a per-chunk η has no clean paper form, so we do not apply η-outside there.
+        # Only test_muon_custom_steps exercises that combination, for NS-step plumbing.
+
+        apply_eta_outside = use_omega and self.spectral_norm_surprises
+        eta_for_update = None
+
+        if apply_eta_outside:
+            store_mask_weight = mask.to(adaptive_lr.dtype) if exists(mask) else torch.ones_like(adaptive_lr)
+            eta_for_update = rearrange(adaptive_lr, '(b n) c -> b (n c)', b = batch * heads)
+
         # get grads and extra auxiliary loss
 
         if use_omega:
             # omega rule: per-token gradients within each chunk, all w.r.t. same M_{t'}
             # then apply sliding window mask M_s (Section 3.3)
 
-            grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
+            grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, store_mask_weight if apply_eta_outside else adaptive_lr, values)
 
             grads = TensorDict(grads)
             # grads shape: (batch*heads*num_chunks, chunk_size, *weight_shape)
 
-            # apply gamma-weighted sliding window (Section 3.2, Eq 9)
-            # for each position i, G_i = Σ_{k=0}^{c-1} γ_k^(i) · grad[i - c + 1 + k]
             # gamma gates: c learned weights per position, input-dependent
-
             omega_c = self.omega_context
             context_gates = self.to_context_gates(seq).sigmoid()  # (bh, num_tokens, c)
             context_gates = rearrange(context_gates, 'bh (n b) c -> (bh n) b c', b = chunk_size)
             # context_gates: (bh*num_chunks, chunk_size, omega_context)
 
-            windowed_grads = TensorDict()
-
-            # One-shot memory instrumentation: print the cost of the omega-windowed
-            # gradient accumulation on the first call only. Provides a concrete
-            # baseline for what FSDP / model parallelism would have to beat. Set
-            # ATLAS_LOG_OMEGA_MEM=1 to enable; off by default to keep production
-            # logs clean.
-            log_omega_mem = (
-                os.environ.get('ATLAS_LOG_OMEGA_MEM', '0') == '1'
-                and not getattr(self, '_logged_omega_mem', False)
-                and torch.cuda.is_available()
-            )
-            if log_omega_mem:
-                first_g = next(iter(grads.values()))
-                pre_alloc_gb = torch.cuda.memory_allocated() / 1e9
-
-            for name, g in grads.items():
-                # g: (bhn, chunk_size, ...)
-                windowed = torch.zeros_like(g)
-
-                for k in range(omega_c):
-                    offset = omega_c - 1 - k  # k=0 → oldest (largest shift), k=c-1 → newest (no shift)
-                    gamma_k = context_gates[..., k]  # (bhn, chunk_size)
-
-                    if offset == 0:
-                        shifted = g
-                    else:
-                        # shift right by offset along dim 1 (chunk_size), zero-pad start
-                        shifted = F.pad(
-                            g[:, offset:],
-                            (0,) * (2 * (g.ndim - 2)) + (offset, 0)
-                        )
-
-                    # broadcast gamma over all trailing weight dimensions
-                    gamma_expanded = gamma_k
-                    for _ in range(g.ndim - 2):
-                        gamma_expanded = gamma_expanded.unsqueeze(-1)
-
-                    windowed = windowed + shifted * gamma_expanded
-
-                windowed_grads[name] = windowed
-
-            if log_omega_mem:
-                post_alloc_gb = torch.cuda.memory_allocated() / 1e9
-                first_shape = tuple(first_g.shape)
-                num_params = len(grads)
-                print(
-                    f"OMEGA_MEM: pre={pre_alloc_gb:.2f}GB post={post_alloc_gb:.2f}GB "
-                    f"delta={post_alloc_gb - pre_alloc_gb:.2f}GB "
-                    f"first_grad_shape={first_shape} omega_c={omega_c} num_param_tensors={num_params}",
-                    flush = True,
-                )
-                self._logged_omega_mem = True
-
-            grads = windowed_grads
+            # apply the gamma-weighted sliding window (Section 3.2, Eq 9)
+            grads = apply_omega_window(grads, context_gates, omega_c)
 
             # reshape from (bh*num_chunks, chunk_size, ...) to (bh, num_tokens, ...)
             # so momentum/decay scan runs per-position (Eqs 37-39)
@@ -1209,6 +1226,11 @@ class NeuralMemory(Module):
 
             if self.spectral_norm_surprises:
                 update = newtonschulz5(update, steps = self.muon_ns_steps, eps = self.muon_ns_eps)
+
+                if apply_eta_outside:
+                    # paper Table 1: η_t scales the spectrally-normalized surprise (outside NS-5).
+                    # NS-5 is scale-invariant, so this is where the adaptive lr actually takes effect.
+                    update = einx.multiply('bh m, bh m ... -> bh m ...', eta_for_update, update)
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 

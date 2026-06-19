@@ -770,3 +770,39 @@ def test_detach_segment_memory_truncates_outer_loop_grad():
             f'gradient norm (detach={d:.4f}, full={f:.4f}, ratio={d/f:.3f}). '
             f'Detach may be silently a no-op.'
         )
+
+def test_atlas_adaptive_lr_affects_muon_update_magnitude():
+    """Regression: the adaptive learning rate η must affect the magnitude of the
+    Atlas (Muon) memory update. Paper Table 1 applies η OUTSIDE Newton-Schulz
+    (M_t = α M_{t-1} − η_t·NS-5(S_t), raw gradient inside S_t). Because newtonschulz5
+    normalizes its input by norm and is scale-invariant (NS5(c·S) = NS5(S)), folding η
+    into the surprise — as the code originally did, via the grad loss weight — silently
+    cancels it, leaving the learned adaptive step dead on the store side. Verified against
+    the paper on 2026-06-18.
+
+    We scale η globally via default_step_transform_max_lr (η = sigmoid(logit)·max_lr) and
+    assert the retrieved output changes. With the bug, the two outputs are bit-identical
+    because η is washed out by NS-5; with the fix (η applied after NS-5) they differ.
+    Same runtime-difference methodology as test_detach_segment_memory_truncates."""
+    config = NeuralMemory.atlas_config()
+
+    torch.manual_seed(42)
+    mem_small_lr = NeuralMemory(dim = 16, chunk_size = 8, default_step_transform_max_lr = 0.1, **config)
+    seq = torch.randn(2, 64, 16)
+    out_small, _ = mem_small_lr(seq)
+
+    torch.manual_seed(42)
+    mem_large_lr = NeuralMemory(dim = 16, chunk_size = 8, default_step_transform_max_lr = 1.0, **config)
+    out_large, _ = mem_large_lr(seq)
+
+    # this discriminates only because omega forces the other adaptive_lr-dependent store
+    # terms off (no lookahead, num_kv_per_token=1, no per-parameter lr modulation), so max_lr
+    # reaches the output solely through the post-NS η multiply. guard against a NaN regression
+    # trivially satisfying `not allclose` (NaN != NaN).
+    assert out_small.isfinite().all() and out_large.isfinite().all(), 'non-finite memory output'
+
+    assert not torch.allclose(out_small, out_large, atol = 1e-6), (
+        'Adaptive learning rate η has no effect on the Atlas/Muon update — it is being '
+        'cancelled by the scale-invariant Newton-Schulz normalization. η must be applied '
+        'OUTSIDE NS-5 (paper Table 1), not folded into the surprise as the grad loss weight.'
+    )
