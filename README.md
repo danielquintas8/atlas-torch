@@ -24,7 +24,7 @@ What this does not do for free is retain. The decay gate means the memory adapts
 |-----------|------|-------------|
 | Polynomial Features | `neural_memory.py` | `PolynomialFeatures` class — exact monomial expansion via `combinations_with_replacement`, learnable coefficients (1/d!), optional `project_back` (Section 3.1) |
 | Omega Rule | `neural_memory.py` | Per-token gradients via nested `vmap(vmap(grad))`, gamma-weighted sliding window with learned context gates, per-position momentum/decay scan (Sections 3.2-3.3) |
-| Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 57-58) |
+| Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 32) |
 | Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/queries (paper p.13, Figure 3) |
 | Sequential Scan | `neural_memory.py` | O(1) forward memory alternative to parallel AssocScan for momentum/decay |
 | Detach Segment Memory | `neural_memory.py` | Truncated outer-loop backprop across segments — standard TTT approximation for memory efficiency |
