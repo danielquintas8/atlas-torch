@@ -4,6 +4,18 @@ First open-source implementation of [ATLAS: Learning to Optimally Memorize the C
 
 It is a working, paper-faithful port. The three Atlas additions (the Omega Rule, polynomial feature mapping, and Muon-style spectral normalization) are implemented and checked against the paper, with runtime tests in `tests/test_titans.py` that assert the paper-mandated transformations actually fire. Several correctness bugs in the underlying memory code are also fixed. The table below lists exactly what was added and what was fixed.
 
+## How the memory works
+
+The neural memory is a small MLP whose weights *are* the memory. It learns at inference, by gradient descent, as it reads the sequence.
+
+At each token it takes one step of test-time learning. It projects the token to a key and a value, asks the memory MLP to predict the value from the key, and takes the gradient of that reconstruction error with respect to the memory's own weights. That gradient is the "surprise". For a linear memory it reduces to (prediction error) ⊗ (key), the classic delta-rule associative write, and the MLP is the nonlinear version of the same idea. A token the memory already predicts well produces a near-zero gradient and barely moves it; a surprising token moves it a lot. There is no store-or-not threshold. The update is continuous and proportional, shaped by learned gates for step size (the adaptive learning rate), carry-over (momentum), and forgetting (a decay gate that makes the memory leaky on purpose).
+
+So there are two loops. The inner loop above is the memory learning at test time. The outer loop is ordinary training: you run the full forward pass, including those inner updates, compute the language-modeling loss, and backpropagate through it, which means differentiating through the inner gradient. A gradient of a gradient. That second-order pass teaches the gates how to learn, what to store, how fast, and what to forget, and it is also the dominant memory cost, because the inner-gradient graph has to be kept so the outer pass can flow through it. That graph is incompatible with gradient checkpointing, which is what caps how many memory layers fit on a single GPU.
+
+At inference there is no outer pass. The gates are frozen, so the inner gradient is computed, applied, and discarded. That makes inference cheap at any context length, and it is why "the model adapts to the document or the user as it reads" is realistic rather than aspirational.
+
+What this does not do for free is retain. The decay gate means the memory adapts to recent context more than it permanently accumulates, so durable retention across very long contexts, the thing that would turn this into a continually-improving model rather than a continually-adapting one, is the open problem rather than a solved feature. It is the question this repository was built to probe, and the one the small-scale experiments here did not reach.
+
 ## Changes from lucidrains' Titans
 
 ### Atlas Extensions (arXiv:2505.23735)
@@ -12,7 +24,7 @@ It is a working, paper-faithful port. The three Atlas additions (the Omega Rule,
 |-----------|------|-------------|
 | Polynomial Features | `neural_memory.py` | `PolynomialFeatures` class — exact monomial expansion via `combinations_with_replacement`, learnable coefficients (1/d!), optional `project_back` (Section 3.1) |
 | Omega Rule | `neural_memory.py` | Per-token gradients via nested `vmap(vmap(grad))`, gamma-weighted sliding window with learned context gates, per-position momentum/decay scan (Sections 3.2-3.3) |
-| Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 57-58) |
+| Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 32) |
 | Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/queries (paper p.13, Figure 3) |
 | Sequential Scan | `neural_memory.py` | O(1) forward memory alternative to parallel AssocScan for momentum/decay |
 | Detach Segment Memory | `neural_memory.py` | Truncated outer-loop backprop across segments — standard TTT approximation for memory efficiency |
