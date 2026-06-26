@@ -302,6 +302,13 @@ class PolynomialFeatures(Module):
     leading-order kernel piece and must be included for the Taylor-softmax
     motivation to hold.
 
+    Note: the paper's φ* (Eq 22) instead scales each degree by 1/√(d!) — a
+    per-side coefficient that exists only so the bilinear φ*(q)·φ*(k) squares
+    back to the 1/d! Taylor coefficient, since (1/√d!)² = 1/d!. Atlas reads
+    M(φ(q)) from an MLP, not a dot product, so there is no second φ factor to
+    square, and the single-sided Eq (5) value 1/d! is correct here. (Moot in
+    practice: the coefficient is learnable and absorbed by the downstream linear.)
+
     For each degree d ≥ 1 the feature is the multiset of distinct monomials
     x_{i_1} … x_{i_d} (combinations_with_replacement) — symmetric monomials,
     not all d-tuples, since e.g. x_i x_j == x_j x_i.
@@ -351,7 +358,7 @@ class PolynomialFeatures(Module):
         #   Proposition 2's capacity argument since the MLP only ever sees a `dim`-rank
         #   compression of φ(k) instead of φ(k) itself.
         # project_back=False: feeds the full expanded_dim directly into the memory MLP. Paper-
-        #   faithful per Eq 56-57 (M(φ(k))). Requires the surrounding NeuralMemory to construct
+        #   faithful per Eq (56) (M(φ(k))). Requires the surrounding NeuralMemory to construct
         #   a memory_model with input dim = self.expanded_dim.
 
         self.projection = LinearNoBias(self.expanded_dim, dim) if project_back else None
@@ -454,11 +461,11 @@ class NeuralMemory(Module):
     @classmethod
     def atlas_config(cls, **overrides):
         """Returns kwargs for Atlas-style configuration.
-        Momentum and Muon confirmed in paper Table 1, Eq. 57-58.
-        omega_context=8 based on Figure 5 (best for OmegaNet).
+        Momentum and Muon: Section 5, Eq (32)-(33) (Appendix D.4, Eq (57)-(58)).
+        omega_context=8 is our default; Figure 5 shows the effect of window size c (the paper names no single optimum).
         polynomial_degree=2 — paper does not specify exact degree.
         poly_project_back=True is the documented production tradeoff. Strict
-        Eq 56-57 reading is `M(φ(k))` with the MLP consuming `expanded_dim`
+        Eq (56) reading is`M(φ(k))` with the MLP consuming `expanded_dim`
         directly (project_back=False), but Phase 0 OOM evidence (job
         40049757) showed the omega-windowed gradient accumulation saturates
         a single H100 at 64 GB on the 170M / seq_len=1024 / chunk_size=8
@@ -468,8 +475,9 @@ class NeuralMemory(Module):
         retaining the Taylor-init learnable coefficients but capping
         effective capacity at O(dim_hidden). Treat the project_back=False
         path as a Phase 3+ scaling question (see GitHub issue #17).
-        per_token_retrieve=True is paper-faithful: Eq 41 / Section 3.3 /
-        Appendix D.4 specify y_t = M_t(q_t), retrieval at every token using
+        per_token_retrieve=True is paper-faithful: the per-token weight state is Eq (41)
+        (M_t = M_{t-1} + S'_t) and the read is Eq (42); the paper has no standalone
+        y_t = M_t(q_t) equation. Appendix D.4 is the per-token Atlas form. Retrieval at every token using
         the per-token memory state. Disabling this falls back to a per-chunk
         retrieve approximation that is structurally Titans-grade, not Atlas.
         """
@@ -985,7 +993,7 @@ class NeuralMemory(Module):
         use_omega = self.omega_context > 1
 
         # derive per-chunk or per-token representations for momentum/decay/lr params
-        # omega rule requires per-token granularity (Section 5.1, Eqs 37-39)
+        # omega rule requires per-token granularity (Section 5.1, Eqs (34)-(39))
 
         if use_omega:
             chunked_seq = seq  # per-token: no pooling
@@ -1082,7 +1090,7 @@ class NeuralMemory(Module):
             values = values[..., 1:, :]
 
         # The adaptive learning rate η is applied OUTSIDE Newton-Schulz for the Atlas
-        # (omega + Muon) path, matching paper Table 1: M_t = α M_{t-1} − η_t·NS-5(S_t) with
+        # (omega + Muon) path, matching paper Section 5, Eq (32): M_t = α M_{t-1} − η_t·NS-5(S_t) with
         # the raw gradient inside S_t. newtonschulz5 normalizes its input by norm and is
         # therefore scale-invariant, so folding η into the surprise (as the grad loss weight)
         # would cancel it. We feed the grad fn the store mask only (raw, masked gradient) and
@@ -1122,7 +1130,7 @@ class NeuralMemory(Module):
             grads = apply_omega_window(grads, context_gates, omega_c)
 
             # reshape from (bh*num_chunks, chunk_size, ...) to (bh, num_tokens, ...)
-            # so momentum/decay scan runs per-position (Eqs 37-39)
+            # so momentum/decay scan runs per-position (Eqs (34)-(39))
             grads = rearrange_dict_values(grads, '(b n) c ... -> b (n c) ...', b = batch * heads)
 
             # surprises
@@ -1228,7 +1236,7 @@ class NeuralMemory(Module):
                 update = newtonschulz5(update, steps = self.muon_ns_steps, eps = self.muon_ns_eps)
 
                 if apply_eta_outside:
-                    # paper Table 1: η_t scales the spectrally-normalized surprise (outside NS-5).
+                    # paper Section 5, Eq (32): η_t scales the spectrally-normalized surprise (outside NS-5).
                     # NS-5 is scale-invariant, so this is where the adaptive lr actually takes effect.
                     update = einx.multiply('bh m, bh m ... -> bh m ...', eta_for_update, update)
 

@@ -598,7 +598,7 @@ def test_polynomial_features_constant_in_forward_output():
 
 def test_atlas_config_poly_project_back_default():
     """atlas_config() defaults poly_project_back=True as the documented
-    production tradeoff. The strict Eq 56-57 reading would have the MLP
+    production tradeoff. The strict Eq (56) reading would have the MLP
     consume phi(k) directly (project_back=False), but Phase 0 OOM evidence
     (job 40049757) showed the asymmetric path saturates H100 at the
     omega-windowed gradient accumulation. project_back=True keeps the
@@ -681,7 +681,7 @@ def test_atlas_muon_actually_applies_to_matrix_surprises():
 
     assert matrix_call_count > 0, (
         'newtonschulz5 was never called with a 4D matrix surprise tensor — '
-        'Muon path may have been refactored away. Atlas requires Muon (Eq 57).'
+        'Muon path may have been refactored away. Atlas requires Muon (Section 5, Eq (32)).'
     )
     assert matrix_transform_count == matrix_call_count, (
         f'newtonschulz5 returned its input unchanged on {matrix_call_count - matrix_transform_count} '
@@ -696,8 +696,8 @@ def test_atlas_config_enables_per_token_retrieve():
     matters for every Atlas run that goes through it."""
     config = NeuralMemory.atlas_config()
     assert config['per_token_retrieve'] is True, (
-        'atlas_config() must enable per_token_retrieve — Eq 41 / Section 3.3 '
-        'requires y_t = M_t(q_t), retrieval at every token. Falling back to '
+        'atlas_config() must enable per_token_retrieve — Eq (41) gives the per-token '
+        'weight state and Eq (42) the read (y_t = M_t(q_t)), retrieval at every token. Falling back to '
         'per-chunk retrieve silently re-runs Titans on the retrieve side.'
     )
 
@@ -773,7 +773,7 @@ def test_detach_segment_memory_truncates_outer_loop_grad():
 
 def test_atlas_adaptive_lr_affects_muon_update_magnitude():
     """Regression: the adaptive learning rate η must affect the magnitude of the
-    Atlas (Muon) memory update. Paper Table 1 applies η OUTSIDE Newton-Schulz
+    Atlas (Muon) memory update. Paper Section 5, Eq (32) applies η OUTSIDE Newton-Schulz
     (M_t = α M_{t-1} − η_t·NS-5(S_t), raw gradient inside S_t). Because newtonschulz5
     normalizes its input by norm and is scale-invariant (NS5(c·S) = NS5(S)), folding η
     into the surprise — as the code originally did, via the grad loss weight — silently
@@ -804,5 +804,5 @@ def test_atlas_adaptive_lr_affects_muon_update_magnitude():
     assert not torch.allclose(out_small, out_large, atol = 1e-6), (
         'Adaptive learning rate η has no effect on the Atlas/Muon update — it is being '
         'cancelled by the scale-invariant Newton-Schulz normalization. η must be applied '
-        'OUTSIDE NS-5 (paper Table 1), not folded into the surprise as the grad loss weight.'
+        'OUTSIDE NS-5 (paper Section 5, Eq (32)), not folded into the surprise as the grad loss weight.'
     )
