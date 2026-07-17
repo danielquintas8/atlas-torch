@@ -94,6 +94,9 @@ def is_empty_tensor(t):
 def dict_get_value_shapes(td):
     return [v.shape for k, v in td.items()]
 
+def dict_first_value(td):
+    return next(iter(td.values()))
+
 def rearrange_dict_values(td, pattern, **kwargs):
     return td.apply(lambda t: rearrange(t, pattern, **kwargs))
 
@@ -1062,14 +1065,20 @@ class NeuralMemory(Module):
 
         assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
 
-        if exists(prev_weights):
+        if exists(prev_weights) and num_chunks > 0:
 
             start_index = math.ceil(seq_index / chunk_size)
             end_index = start_index + num_chunks
+            prev_num_chunks = dict_first_value(prev_weights).shape[1]
 
-            prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
+            # guard against slicing past the available prev_weights chunks, which happens
+            # when sampling with segment length > 1 (upstream lucidrains 1d40c44 / issue #61)
+            if end_index <= prev_num_chunks:
+                prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
+            else:
+                prev_weights = prev_weights.apply(lambda t: t[:, :num_chunks])
 
-            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
+            if exists(self.to_learned_weight_residual_mix):
                 # weight residual operates at chunk granularity (prev_weights is per-chunk)
                 chunked_seq_for_mix = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size) if use_omega else chunked_seq
                 mix = self.to_learned_weight_residual_mix(chunked_seq_for_mix)
@@ -1274,7 +1283,7 @@ class NeuralMemory(Module):
         # auto infer single token decoding, if there are only 1 set of weights and 1 token
 
         is_one_token = seq_len == 1
-        is_one_weight = (not weights_have_expanded_shape) or next(iter(weights.values())).shape[1] == 1
+        is_one_weight = (not weights_have_expanded_shape) or dict_first_value(weights).shape[1] == 1
 
         is_single_token_decode = is_one_token and is_one_weight
 
@@ -1334,7 +1343,7 @@ class NeuralMemory(Module):
                     # per-token retrieve: use full per-token weights, no subsampling.
                     # pad for remainder tokens (those not processed by store_memories due
                     # to round_down_multiple). the last M_t is the correct state.
-                    n_weights = next(iter(weights.values())).shape[1]
+                    n_weights = dict_first_value(weights).shape[1]
                     n_needed = seq_len_plus_one
                     if n_weights < n_needed:
                         diff = n_needed - n_weights

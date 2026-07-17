@@ -301,6 +301,27 @@ def test_mac_sampling(
 
     assert torch.allclose(sampled, sampled_with_cache)
 
+@pytest.mark.parametrize('prompt_len', (4, 16, 33, 65))
+def test_mac_sampling_with_weight_residual(prompt_len):
+    # regression for a prev_weights out-of-bounds slice when sampling with segment
+    # length > 1 and weight residual on (upstream lucidrains 1d40c44 / issue #61)
+    transformer = MemoryAsContextTransformer(
+        num_tokens = 256,
+        dim = 16,
+        depth = 2,
+        segment_len = 32,
+        num_persist_mem_tokens = 4,
+        num_longterm_mem_tokens = 4,
+        neural_mem_weight_residual = True,
+        neural_mem_gate_attn_output = False,
+    )
+
+    prompt = torch.randint(0, 256, (1, prompt_len))
+
+    sampled = transformer.sample(prompt, prompt_len + 65, use_cache = True, temperature = 0., show_progress = False)
+
+    assert sampled.shape == (1, 65)
+
 @pytest.mark.parametrize('seq_len', (2, 64, 256))
 @pytest.mark.parametrize('prompt_len', (0, 65))
 @pytest.mark.parametrize('mem_chunk_size', (2, 32, 64))
