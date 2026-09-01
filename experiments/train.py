@@ -15,6 +15,8 @@ Usage:
 import argparse
 import math
 import os
+import re
+import shutil
 import sys
 import time
 
@@ -129,6 +131,42 @@ def cosine_with_warmup(optimizer, warmup_steps, total_steps):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+
+def build_param_groups(model, weight_decay):
+    """Split parameters into decay / no-decay groups for AdamW.
+
+    Decay: matmul-style weights (ndim >= 2), excluding embedding-like tables.
+    No decay (wd=0.0): everything else — biases, norm gains, the
+    hyper-connection split_fracs (the parameter the seq-4096 divergence
+    localized to), the polynomial Taylor coefficients (uniform decay pulled
+    them toward 0, not their 1/d! init), gate scalars — plus the
+    embedding-like tables (token_emb, longterm_mems, persistent_memory,
+    axial_pos_emb): weight decay on embeddings shrinks their norms and
+    inflates early-layer gradients via the LayerNorm Jacobian (OLMo-2
+    mechanism). Field standard is decay-matrices-only; the previous uniform
+    wd=0.1 decayed all of the above at lr*wd ≈ 3e-4/step (found 2026-09-01).
+    """
+    embedding_like = ("token_emb", "longterm_mems", "persistent_memory", "axial_pos_emb")
+
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_embedding_like = any(tag in name for tag in embedding_like)
+        if param.ndim >= 2 and not is_embedding_like:
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+
+    return [
+        dict(params=decay_params, weight_decay=weight_decay),
+        dict(params=no_decay_params, weight_decay=0.0),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
@@ -146,6 +184,32 @@ def load_checkpoint(accelerator, resume_dir):
         os.path.join(resume_dir, "meta.pt"), map_location="cpu", weights_only=True
     )
     return meta["step"]
+
+
+def prune_checkpoints(accelerator, output_dir, keep):
+    """Delete the oldest step-* checkpoint dirs beyond the newest `keep`.
+
+    Opt-in via --keep-checkpoints: the eval workflow scores multiple
+    historical checkpoints, so nothing is deleted by default. At
+    --save-every 100 a full 15B run writes ~300 checkpoints x ~2-3 GB
+    (600-900 GB of GPFS). Only directories matching step-<digits> inside
+    output_dir are ever touched.
+    """
+    if keep is None or keep < 1 or not accelerator.is_main_process:
+        return
+
+    pattern = re.compile(r"^step-(\d+)$")
+    step_dirs = []
+    for entry in os.listdir(output_dir):
+        match = pattern.match(entry)
+        full = os.path.join(output_dir, entry)
+        if match and os.path.isdir(full):
+            step_dirs.append((int(match.group(1)), full))
+
+    step_dirs.sort()  # numerically, oldest first
+    for _, path in step_dirs[:-keep]:
+        shutil.rmtree(path)
+        accelerator.print(f"Pruned checkpoint {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +255,14 @@ def parse_args():
         help="Enable DDP find_unused_parameters (escape hatch — only needed if "
         "some parameters receive no gradients, e.g. detach_segment_memory "
         "geometries that truncate the store graph)",
+    )
+    p.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=None,
+        help="Keep only the newest N step-* checkpoints, deleting older ones "
+        "after each save. Default None keeps all — the eval workflow scores "
+        "multiple historical checkpoints, so rotation is opt-in.",
     )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -279,10 +351,18 @@ def main():
     accelerator.print(f"Parameters: {param_count:,} ({param_count / 1e6:.1f}M)")
 
     # Optimizer + scheduler
+    # betas set explicitly: neither the Titans nor the Atlas paper pins them;
+    # every reference pretraining config (Llama 1-3, DeepSeek V1-V3,
+    # SmolLM2/3, Salamandra) uses beta2=0.95. torch's default 0.999 adapts
+    # the second moment too slowly at peak_lr 3e-3 and is spike-prone.
+    # Weight decay applies to matmul weights only — see build_param_groups.
+    # NOTE: optimizer state from pre-existing checkpoints will not load
+    # (param-group count changed) — those checkpoints are already declared
+    # incompatible on this branch (omega window fix).
     optimizer = AdamW(
-        model.parameters(),
+        build_param_groups(model=model, weight_decay=train_cfg["weight_decay"]),
         lr=train_cfg["peak_lr"],
-        weight_decay=train_cfg["weight_decay"],
+        betas=(0.9, 0.95),
     )
 
     # The scheduler is deliberately NOT passed through accelerator.prepare.
@@ -469,9 +549,17 @@ def main():
         # Checkpoint
         if global_step % args.save_every == 0:
             save_checkpoint(accelerator, global_step, output_dir)
+            prune_checkpoints(
+                accelerator=accelerator,
+                output_dir=output_dir,
+                keep=args.keep_checkpoints,
+            )
 
     # Final save
     save_checkpoint(accelerator, global_step, output_dir)
+    prune_checkpoints(
+        accelerator=accelerator, output_dir=output_dir, keep=args.keep_checkpoints
+    )
 
     # Peak GPU memory — used by Phase 0 smoke runs to verify the asymmetric
     # MLP path fits comfortably under the H100 budget before committing to a

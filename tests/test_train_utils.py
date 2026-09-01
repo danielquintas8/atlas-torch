@@ -106,3 +106,105 @@ def test_cosine_schedule_resume_continuity():
         'warmup=0 on resume was expected to deform the schedule — if these '
         'now match, this guard needs re-derivation'
     )
+
+
+def test_param_groups_split():
+    """AdamW must decay matmul weights only. Uniform wd=0.1 was decaying norm
+    gains, gate biases, the poly Taylor coefficients (toward 0, not their
+    1/d! init), embedding-like tables, and the hyper-connection split_fracs —
+    the parameter the seq-4096 divergence localized to (2026-09-01)."""
+    from experiments.train import build_param_groups
+    from titans_pytorch import MemoryAsContextTransformer
+    from titans_pytorch.neural_memory import NeuralMemory
+
+    mem_kwargs = NeuralMemory.atlas_config()
+    mem_kwargs.update(dim_head = 8, heads = 4)
+
+    model = MemoryAsContextTransformer(
+        num_tokens = 64,
+        dim = 32,
+        depth = 2,
+        segment_len = 16,
+        num_persist_mem_tokens = 4,
+        num_longterm_mem_tokens = 4,
+        neural_memory_layers = (1,),
+        neural_memory_segment_len = 4,
+        use_flex_attn = False,
+        neural_memory_kwargs = mem_kwargs,
+    )
+
+    wd = 0.1
+    groups = build_param_groups(model = model, weight_decay = wd)
+    assert len(groups) == 2
+    assert groups[0]["weight_decay"] == wd
+    assert groups[1]["weight_decay"] == 0.0
+
+    decay_ids = {id(p) for p in groups[0]["params"]}
+    no_decay_ids = {id(p) for p in groups[1]["params"]}
+
+    # every trainable param exactly once
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    assert decay_ids.isdisjoint(no_decay_ids)
+    assert len(decay_ids) + len(no_decay_ids) == len(trainable)
+    assert {id(p) for _, p in trainable} == decay_ids | no_decay_ids
+
+    embedding_like = ("token_emb", "longterm_mems", "persistent_memory", "axial_pos_emb")
+    saw_poly_coefficients = False
+    saw_embedding_like = False
+    saw_decay_weight = False
+
+    for name, param in trainable:
+        if param.ndim < 2:
+            assert id(param) in no_decay_ids, f"{name} (ndim<2) must not decay"
+        if any(tag in name for tag in embedding_like):
+            saw_embedding_like = True
+            assert id(param) in no_decay_ids, f"{name} (embedding-like) must not decay"
+        if "poly_features.coefficients" in name:
+            saw_poly_coefficients = True
+            assert id(param) in no_decay_ids, f"{name} (Taylor coefficients) must not decay"
+        if name.endswith("to_qkv.weight") or name.endswith("to_logits.weight"):
+            saw_decay_weight = True
+            assert id(param) in decay_ids, f"{name} (matmul weight) must decay"
+
+    # prove the discriminating cases actually existed in this model
+    assert saw_poly_coefficients, "atlas config must expose poly coefficients"
+    assert saw_embedding_like, "model must expose embedding-like tables"
+    assert saw_decay_weight, "model must expose ordinary matmul weights"
+
+
+def test_write_train_val_split_crossing_shards(tmp_path):
+    """The train/val boundary crossing 2+ shards must lose nothing. The
+    pre-fix loop sliced shard[split:] with a negative split after the
+    crossing shard — synthetic case produced val=20 with 20 tokens silently
+    lost while meta.json claimed 40 (2026-09-01)."""
+    from experiments.data.prepare import write_train_val_split
+
+    sizes = (100, 100, 30)
+    starts = np.cumsum((0,) + sizes[:-1])
+    shard_paths = []
+    for i, (start, size) in enumerate(zip(starts, sizes)):
+        path = str(tmp_path / f"shard_{i:04d}.bin")
+        np.arange(start, start + size, dtype = np.uint16).tofile(path)
+        shard_paths.append(path)
+
+    train_path = str(tmp_path / "train.bin")
+    val_path = str(tmp_path / "val.bin")
+    total = sum(sizes)
+    train_tokens = 190  # boundary inside shard 1; shard 2 is entirely val
+
+    train_written, val_written = write_train_val_split(
+        shard_paths = shard_paths,
+        train_tokens = train_tokens,
+        train_path = train_path,
+        val_path = val_path,
+    )
+
+    train = np.fromfile(train_path, dtype = np.uint16)
+    val = np.fromfile(val_path, dtype = np.uint16)
+
+    assert train_written == train_tokens and len(train) == train_tokens
+    assert val_written == total - train_tokens and len(val) == total - train_tokens
+    assert np.array_equal(train, np.arange(0, train_tokens, dtype = np.uint16))
+    assert np.array_equal(val, np.arange(train_tokens, total, dtype = np.uint16))
+    # shards consumed
+    assert not any(os.path.exists(sp) for sp in shard_paths)
