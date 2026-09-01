@@ -1,3 +1,4 @@
+import argparse
 import copy
 import os
 import random
@@ -8,7 +9,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.train import MemmapTokenDataset, cosine_with_warmup
+from experiments.train import MemmapTokenDataset, compute_schedule, cosine_with_warmup
 
 
 def _write_bin(path, n_chunks, chunk_len):
@@ -41,8 +42,9 @@ def test_memmap_dataset_full_coverage_single_process(tmp_path):
             f'the dataset must not shard itself by RANK/WORLD_SIZE'
         )
 
-        random.seed(123)
-        ds_shuffled = MemmapTokenDataset(bin_path = bin_path, seq_len = seq_len, shuffle = True)
+        ds_shuffled = MemmapTokenDataset(
+            bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = 123
+        )
         shuffled_ids = [int(chunk[0]) for chunk in ds_shuffled]
         assert sorted(shuffled_ids) == list(range(n_chunks)), 'shuffle must permute, not drop'
         assert shuffled_ids != list(range(n_chunks)), 'shuffle=True must actually permute'
@@ -54,6 +56,101 @@ def test_memmap_dataset_full_coverage_single_process(tmp_path):
     finally:
         os.environ.pop("RANK", None)
         os.environ.pop("WORLD_SIZE", None)
+
+
+def test_memmap_dataset_resume_permutation(tmp_path):
+    """The permutation must be a pure function of seed + epoch, immune to the
+    process-global RNGs — accelerator.load_state restores those to their
+    checkpoint-time (post-shuffle) state, so any global-random shuffle after
+    resume draws the WRONG permutation (probe-proven 2026-09-01: 9/9
+    post-resume batches mismatched). skip_chunks must seek within the first
+    pass only; epoch_base must replay a later epoch's permutation exactly."""
+    n_chunks, seq_len = 32, 16
+    bin_path = str(tmp_path / "data.bin")
+    _write_bin(path = bin_path, n_chunks = n_chunks, chunk_len = seq_len + 1)
+
+    def ids(dataset):
+        return [int(chunk[0]) for chunk in dataset]
+
+    reference = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = 11
+    )
+    epoch0 = ids(reference)
+    epoch1 = ids(reference)
+    assert sorted(epoch0) == sorted(epoch1) == list(range(n_chunks))
+    assert epoch0 != epoch1
+
+    # global RNG state must be irrelevant: scramble every global RNG and the
+    # same constructor must reproduce the same epochs
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+    replay = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = 11
+    )
+    assert ids(replay) == epoch0, 'permutation must not depend on global RNG state'
+    assert ids(replay) == epoch1
+
+    # skip_chunks: first pass seeks, second pass is the full next epoch
+    resumed_mid = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = 11,
+        skip_chunks = 5,
+    )
+    assert ids(resumed_mid) == epoch0[5:], 'skip_chunks must seek within the first pass'
+    assert ids(resumed_mid) == epoch1, 'the pass after the seek must be the full next epoch'
+
+    # epoch_base: replay a later epoch from a fresh dataset (past-epoch resume)
+    resumed_late = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = 11,
+        epoch_base = 1, skip_chunks = 3,
+    )
+    assert ids(resumed_late) == epoch1[3:]
+
+    # limit_chunks caps the dataset (validation's fixed slice)
+    limited = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = False, limit_chunks = 8
+    )
+    assert ids(limited) == list(range(8))
+
+
+def test_compute_schedule_resume_keeps_warmup():
+    """compute_schedule must NOT consult args.resume: warmup comes from config
+    (or the CLI override) regardless. The old `elif args.resume: warmup = 0`
+    rebuilt a different cosine against the restored step counter, measured
+    -1.6% to -12.2% LR vs the intended schedule (2026-09-01); re-adding it
+    must fail this test."""
+    train_cfg = dict(
+        seq_len = 1024, batch_tokens = 500_000, total_tokens = 15_000_000_000,
+        warmup_steps = 2000,
+    )
+
+    def make_args(resume, warmup_steps = None):
+        return argparse.Namespace(
+            per_device_batch_size = 4,
+            grad_accum = None,
+            max_steps = None,
+            warmup_steps = warmup_steps,
+            resume = resume,
+        )
+
+    fresh = compute_schedule(
+        train_cfg = train_cfg, args = make_args(resume = None), num_gpus = 4
+    )
+    resumed = compute_schedule(
+        train_cfg = train_cfg,
+        args = make_args(resume = "runs/whatever/step-4000"),
+        num_gpus = 4,
+    )
+    assert fresh == resumed, 'resume must not change the schedule shape'
+    assert resumed[4] == train_cfg["warmup_steps"], 'warmup must come from config on resume'
+
+    # CLI override still wins
+    overridden = compute_schedule(
+        train_cfg = train_cfg,
+        args = make_args(resume = "runs/whatever/step-4000", warmup_steps = 77),
+        num_gpus = 4,
+    )
+    assert overridden[4] == 77
 
 
 def test_cosine_schedule_resume_continuity():
@@ -111,8 +208,10 @@ def test_cosine_schedule_resume_continuity():
 def test_param_groups_split():
     """AdamW must decay matmul weights only. Uniform wd=0.1 was decaying norm
     gains, gate biases, the poly Taylor coefficients (toward 0, not their
-    1/d! init), embedding-like tables, and the hyper-connection split_fracs —
-    the parameter the seq-4096 divergence localized to (2026-09-01)."""
+    1/d! init), embedding-like tables, and the hyper-connection routing
+    params — static_alpha is initialized one-hot + eye (the residual-stream
+    identity routing), so decay pulls it toward the zero matrix
+    (2026-09-01)."""
     from experiments.train import build_param_groups
     from titans_pytorch import MemoryAsContextTransformer
     from titans_pytorch.neural_memory import NeuralMemory
@@ -149,9 +248,12 @@ def test_param_groups_split():
     assert {id(p) for _, p in trainable} == decay_ids | no_decay_ids
 
     embedding_like = ("token_emb", "longterm_mems", "persistent_memory", "axial_pos_emb")
+    hyper_conn_routing = ("static_alpha", "dynamic_alpha_fn", "stream_embed")
     saw_poly_coefficients = False
     saw_embedding_like = False
     saw_decay_weight = False
+    saw_routing = {tag: False for tag in hyper_conn_routing}
+    saw_norm_gain_2d = False
 
     for name, param in trainable:
         if param.ndim < 2:
@@ -159,6 +261,18 @@ def test_param_groups_split():
         if any(tag in name for tag in embedding_like):
             saw_embedding_like = True
             assert id(param) in no_decay_ids, f"{name} (embedding-like) must not decay"
+        for tag in hyper_conn_routing:
+            if tag in name:
+                saw_routing[tag] = True
+                assert id(param) in no_decay_ids, (
+                    f"{name} (hyper-connection routing — static_alpha is the "
+                    f"identity residual routing at init) must not decay"
+                )
+        if name.endswith(".gamma") and param.ndim >= 2:
+            saw_norm_gain_2d = True
+            assert id(param) in no_decay_ids, (
+                f"{name} (norm gain, (gamma+1)-parameterized) must not decay"
+            )
         if "poly_features.coefficients" in name:
             saw_poly_coefficients = True
             assert id(param) in no_decay_ids, f"{name} (Taylor coefficients) must not decay"
@@ -170,6 +284,9 @@ def test_param_groups_split():
     assert saw_poly_coefficients, "atlas config must expose poly coefficients"
     assert saw_embedding_like, "model must expose embedding-like tables"
     assert saw_decay_weight, "model must expose ordinary matmul weights"
+    for tag, seen in saw_routing.items():
+        assert seen, f"model must expose hyper-connection {tag} (default 4 residual streams)"
+    assert saw_norm_gain_2d, "model must expose an ndim>=2 norm gain (qk_rmsnorm gammas)"
 
 
 def test_write_train_val_split_crossing_shards(tmp_path):

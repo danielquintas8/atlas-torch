@@ -176,6 +176,12 @@ def main():
         f"val.bin {os.path.getsize(val_path)}B != {total_tokens:,} tokens * 2B"
     )
 
+    # a 0-byte val.bin would crash np.memmap at train startup; remove it and
+    # let train.py print "validation disabled" instead
+    if val_written == 0:
+        os.remove(val_path)
+        print("val split empty — removed val.bin (validation will be disabled)")
+
     meta = dict(
         vocab_size=tokenizer.vocab_size,
         total_tokens=total_tokens,
@@ -188,7 +194,8 @@ def main():
 
     print(f"\nDone → {args.output}/")
     print(f"  train.bin  {os.path.getsize(train_path) / 1e9:.2f} GB")
-    print(f"  val.bin    {os.path.getsize(val_path) / 1e6:.1f} MB")
+    if os.path.exists(val_path):
+        print(f"  val.bin    {os.path.getsize(val_path) / 1e6:.1f} MB")
     print(f"  tokenizer/")
     print(f"  meta.json")
 
