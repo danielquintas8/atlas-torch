@@ -98,10 +98,19 @@ MEMORY_CONFIGS = {
                                       # and detach cut segment 0's store graph — the learned
                                       # memory init got ZERO outer-loop gradient (frozen at
                                       # random init) and store-side params trained on only the
-                                      # last ~60 tokens. full backprop retains the full store
-                                      # graph: run a BSC memory smoke before the next training
-                                      # launch. the flag remains available for seq_len >>
-                                      # batch_size experiments where truncated BPTT is intended.
+                                      # last ~60 tokens. that justification is the ctx-1024
+                                      # geometry actually trained (slurm/train.sh --seq-len
+                                      # 1024); at TRAINING_DEFAULTS seq_len=4096 the interleaved
+                                      # sequence splits into 5 segments and the retained
+                                      # no-detach graph is substantially larger (directional
+                                      # CPU-RSS measurement: ~+50%). full backprop retains the
+                                      # full store graph: run a BSC memory smoke at the geometry
+                                      # actually launched before the next training run —
+                                      # benchmarks/profile_omega_memory.py with --batch-size set
+                                      # (without it the profiler builds one segment and cannot
+                                      # see this trade-off at all). the flag remains available
+                                      # for seq_len >> batch_size experiments where truncated
+                                      # BPTT is intended.
         use_sequential_scan=True,  # O(1) memory scan instead of O(n log n) parallel scan
     ),
 }

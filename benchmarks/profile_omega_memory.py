@@ -38,6 +38,8 @@ def profile_omega_memory(
     omega_context: int,
     chunk_size: int,
     batch: int,
+    batch_size: int | None,
+    detach_segment_memory: bool,
 ) -> dict[str, float]:
     """Run one omega-path forward and backward and report the memory it costs.
 
@@ -59,11 +61,17 @@ def profile_omega_memory(
     config = NeuralMemory.atlas_config()
     config["omega_context"] = omega_context
 
+    # batch_size / detach_segment_memory exist so the profiler can reproduce the
+    # multi-segment training geometry (interleaved length > neural_memory_batch_size).
+    # without batch_size there is always exactly one segment, and the memory cost of
+    # detach_segment_memory=False vs True is invisible to this tool.
     memory = NeuralMemory(
         dim=dim,
         dim_head=dim // heads,
         heads=heads,
         chunk_size=chunk_size,
+        batch_size=batch_size,
+        detach_segment_memory=detach_segment_memory,
         **config,
     ).to(device)
 
@@ -90,6 +98,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--omega-context", type=int, default=8)
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="neural memory batch size (segment length at which base weights advance); "
+        "set it below seq_len to reproduce the multi-segment training geometry",
+    )
+    parser.add_argument(
+        "--detach-segment-memory",
+        action="store_true",
+        help="detach non-final segment store graphs (measure the truncated-BPTT footprint)",
+    )
     return parser.parse_args()
 
 
@@ -102,10 +122,13 @@ def main() -> None:
         omega_context=args.omega_context,
         chunk_size=args.chunk_size,
         batch=args.batch,
+        batch_size=args.batch_size,
+        detach_segment_memory=args.detach_segment_memory,
     )
     print(
         f"OMEGA_MEM dim={args.dim} heads={args.heads} seq_len={args.seq_len} "
-        f"omega_context={args.omega_context} chunk_size={args.chunk_size} batch={args.batch} | "
+        f"omega_context={args.omega_context} chunk_size={args.chunk_size} batch={args.batch} "
+        f"batch_size={args.batch_size} detach={args.detach_segment_memory} | "
         f"before={result['before_gb']:.2f}GB after={result['after_gb']:.2f}GB "
         f"peak={result['peak_gb']:.2f}GB"
     )

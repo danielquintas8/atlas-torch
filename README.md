@@ -41,6 +41,8 @@ What this does not do for free is retain. The decay gate means the memory adapts
 | Omega window slide | `neural_memory.py` | Fixed shifted-gradient slice direction (2026-09-01): pre-fix, the window collapsed to a per-position gate multiplier with no cross-token mixing; now guarded by value-level tests against a brute-force reference of the paper equation |
 | Store-path gradient starvation | `experiments/configs.py` | `detach_segment_memory` off in the training config (2026-09-01): with the interleaved sequence exceeding `neural_memory_batch_size`, detach froze the learned memory init and cut store-side params off from most outer-loop gradient |
 
+Checkpoints trained before these fixes are incompatible with current code: strict loading fails (the new value conv adds parameters), and they are semantically stale under the fixed omega window — loading them with `strict=False` silently runs a randomly-initialized value conv in the store path. Do not evaluate old checkpoints on new code.
+
 ### Configuration
 
 ```python
@@ -73,7 +75,7 @@ The `pip install titans-pytorch` line in the inherited section below installs Ph
 
 This repository is an implementation, not a research result. I used it for small-scale experiments at 170M parameters, and those runs did not reach a scale where the model has measurable long-context capability, so they produced no conclusions about Atlas's long-context behavior. The value here is the code and the documented fixes and limitations, not a finding.
 
-Two known limitations are worth reading before building on this at scale: the polynomial memory capacity bound under the default configuration (tracked in the [issues](https://github.com/danielquintas8/atlas-torch/issues)), and an autograd memory constraint (the per-token gradient path is incompatible with gradient checkpointing) that caps how many memory layers fit on a single GPU.
+Three known limitations are worth reading before building on this at scale: the polynomial memory capacity bound under the default configuration (tracked in the [issues](https://github.com/danielquintas8/atlas-torch/issues)); an autograd memory constraint (the per-token gradient path is incompatible with gradient checkpointing) that caps how many memory layers fit on a single GPU; and a parallel-vs-decoding mismatch — token-by-token decoding (`model.sample()`) runs a different memory than the parallel forward, because the store cache flushes every `chunk_size` tokens, so omega windows truncate at those flush boundaries during decoding but span the full neural-memory batch segment in parallel mode. Training and likelihood-style evaluation (e.g. BABILong scoring) use the parallel forward and are unaffected.
 
 ---
 
