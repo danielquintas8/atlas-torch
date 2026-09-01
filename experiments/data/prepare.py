@@ -62,6 +62,35 @@ def load_tokenizer(tokenizer_dir=None):
     return tokenizer
 
 
+def write_train_val_split(shard_paths, train_tokens, train_path, val_path):
+    """Concatenate shards into train.bin / val.bin, splitting at train_tokens.
+
+    The boundary may fall anywhere, including across multiple shards: per
+    shard, the first `clamp(train_tokens - train_written, 0, len(shard))`
+    tokens go to train and the remainder to val. (The previous inline loop
+    sliced `shard[split:]` with a NEGATIVE split once the boundary had been
+    passed, silently dropping all but the last tokens of any later shard —
+    token loss whenever the val overhang spanned 2+ shards; found
+    2026-09-01.) Shards are deleted as they are consumed.
+
+    Returns (train_written, val_written).
+    """
+    train_written = 0
+    val_written = 0
+    with open(train_path, "wb") as ft, open(val_path, "wb") as fv:
+        for sp in shard_paths:
+            shard = np.fromfile(sp, dtype=np.uint16)
+            split = min(max(train_tokens - train_written, 0), len(shard))
+            if split > 0:
+                shard[:split].tofile(ft)
+                train_written += split
+            if split < len(shard):
+                shard[split:].tofile(fv)
+                val_written += len(shard) - split
+            os.remove(sp)
+    return train_written, val_written
+
+
 def main():
     p = argparse.ArgumentParser(description="Pre-tokenize FineWeb for training")
     p.add_argument("--output", required=True, help="Output directory")
@@ -130,20 +159,22 @@ def main():
 
     train_path = os.path.join(args.output, "train.bin")
     val_path = os.path.join(args.output, "val.bin")
-    written = 0
 
-    with open(train_path, "wb") as ft, open(val_path, "wb") as fv:
-        for sp in shard_paths:
-            shard = np.fromfile(sp, dtype=np.uint16)
-            if written + len(shard) <= train_tokens:
-                shard.tofile(ft)
-            else:
-                split = train_tokens - written
-                if split > 0:
-                    shard[:split].tofile(ft)
-                shard[split:].tofile(fv)
-            written += len(shard)
-            os.remove(sp)
+    train_written, val_written = write_train_val_split(
+        shard_paths=shard_paths,
+        train_tokens=train_tokens,
+        train_path=train_path,
+        val_path=val_path,
+    )
+
+    # every token lands in exactly one of the two files (uint16 = 2 bytes)
+    assert train_written == train_tokens, (
+        f"train split short: wrote {train_written:,}, wanted {train_tokens:,}"
+    )
+    assert os.path.getsize(train_path) + os.path.getsize(val_path) == total_tokens * 2, (
+        f"token loss in split: train.bin {os.path.getsize(train_path)}B + "
+        f"val.bin {os.path.getsize(val_path)}B != {total_tokens:,} tokens * 2B"
+    )
 
     meta = dict(
         vocab_size=tokenizer.vocab_size,
