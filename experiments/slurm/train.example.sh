@@ -63,6 +63,9 @@ if [ -n "${WARMUP_STEPS}" ]; then
     WARMUP_FLAG="--warmup-steps ${WARMUP_STEPS}"
 fi
 
+# Checkpoints: SAVE_EVERY=100 writes ~300 checkpoints x ~2-3 GB over a full
+# 15B run (600-900 GB of GPFS). train.py's --keep-checkpoints N rotates,
+# keeping only the newest N — opt-in because evals score historical checkpoints.
 RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}"
 
 # rename job to match variant (SBATCH --job-name is hardcoded; static directives can't use env vars)

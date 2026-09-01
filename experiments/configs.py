@@ -27,6 +27,12 @@ MODELS = {
 # ---------------------------------------------------------------------------
 # Per-size training hyperparams (Appendix E + Table 7)
 # ---------------------------------------------------------------------------
+# NOTE: peak LRs follow Atlas Table 7 for BOTH variants. The Titans paper's
+# own recipe is AdamW 4e-4 (verified against its arXiv source: "learning
+# rate of 4e-4", Experiments section) — running the titans baseline at 3e-3
+# is a deliberate same-LR-comparison choice, not the Titans paper's recipe.
+# Any headline Titans-vs-Atlas claim should either sweep LR per condition
+# or state this choice.
 
 TRAINING = {
     "170m": dict(peak_lr=3e-3,    total_tokens=15_000_000_000),
