@@ -546,7 +546,7 @@ class NeuralMemory(Module):
         poly_project_back = True,
         omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. window truncates at neural-memory batch (segment) boundaries.
         per_token_retrieve: bool = False,  # per-token retrieve: each y_t = M_t(q_t) using per-token weights from Eq 41. requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
-        short_conv_size: int = 0,  # causal depthwise conv on keys/queries (paper p.13, kernel size). 0 = disabled.
+        short_conv_size: int = 0,  # causal depthwise conv on keys/values/queries (paper Section 5 architectural backbone, kernel size). 0 = disabled.
         detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
         use_sequential_scan: bool = False,  # use sequential scan for momentum/decay instead of parallel associative scan. O(1) forward memory vs O(n log n). slower but drastically reduces GPU memory for large sequences.
         gated_transition = False,
@@ -768,9 +768,12 @@ class NeuralMemory(Module):
             activation,
         )
 
-        # short causal convolution on keys/queries (paper p.13)
+        # short causal convolution on keys / values / queries (paper Section 5 architectural
+        # backbone: "linear layers to project keys, values, and queries, followed by short
+        # convolution layers with size 4")
 
         self.key_conv = CausalDepthwiseConv1d(dim_inner * num_kv_per_token, short_conv_size) if short_conv_size > 0 else None
+        self.value_conv = CausalDepthwiseConv1d(dim_inner * num_kv_per_token, short_conv_size) if short_conv_size > 0 else None
         self.query_conv = CausalDepthwiseConv1d(dim_inner, short_conv_size) if short_conv_size > 0 else None
 
         self.store_with_lookahead_value = store_with_lookahead_value
@@ -1044,6 +1047,9 @@ class NeuralMemory(Module):
 
         if exists(self.key_conv):
             keys = self.key_conv(keys)
+
+        if exists(self.value_conv):
+            values = self.value_conv(values)
 
         # maybe multi head
 

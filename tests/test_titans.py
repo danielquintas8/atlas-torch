@@ -937,3 +937,84 @@ def test_atlas_adaptive_lr_affects_muon_update_magnitude():
         'cancelled by the scale-invariant Newton-Schulz normalization. η must be applied '
         'OUTSIDE NS-5 (paper Section 5, Eq (32)), not folded into the surprise as the grad loss weight.'
     )
+
+def test_value_conv_in_atlas_config():
+    """Paper Section 5 architectural backbone: keys, VALUES, and queries all get a
+    short causal conv (size 4) after their projections. The repo previously conv'd
+    only keys and queries — values went straight from projection to storage
+    (2026-09-01 audit)."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    assert mem.value_conv is not None, 'atlas_config (short_conv_size=4) must construct a value conv'
+
+    mem_no_conv = NeuralMemory(dim = 16, chunk_size = 8, **NeuralMemory.atlas_config(short_conv_size = 0))
+    assert mem_no_conv.value_conv is None
+
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert retrieved.shape == seq.shape
+    retrieved.sum().backward()
+    assert mem.value_conv.conv.weight.grad is not None, 'value conv must participate in the store path'
+
+def test_store_path_receives_outer_loop_grads_in_mac_geometry():
+    """N1 regression guard (2026-09-01 audit): in the shipped 170M geometry the
+    interleaved sequence (train ctx + longterm mem tokens) exceeded
+    neural_memory_batch_size, splitting storage into two segments, and
+    detach_segment_memory=True detached the first — so the learned memory init
+    (W0) received ZERO outer-loop gradient for the whole run (frozen at random
+    init; DDP find_unused_parameters=True masked the symptom) and store-side
+    params trained on only the trailing ~5% of tokens. The atlas config now
+    ships detach_segment_memory=False. This test reproduces the trigger
+    geometry at reduced size (interleaved 268 > batch_size 256 -> segments
+    [256, 12]) and pins both halves of the behavior."""
+    from titans_pytorch.mac_transformer import MemoryAsContextTransformer
+
+    def build_and_backward(detach):
+        torch.manual_seed(42)
+        mem_kwargs = NeuralMemory.atlas_config()
+        mem_kwargs.update(
+            dim_head = 8,
+            heads = 4,
+            use_sequential_scan = True,
+            default_step_transform_max_lr = 1e-1,
+            detach_segment_memory = detach,
+        )
+        model = MemoryAsContextTransformer(
+            num_tokens = 256,
+            dim = 32,
+            depth = 2,
+            segment_len = 64,
+            num_persist_mem_tokens = 4,
+            num_longterm_mem_tokens = 4,
+            neural_memory_layers = (1,),
+            neural_memory_segment_len = 8,
+            neural_memory_batch_size = 256,
+            use_flex_attn = False,
+            sliding_window_attn = True,
+            neural_memory_kwargs = mem_kwargs,
+        )
+        mem = next(layer[4] for layer in model.layers if layer[4] is not None)
+        x = torch.randint(0, 256, (1, 257))
+        loss = model(x, return_loss = True)
+        loss.backward()
+        return mem
+
+    # shipped config (detach off): the learned init and store-side params train
+
+    mem = build_and_backward(detach = False)
+    assert mem.memory_model_parameters[0].grad is not None, (
+        'learned memory init (W0) must receive outer-loop gradient with '
+        'detach_segment_memory=False — if this fails, the store path is starved again'
+    )
+    to_keys_weight = mem.to_keys.weight if isinstance(mem.to_keys, nn.Linear) else mem.to_keys[0].weight
+    assert to_keys_weight.grad is not None
+
+    # characterization: detach=True in this geometry silently freezes W0 —
+    # the reason the atlas training config must not re-enable it
+
+    mem_detached = build_and_backward(detach = True)
+    assert mem_detached.memory_model_parameters[0].grad is None, (
+        'expected detach_segment_memory=True to cut all outer-loop gradient to the '
+        'learned memory init in the two-segment geometry — if it now receives '
+        'gradient, the detach semantics changed and this guard needs re-derivation'
+    )
