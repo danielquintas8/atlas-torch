@@ -325,3 +325,108 @@ def test_write_train_val_split_crossing_shards(tmp_path):
     assert np.array_equal(val, np.arange(train_tokens, total, dtype = np.uint16))
     # shards consumed
     assert not any(os.path.exists(sp) for sp in shard_paths)
+
+
+def test_resume_data_position_roundtrip(tmp_path):
+    """The checkpoint records the data position (epochs_done /
+    yields_this_epoch) COUNTED by the training loop; resume_data_position
+    maps it back to (epoch_base, skip_chunks) whose stream continues the
+    uninterrupted one exactly. Recording — never inverting from step
+    counts — is the point: Accelerate's end-of-dataloader forced sync makes
+    each epoch's final optimization step consume fewer than grad_accum
+    yields, so `start_step * grad_accum` overcounted (delta review
+    2026-09-02: 2 yields off at toy scale, up to 121 at production
+    cadence). Covers mid-epoch, exactly-at-epoch-end (the clamp corner),
+    and past-boundary positions, plus the missing-fields fallback."""
+    from experiments.train import resume_data_position
+
+    n_chunks, seq_len, chunks_per_yield = 64, 16, 4
+    bin_path = str(tmp_path / "data.bin")
+    _write_bin(path = bin_path, n_chunks = n_chunks, chunk_len = seq_len + 1)
+    seed = 7
+
+    def consume(n_yields):
+        ds = MemmapTokenDataset(
+            bin_path = bin_path, seq_len = seq_len, shuffle = True, seed = seed,
+        )
+        it = iter(ds)
+        epochs_done, yields_this_epoch = 0, 0
+        yields = []
+        while len(yields) < n_yields:
+            batch = []
+            for _ in range(chunks_per_yield):
+                try:
+                    batch.append(int(next(it)[0]))
+                except StopIteration:
+                    epochs_done += 1
+                    yields_this_epoch = 0
+                    it = iter(ds)
+                    batch.append(int(next(it)[0]))
+            yields.append(list(batch))
+            yields_this_epoch += 1
+        return yields, epochs_done, yields_this_epoch
+
+    total_positions = [
+        9,        # mid-epoch 0
+        16,       # exactly at epoch 0's end (clamp corner: 16*4 == n_chunks)
+        22,       # past the boundary, mid-epoch 1
+    ]
+    horizon = 40
+    reference, _, _ = consume(horizon)
+
+    for stop_at in total_positions:
+        _, epochs_done, yields_this_epoch = consume(stop_at)
+        meta = dict(epochs_done = epochs_done, yields_this_epoch = yields_this_epoch)
+        epoch_base, skip_chunks, exact = resume_data_position(
+            resume_meta = meta, n_chunks = n_chunks, chunks_per_yield = chunks_per_yield,
+        )
+        assert exact
+
+        # resumed stream must equal the uninterrupted continuation exactly
+        ds = MemmapTokenDataset(
+            bin_path = bin_path, seq_len = seq_len, shuffle = True,
+            seed = seed, epoch_base = epoch_base, skip_chunks = skip_chunks,
+        )
+        it = iter(ds)
+        resumed = []
+        while len(resumed) < horizon - stop_at:
+            batch = []
+            for _ in range(chunks_per_yield):
+                try:
+                    batch.append(int(next(it)[0]))
+                except StopIteration:
+                    it = iter(ds)
+                    batch.append(int(next(it)[0]))
+            resumed.append(batch)
+
+        assert resumed == reference[stop_at:horizon], (
+            f"stop_at={stop_at}: resumed stream diverged "
+            f"(epoch_base={epoch_base}, skip_chunks={skip_chunks})"
+        )
+
+    # liveness: a deliberately wrong position must NOT match
+    _, epochs_done, yields_this_epoch = consume(9)
+    wrong_meta = dict(epochs_done = epochs_done, yields_this_epoch = yields_this_epoch + 1)
+    eb, sc, _ = resume_data_position(
+        resume_meta = wrong_meta, n_chunks = n_chunks, chunks_per_yield = chunks_per_yield,
+    )
+    ds = MemmapTokenDataset(
+        bin_path = bin_path, seq_len = seq_len, shuffle = True,
+        seed = seed, epoch_base = eb, skip_chunks = sc,
+    )
+    first_wrong = [int(next(iter(ds))[0])]
+    assert first_wrong != [reference[9][0]], "comparator cannot detect a wrong seek"
+
+    # at-epoch-end positions roll over at construction — an empty first pass
+    # must never reach the dispatcher (its main process would broadcast a
+    # None batch and crash; probe-proven 2026-09-02)
+    assert resume_data_position(
+        resume_meta = dict(epochs_done = 0, yields_this_epoch = 16),
+        n_chunks = n_chunks,
+        chunks_per_yield = chunks_per_yield,
+    ) == (1, 0, True)
+
+    # missing recorded fields -> inexact epoch-0 restart
+    assert resume_data_position(
+        resume_meta = dict(step = 5), n_chunks = n_chunks, chunks_per_yield = chunks_per_yield,
+    ) == (0, 0, False)

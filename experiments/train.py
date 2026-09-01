@@ -297,14 +297,17 @@ def build_param_groups(model, weight_decay):
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(accelerator, step, output_dir, schedule_meta):
+def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position):
     """Save accelerate state + meta.pt marking the checkpoint complete.
 
     meta.pt is written by the main process AFTER a barrier, so its presence
     marks a fully-written checkpoint (all ranks done) — prune_checkpoints
     only counts dirs that have it. It carries the schedule-shape fields
     (warmup_steps, schedule_steps, batch_tokens, grad_accum, world_size) so
-    resume can refuse a run whose shape silently changed.
+    resume can refuse a run whose shape silently changed, and the exact data
+    position (epochs_done, yields_this_epoch) counted by the training loop —
+    resume maps it straight back to (epoch_base, skip_chunks), see
+    resume_data_position.
     """
     ckpt_dir = os.path.join(output_dir, f"step-{step}")
     accelerator.save_state(ckpt_dir)
@@ -312,15 +315,57 @@ def save_checkpoint(accelerator, step, output_dir, schedule_meta):
     if accelerator.is_main_process:
         meta = dict(step=step)
         meta.update(schedule_meta)
+        meta.update(data_position)
         torch.save(meta, os.path.join(ckpt_dir, "meta.pt"))
     accelerator.print(f"Checkpoint saved → {ckpt_dir}")
 
 
 def read_checkpoint_meta(resume_dir):
     """Read meta.pt without touching accelerate (usable before Accelerator)."""
-    return torch.load(
-        os.path.join(resume_dir, "meta.pt"), map_location="cpu", weights_only=True
-    )
+    meta_path = os.path.join(resume_dir, "meta.pt")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"checkpoint incomplete — {meta_path} missing (killed mid-save?); "
+            f"resume from an older step-* directory"
+        )
+    return torch.load(meta_path, map_location="cpu", weights_only=True)
+
+
+def resume_data_position(resume_meta, n_chunks, chunks_per_yield):
+    """Map a checkpoint's recorded data position to (epoch_base, skip_chunks).
+
+    The position is RECORDED at save time (epochs_done / yields_this_epoch,
+    counted by the training loop) — never inverted from step counts.
+    Accelerate's GradientState.sync_with_dataloader forces an optimizer step
+    on each epoch's final micro-batch group, so steps do not uniformly
+    consume grad_accum yields, and the dispatcher's ceil-with-padding yield
+    count exceeds n_chunks // chunks_per_yield; a step-derived seek was
+    measured 2 yields off at toy scale and up to 121 yields (~496K tokens)
+    off at the production save cadence (2026-09-02).
+
+    Returns (epoch_base, skip_chunks, exact). exact=False when the recorded
+    fields are missing (pre-recording meta.pt): the caller restarts the data
+    stream at epoch 0 — exactness is impossible for such checkpoints.
+
+    A checkpoint saved on an epoch's final yield records a position at or
+    past the epoch's end (with a trailing partial/padded yield,
+    yields_this_epoch * chunks_per_yield can exceed n_chunks). That rolls
+    over to (epochs_done + 1, 0) HERE, at construction — an empty first
+    pass must never reach the dispatcher, whose main process would
+    broadcast a None batch and crash (probe-proven 2026-09-02). The only
+    remaining approximation is the padding CONTENT inside a trailing
+    partial yield (at most one yield of gradient content, never a stream
+    misalignment).
+    """
+    if "epochs_done" not in resume_meta or "yields_this_epoch" not in resume_meta:
+        return 0, 0, False
+
+    epoch_base = resume_meta["epochs_done"]
+    skip_chunks = resume_meta["yields_this_epoch"] * chunks_per_yield
+    if skip_chunks >= n_chunks:
+        epoch_base += 1
+        skip_chunks = 0
+    return epoch_base, skip_chunks, True
 
 
 def prune_checkpoints(accelerator, output_dir, keep):
@@ -523,31 +568,32 @@ def main():
 
     # Data — on resume the stream SEEKS instead of read-and-discarding:
     # permutations are a pure function of seed + epoch (MemmapTokenDataset),
-    # so the resumed position is reconstructed from (a) epoch_base = full
-    # epochs already consumed, (b) skip_chunks = chunks consumed within the
-    # current epoch. The dispatcher consumes per_device_batch_size * world
-    # chunks per per-rank yield. Approximation: a resume that falls inside an
-    # epoch's trailing partial-batch region (drop_last=False padding) is off
-    # by at most one batch.
+    # and the position comes from the checkpoint's RECORDED counters
+    # (epochs_done / yields_this_epoch) — see resume_data_position for why it
+    # must never be inverted from step counts.
     data_dir = args.data_dir or train_cfg["dataset"]
     epoch_base, skip_chunks = 0, 0
     train_bin = os.path.join(data_dir, "train.bin")
     if start_step > 0 and os.path.exists(train_bin):
         n_chunks = os.path.getsize(train_bin) // ((seq_len + 1) * 2)
         chunks_per_yield = args.per_device_batch_size * num_gpus
-        yields_per_epoch = n_chunks // chunks_per_yield
-        assert yields_per_epoch > 0, (
-            f"train.bin holds {n_chunks} chunks — fewer than one "
-            f"{chunks_per_yield}-chunk yield"
+        epoch_base, skip_chunks, exact = resume_data_position(
+            resume_meta=resume_meta,
+            n_chunks=n_chunks,
+            chunks_per_yield=chunks_per_yield,
         )
-        total_yields = start_step * grad_accum
-        epoch_base, yields_within = divmod(total_yields, yields_per_epoch)
-        assert yields_within < yields_per_epoch
-        skip_chunks = yields_within * chunks_per_yield
-        accelerator.print(
-            f"Resume data seek: epoch {epoch_base}, skipping {skip_chunks} chunks "
-            f"({yields_within}/{yields_per_epoch} yields into the epoch)"
-        )
+        if exact:
+            accelerator.print(
+                f"Resume data seek: epoch {epoch_base}, skipping {skip_chunks} "
+                f"of {n_chunks} chunks"
+            )
+        else:
+            accelerator.print(
+                "WARNING: checkpoint meta.pt lacks the recorded data position "
+                "(epochs_done / yields_this_epoch) — restarting the data "
+                "stream at epoch 0; exact resume is impossible for this "
+                "checkpoint"
+            )
     elif start_step > 0:
         accelerator.print(
             "Streaming dataset: resume restarts the stream (no seek support)"
@@ -670,6 +716,16 @@ def main():
     # initialized before the loop: a requeued job resuming at/after max_steps
     # never runs the body, and the closing print still reads tokens_total
     tokens_total = start_step * batch_tokens
+    # data-position counters, recorded into every checkpoint's meta.pt and
+    # mapped straight back to (epoch_base, skip_chunks) on resume. Counted
+    # here — never derived from step counts: the end-of-dataloader forced
+    # sync makes each epoch's final step consume fewer than grad_accum
+    # yields. Initialized from the SEEK RESULT (single source of truth —
+    # resume_data_position may have rolled an at-epoch-end position over to
+    # the next epoch), so the counters always describe the stream position
+    # the dataset was actually built with.
+    epochs_done = epoch_base
+    yields_this_epoch = skip_chunks // (args.per_device_batch_size * num_gpus)
     running_loss = torch.zeros((), device=accelerator.device)
     loss_count = 0
     t0 = time.time()
@@ -678,8 +734,15 @@ def main():
         try:
             batch = next(train_iter)
         except StopIteration:
+            # dispatcher landmine: an ABANDONED mid-pass iterator does not
+            # advance the dispatcher's iteration counter, so the next iter()
+            # would replay the SAME epoch permutation from the start. Only
+            # ever recreate the iterator here, after natural exhaustion.
+            epochs_done += 1
+            yields_this_epoch = 0
             train_iter = iter(train_loader)
             batch = next(train_iter)
+        yields_this_epoch += 1
 
         with accelerator.accumulate(model):
             loss = model(batch, return_loss=True)
@@ -776,6 +839,9 @@ def main():
                 step=global_step,
                 output_dir=output_dir,
                 schedule_meta=schedule_meta,
+                data_position=dict(
+                    epochs_done=epochs_done, yields_this_epoch=yields_this_epoch
+                ),
             )
             prune_checkpoints(
                 accelerator=accelerator,
@@ -789,6 +855,9 @@ def main():
         step=global_step,
         output_dir=output_dir,
         schedule_meta=schedule_meta,
+        data_position=dict(
+            epochs_done=epochs_done, yields_this_epoch=yields_this_epoch
+        ),
     )
     prune_checkpoints(
         accelerator=accelerator, output_dir=output_dir, keep=args.keep_checkpoints
