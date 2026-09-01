@@ -61,7 +61,11 @@ MAC_DEFAULTS = dict(
     ff_mult=4,
     sliding_window_attn=True,
     use_flex_attn=True,
-    neural_memory_batch_size=1024,  # larger = fewer segments = less retained memory with detach_segment_memory
+    neural_memory_batch_size=1024,  # segment length at which the memory's base weights advance
+                                    # (the paper's chunk-size-b analog, Section 3.3) — so it also
+                                    # shapes eval-time semantics at long contexts. NOTE: with
+                                    # detach_segment_memory the retained store graph is the LAST
+                                    # segment, so larger batch_size = MORE retained memory, not less.
 )
 
 # ---------------------------------------------------------------------------
@@ -88,7 +92,16 @@ MEMORY_CONFIGS = {
         default_step_transform_max_lr=1e-1,
         per_parameter_lr_modulation=True,
         use_accelerated_scan=False,
-        detach_segment_memory=True, # truncated outer-loop backprop across segments (memory optimization)
+        detach_segment_memory=False,  # MUST stay False for training (fixed 2026-09-01): with
+                                      # train ctx 1024 the interleaved sequence (1084 tokens)
+                                      # splits at neural_memory_batch_size=1024 into [1024, 60]
+                                      # and detach cut segment 0's store graph — the learned
+                                      # memory init got ZERO outer-loop gradient (frozen at
+                                      # random init) and store-side params trained on only the
+                                      # last ~60 tokens. full backprop retains the full store
+                                      # graph: run a BSC memory smoke before the next training
+                                      # launch. the flag remains available for seq_len >>
+                                      # batch_size experiments where truncated BPTT is intended.
         use_sequential_scan=True,  # O(1) memory scan instead of O(n log n) parallel scan
     ),
 }
