@@ -539,11 +539,121 @@ def test_omega_context_partial_window():
     assert seq.shape == retrieved.shape
     retrieved.sum().backward()
 
-def test_omega_context_exceeds_chunk_raises():
-    """omega_context > chunk_size must raise assertion error"""
-    import pytest
-    with pytest.raises(AssertionError):
-        NeuralMemory(dim = 16, chunk_size = 4, omega_context = 8)
+def _omega_window_reference(g, gates, c):
+    """Brute-force reference for the omega window (paper Section 3.2, Eq 9):
+    G_i = sum_{k=0}^{c-1} gamma_k^(i) * grad[i - (c-1-k)], zero outside the segment.
+    g: (B, T, *weight_shape), gates: (B, T, c). Loop implementation on purpose —
+    any vectorization shortcut could share a bug with the code under test."""
+    out = torch.zeros_like(g)
+    seq_len = g.shape[1]
+    for i in range(seq_len):
+        for k in range(c):
+            j = i - (c - 1 - k)
+            if j < 0:
+                continue
+            gamma = gates[:, i, k].reshape(-1, *([1] * (g.ndim - 2)))
+            out[:, i] += g[:, j] * gamma
+    return out
+
+def test_omega_window_matches_reference():
+    """apply_omega_window must equal the brute-force paper equation exactly.
+    Value-level regression for the non-sliding-window bug (found 2026-09-01):
+    the pre-fix slice direction returned every gradient to its original index,
+    reducing the omega rule to a per-position gate-sum LR multiplier with zero
+    cross-token mixing. Shape tests cannot catch this class of bug."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    torch.manual_seed(0)
+    c = 8
+    g = torch.randn(3, 20, 4, 5, dtype = torch.float64)
+    gates = torch.rand(3, 20, c, dtype = torch.float64)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+    ref = _omega_window_reference(g = g, gates = gates, c = c)
+
+    assert torch.allclose(out, ref, atol = 1e-12)
+
+def test_omega_window_impulse_slides():
+    """An impulse gradient at token 0 with all-ones gates must appear in the
+    window of every one of the next c positions — the defining property of a
+    sliding window. The pre-fix code produced [1, 0, ..., 0]."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    c = 8
+    g = torch.zeros(1, c, 1, 1)
+    g[0, 0] = 1.
+    gates = torch.ones(1, c, c)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+
+    assert torch.allclose(out.flatten(), torch.ones(c)), (
+        f'impulse at token 0 must reach all {c} window positions, got {out.flatten().tolist()}'
+    )
+
+def test_omega_window_crosses_chunk_boundary():
+    """The window must mix gradients across vmap-chunk boundaries — all chunks in
+    a store segment share the same segment-start base weights, so this mixing is
+    exact, not an approximation. Also asserts store_memories hands
+    apply_omega_window the full segment token axis, not per-chunk blocks."""
+    from tensordict import TensorDict
+    import titans_pytorch.neural_memory as nm
+
+    # unit level: impulse at position 3 with c=4 must propagate into positions
+    # 4, 5, 6 (the old chunk_size=4 boundary sat between 3 and 4)
+    c = 4
+    g = torch.zeros(1, 8, 1, 1)
+    g[0, 3] = 1.
+    gates = torch.ones(1, 8, c)
+    out = nm.apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w'].flatten()
+    assert torch.allclose(out[3:7], torch.ones(4)), 'impulse must appear in the next c-1 positions across the chunk boundary'
+    assert torch.allclose(out[[0, 1, 2, 7]], torch.zeros(4))
+
+    # integration level: grads reach the window with the full token axis
+    seen_token_dims = []
+    orig = nm.apply_omega_window
+
+    def spy(grads, context_gates, omega_context):
+        seen_token_dims.append(next(iter(grads.values())).shape[1])
+        return orig(grads = grads, context_gates = context_gates, omega_context = omega_context)
+
+    nm.apply_omega_window = spy
+    try:
+        mem = NeuralMemory(dim = 16, chunk_size = 4, omega_context = 4)
+        seq = torch.randn(2, 32, 16)
+        retrieved, _ = mem(seq)
+    finally:
+        nm.apply_omega_window = orig
+
+    assert seen_token_dims == [32], (
+        f'expected the window to see the full 32-token segment axis, got {seen_token_dims}'
+    )
+
+def test_omega_context_exceeds_chunk_size():
+    """omega_context may exceed the vmap chunk size — the window lives on the
+    segment token axis, not the chunk axis. Previously asserted out."""
+    mem = NeuralMemory(dim = 16, chunk_size = 4, omega_context = 8)
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_omega_window_context_longer_than_segment():
+    """Window size c larger than the segment token count: taps reaching before
+    the segment start contribute zeros (the offset >= num_tokens guard)."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    torch.manual_seed(1)
+    c, seq_len = 16, 8
+    g = torch.randn(2, seq_len, 3, dtype = torch.float64)
+    gates = torch.rand(2, seq_len, c, dtype = torch.float64)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+    ref = _omega_window_reference(g = g, gates = gates, c = c)
+
+    assert torch.allclose(out, ref, atol = 1e-12)
 
 def test_omega_with_momentum_backward():
     """omega rule + momentum must support gradient flow"""

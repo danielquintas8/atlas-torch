@@ -237,9 +237,14 @@ def apply_omega_window(
 
     where the γ gates are input-dependent (c learned weights per position).
 
+    Operates on the full per-segment token axis: all per-token gradients within a
+    store segment are taken at the same segment-start weights, so the window mixes
+    gradients across vmap-chunk boundaries and truncates (zero-pads) only at the
+    segment start.
+
     Args:
-        grads: per-token gradients; each value has shape (bhn, chunk_size, *weight_shape).
-        context_gates: gamma gates, shape (bhn, chunk_size, omega_context).
+        grads: per-token gradients; each value has shape (bh, n_tokens, *weight_shape).
+        context_gates: gamma gates, shape (bh, n_tokens, omega_context).
         omega_context: sliding window size c.
 
     Returns:
@@ -248,19 +253,26 @@ def apply_omega_window(
     windowed_grads = TensorDict()
 
     for name, g in grads.items():
-        # g: (bhn, chunk_size, *weight_shape)
+        # g: (bh, n_tokens, *weight_shape)
         windowed = torch.zeros_like(g)
+        num_tokens = g.shape[1]
 
         for k in range(omega_context):
             offset = omega_context - 1 - k  # k=0 → oldest (largest shift), k=c-1 → newest (no shift)
-            gamma_k = context_gates[..., k]  # (bhn, chunk_size)
+
+            if offset >= num_tokens:
+                # window tap reaches entirely before the segment start — contributes nothing
+                continue
+
+            gamma_k = context_gates[..., k]  # (bh, n_tokens)
 
             if offset == 0:
                 shifted = g
             else:
-                # shift right by `offset` along the chunk (time) axis, zero-pad the start
+                # shift right by `offset` along the token (time) axis: position i receives
+                # grad[i - offset], zero-padded at the segment start
                 shifted = F.pad(
-                    g[:, offset:],
+                    g[:, :-offset],
                     (0,) * (2 * (g.ndim - 2)) + (offset, 0)
                 )
 
@@ -532,7 +544,7 @@ class NeuralMemory(Module):
         muon_ns_eps = 1e-7,
         polynomial_degree: int | None = None,
         poly_project_back = True,
-        omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. must be <= store_chunk_size.
+        omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. window truncates at neural-memory batch (segment) boundaries.
         per_token_retrieve: bool = False,  # per-token retrieve: each y_t = M_t(q_t) using per-token weights from Eq 41. requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
         short_conv_size: int = 0,  # causal depthwise conv on keys/queries (paper p.13, kernel size). 0 = disabled.
         detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
@@ -855,14 +867,15 @@ class NeuralMemory(Module):
         self.omega_context = omega_context
 
         if omega_context > 1:
-            assert omega_context <= self.store_chunk_size, \
-                f'omega_context ({omega_context}) must be <= chunk_size ({self.store_chunk_size})'
-
             # NOTE: the paper's M_s mask (Section 3.3) is a banded lower-triangular matrix
-            # that enforces which tokens fall within each position's window. In our implementation,
-            # this hard boundary is implicitly enforced by zero-padding in the shift-based gamma
-            # gate computation — tokens outside the window produce zero-padded shifted gradients,
-            # so no explicit M_s buffer is needed.
+            # selecting which token gradients fall inside each position's window. here the
+            # band is realized by shifting the per-token gradients along the segment token
+            # axis and zero-padding at the segment start — see apply_omega_window. the window
+            # crosses vmap-chunk boundaries (all chunks in a segment share the same base
+            # weights) and truncates only at neural-memory batch (segment) boundaries, the
+            # analog of the paper's chunk-size-b truncation. during incremental decoding the
+            # store flushes every chunk_size tokens, so windows also truncate at those flush
+            # boundaries — a parallel-vs-incremental mismatch inherited from the store cache.
 
             # learned per-window-position context gates γ_i^(t) (Section 3.2, page 8)
             # for each position t, produces c gates ∈ [0,1] weighting each token in the window
@@ -1121,26 +1134,27 @@ class NeuralMemory(Module):
         # get grads and extra auxiliary loss
 
         if use_omega:
-            # omega rule: per-token gradients within each chunk, all w.r.t. same M_{t'}
-            # then apply sliding window mask M_s (Section 3.3)
+            # omega rule: per-token gradients within each vmap chunk, all w.r.t. the same
+            # segment-start weights, then the gamma-weighted sliding window (Sections 3.2-3.3)
 
             grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, store_mask_weight if apply_eta_outside else adaptive_lr, values)
 
             grads = TensorDict(grads)
             # grads shape: (batch*heads*num_chunks, chunk_size, *weight_shape)
 
+            # reshape to (bh, num_tokens, ...) BEFORE windowing. every chunk in this segment
+            # shares the same base weights (weights_for_surprise is a repeat), so the window
+            # may mix gradients across vmap-chunk boundaries; it truncates only at segment
+            # boundaries — the analog of the paper's chunk-size-b truncation in Section 3.3.
+            # the momentum/decay scan below also runs per-position (Eqs (34)-(39))
+            grads = rearrange_dict_values(grads, '(b n) c ... -> b (n c) ...', b = batch * heads)
+
             # gamma gates: c learned weights per position, input-dependent
             omega_c = self.omega_context
             context_gates = self.to_context_gates(seq).sigmoid()  # (bh, num_tokens, c)
-            context_gates = rearrange(context_gates, 'bh (n b) c -> (bh n) b c', b = chunk_size)
-            # context_gates: (bh*num_chunks, chunk_size, omega_context)
 
             # apply the gamma-weighted sliding window (Section 3.2, Eq 9)
-            grads = apply_omega_window(grads, context_gates, omega_c)
-
-            # reshape from (bh*num_chunks, chunk_size, ...) to (bh, num_tokens, ...)
-            # so momentum/decay scan runs per-position (Eqs (34)-(39))
-            grads = rearrange_dict_values(grads, '(b n) c ... -> b (n c) ...', b = batch * heads)
+            grads = apply_omega_window(grads = grads, context_gates = context_gates, omega_context = omega_c)
 
             # surprises
             adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
