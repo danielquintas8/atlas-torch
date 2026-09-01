@@ -1,6 +1,6 @@
 # Atlas-Torch
 
-First open-source implementation of [ATLAS: Learning to Optimally Memorize the Context at Test Time](https://arxiv.org/abs/2505.23735) (Behrouz et al., 2025), built on top of [lucidrains' titans-pytorch](https://github.com/lucidrains/titans-pytorch) (commit `714a14c`, preserved on the `titans-torch` branch).
+An open-source implementation of [ATLAS: Learning to Optimally Memorize the Context at Test Time](https://arxiv.org/abs/2505.23735) (Behrouz et al., 2025), built on top of [lucidrains' titans-pytorch](https://github.com/lucidrains/titans-pytorch) (commit `714a14c`, preserved on the `titans-torch` branch).
 
 It is a working, paper-faithful port. The three Atlas additions (the Omega Rule, polynomial feature mapping, and Muon-style spectral normalization) are implemented and checked against the paper, with runtime tests in `tests/test_titans.py` that assert the paper-mandated transformations actually fire. Several correctness bugs in the underlying memory code are also fixed. The table below lists exactly what was added and what was fixed.
 
@@ -25,7 +25,7 @@ What this does not do for free is retain. The decay gate means the memory adapts
 | Polynomial Features | `neural_memory.py` | `PolynomialFeatures` class — exact monomial expansion via `combinations_with_replacement`, learnable coefficients (1/d!), optional `project_back` (Section 3.1) |
 | Omega Rule | `neural_memory.py` | Per-token gradients via nested `vmap(vmap(grad))`, gamma-weighted sliding window with learned context gates, per-position momentum/decay scan (Sections 3.2-3.3) |
 | Muon / Newton-Schulz | `neural_memory.py` | `newtonschulz5()` — 5-iteration spectral normalization on surprise updates (Section 5, Eq 32) |
-| Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/queries (paper p.13, Figure 3) |
+| Short Convolution | `neural_memory.py` | `CausalDepthwiseConv1d` — causal depthwise conv (kernel=4) on keys/values/queries (paper Section 5 architectural backbone) |
 | Sequential Scan | `neural_memory.py` | O(1) forward memory alternative to parallel AssocScan for momentum/decay |
 | Detach Segment Memory | `neural_memory.py` | Truncated outer-loop backprop across segments — standard TTT approximation for memory efficiency |
 | `atlas_config()` | `neural_memory.py` | Convenience classmethod returning recommended Atlas defaults |
@@ -38,6 +38,8 @@ What this does not do for free is retain. The decay gate means the memory adapts
 | O(n²) autograd memory | `neural_memory.py` | Replace incremental `cat` in `accum_updates` with single-cat — reduces autograd memory from O(segments²) to O(segments) |
 | Conv empty sequence | `neural_memory.py` | Guard `CausalDepthwiseConv1d` against 0-length input during autoregressive inference |
 | Omega incompatibility guards | `neural_memory.py` | Assertions preventing omega with `num_kv_per_token > 1` or `store_with_lookahead_value` |
+| Omega window slide | `neural_memory.py` | Fixed shifted-gradient slice direction (2026-09-01): pre-fix, the window collapsed to a per-position gate multiplier with no cross-token mixing; now guarded by value-level tests against a brute-force reference of the paper equation |
+| Store-path gradient starvation | `experiments/configs.py` | `detach_segment_memory` off in the training config (2026-09-01): with the interleaved sequence exceeding `neural_memory_batch_size`, detach froze the learned memory init and cut store-side params off from most outer-loop gradient |
 
 ### Configuration
 

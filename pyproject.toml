@@ -1,7 +1,7 @@
 [project]
 name = "atlas-torch"
 version = "0.1.0"
-description = "First open-source implementation of Atlas (Behrouz et al. 2025), built on lucidrains' titans-pytorch"
+description = "Open-source implementation of Atlas (Behrouz et al. 2025), built on lucidrains' titans-pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" },
     { name = "Daniel Quintas", email = "daniel.quintas.lopes@gmail.com" }

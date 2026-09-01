@@ -47,12 +47,6 @@ def profile_omega_memory(
     if not torch.cuda.is_available():
         raise SystemExit("This profiler requires a CUDA device.")
 
-    if omega_context > chunk_size:
-        raise SystemExit(
-            f"omega_context ({omega_context}) must be <= chunk_size ({chunk_size}); "
-            f"pass --chunk-size {omega_context} or larger."
-        )
-
     if dim % heads != 0:
         raise SystemExit(
             f"dim ({dim}) must be divisible by heads ({heads}) so dim_head = dim // heads is exact."

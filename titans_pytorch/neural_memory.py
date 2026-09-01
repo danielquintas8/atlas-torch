@@ -288,8 +288,8 @@ def apply_omega_window(
     return windowed_grads
 
 
-# short causal depthwise convolution on keys/queries (paper p.13)
-# provides local mixing before memory read/write
+# short causal depthwise convolution on keys/values/queries (paper Section 5
+# architectural backbone) — provides local mixing before memory read/write
 
 class CausalDepthwiseConv1d(Module):
     def __init__(self, channels, kernel_size = 4):
@@ -317,12 +317,13 @@ class PolynomialFeatures(Module):
     leading-order kernel piece and must be included for the Taylor-softmax
     motivation to hold.
 
-    Note: the paper's φ* (Eq 22) instead scales each degree by 1/√(d!) — a
-    per-side coefficient that exists only so the bilinear φ*(q)·φ*(k) squares
-    back to the 1/d! Taylor coefficient, since (1/√d!)² = 1/d!. Atlas reads
-    M(φ(q)) from an MLP, not a dot product, so there is no second φ factor to
-    square, and the single-sided Eq (5) value 1/d! is correct here. (Moot in
-    practice: the coefficient is learnable and absorbed by the downstream linear.)
+    Note: the paper's φ* (the exponential feature map in the DeepTransformers
+    section) instead scales each degree by 1/√(d!) — a per-side coefficient that
+    exists only so the bilinear φ*(q)·φ*(k) squares back to the 1/d! Taylor
+    coefficient, since (1/√d!)² = 1/d!. Atlas reads M(φ(q)) from an MLP, not a
+    dot product, so there is no second φ factor to square, and the single-sided
+    1/d! value is correct here. (Moot in practice: the coefficient is learnable
+    and absorbed by the downstream linear.)
 
     For each degree d ≥ 1 the feature is the multiset of distinct monomials
     x_{i_1} … x_{i_d} (combinations_with_replacement) — symmetric monomials,
@@ -369,12 +370,16 @@ class PolynomialFeatures(Module):
         self.coefficients = Parameter(torch.tensor(coefficients))
 
         # project_back=True: compresses the full O(d^p)-dim φ(k) back to `dim` via a learned
-        #   linear, keeping the memory MLP architecture unchanged. PAPER-DEVIATING — collapses
-        #   Proposition 2's capacity argument since the MLP only ever sees a `dim`-rank
-        #   compression of φ(k) instead of φ(k) itself.
-        # project_back=False: feeds the full expanded_dim directly into the memory MLP. Paper-
-        #   faithful per Eq (56) (M(φ(k))). Requires the surrounding NeuralMemory to construct
-        #   a memory_model with input dim = self.expanded_dim.
+        #   linear, keeping the memory MLP architecture unchanged. PAPER-DEVIATING — the MLP
+        #   only ever sees a rank-≤`dim` linear compression of φ(k) (measured 2026-09-01:
+        #   rank 48 vs 1225 at dim=48, degree=2), so Proposition 2's O(d_k^p) capacity bound
+        #   does NOT apply on this path. What survives is the learnable per-degree
+        #   coefficients acting as input feature gating (Section 3.1's gating
+        #   interpretation) plus a fixed nonlinear expansion — a nonlinearity, not capacity.
+        # project_back=False: feeds the full expanded_dim directly into the memory MLP —
+        #   the paper's literal M(φ(k)), preserving the capacity argument. Requires the
+        #   surrounding NeuralMemory to construct a memory_model with input dim =
+        #   self.expanded_dim.
 
         self.projection = LinearNoBias(self.expanded_dim, dim) if project_back else None
 
@@ -476,25 +481,37 @@ class NeuralMemory(Module):
     @classmethod
     def atlas_config(cls, **overrides):
         """Returns kwargs for Atlas-style configuration.
-        Momentum and Muon: Section 5, Eq (32)-(33) (Appendix D.4, Eq (57)-(58)).
-        omega_context=8 is our default; Figure 5 shows the effect of window size c (the paper names no single optimum).
+        Momentum and Muon follow the model definition in paper Section 5: the
+        gamma-gated windowed gradient feeds the momentum, Newton-Schulz
+        orthogonalizes the momentum, and the adaptive lr η scales the result
+        OUTSIDE Newton-Schulz. The paper contradicts itself here — its appendix
+        ("Detailed Formulations of All Architectures") folds per-token η inside
+        the momentum instead — but Section 5 is the model-defining section and
+        matches standard Muon semantics (lr outside the orthogonalization), so
+        this repo follows Section 5.
+        omega_context=8 is our default; the paper shows the effect of window
+        size c without naming a single optimum.
         polynomial_degree=2 — paper does not specify exact degree.
-        poly_project_back=True is the documented production tradeoff. Strict
-        Eq (56) reading is`M(φ(k))` with the MLP consuming `expanded_dim`
+        poly_project_back=True is the documented production tradeoff. The
+        strict reading is M(φ(k)) with the MLP consuming `expanded_dim`
         directly (project_back=False), but Phase 0 OOM evidence (job
         40049757) showed the omega-windowed gradient accumulation saturates
         a single H100 at 64 GB on the 170M / seq_len=1024 / chunk_size=8
         config — the asymmetric MLP path is not viable at this scale without
         FSDP/model parallelism. With project_back=True the polynomial
         features still feed φ(k) → learned linear → dim_head into the MLP,
-        retaining the Taylor-init learnable coefficients but capping
-        effective capacity at O(dim_hidden). Treat the project_back=False
-        path as a Phase 3+ scaling question (see GitHub issue #17).
-        per_token_retrieve=True is paper-faithful: the per-token weight state is Eq (41)
-        (M_t = M_{t-1} + S'_t) and the read is Eq (42); the paper has no standalone
-        y_t = M_t(q_t) equation. Appendix D.4 is the per-token Atlas form. Retrieval at every token using
-        the per-token memory state. Disabling this falls back to a per-chunk
-        retrieve approximation that is structurally Titans-grade, not Atlas.
+        retaining the Taylor-init learnable coefficients, but the MLP sees a
+        rank-≤dim_head compression of φ(k), so Proposition 2's O(d_k^p)
+        capacity bound does not apply on this path. Treat project_back=False
+        as a Phase 3+ scaling question (see GitHub issue #17).
+        per_token_retrieve=True is paper-faithful: the appendix per-token
+        formulation ("Detailed Formulations of All Architectures") updates the
+        memory with token t and reads y_t = M_t(q_t) with the post-update
+        state; retrieval happens at every token using the per-token weight
+        state. Disabling it falls back to a per-chunk retrieve approximation
+        that is structurally Titans-grade, not Atlas.
+        short_conv_size=4 applies the short causal conv to keys, values, and
+        queries per Section 5's architectural backbone.
         """
         defaults = dict(
             momentum = True,
