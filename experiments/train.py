@@ -23,8 +23,9 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset
 
-from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed
+# accelerate is imported lazily inside main() (same pattern as datasets /
+# transformers in load_data) so unit tests can import MemmapTokenDataset and
+# cosine_with_warmup from this module in environments without accelerate.
 
 # allow running from repo root: `python experiments/train.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,7 +42,13 @@ class MemmapTokenDataset(IterableDataset):
     """Pre-tokenized binary data (from experiments/data/prepare.py).
 
     Reads uint16 memmap, yields (seq_len + 1,) int64 chunks.
-    Shards by rank for multi-GPU — each GPU sees a disjoint subset.
+
+    Deliberately does NOT self-shard by rank. Multi-GPU distribution is owned
+    by Accelerate's dataloader dispatch: a single reader on the main process
+    iterates this dataset and slices batches across ranks. Rank striding here
+    combined with that dispatch double-sharded the data — only the main
+    process's 1/world_size shard was ever read, cutting effective epochs to
+    a quarter on 4 GPUs (found 2026-09-01). Do not reintroduce it.
     """
 
     def __init__(self, bin_path, seq_len, shuffle=True):
@@ -51,16 +58,12 @@ class MemmapTokenDataset(IterableDataset):
         self.shuffle = shuffle
 
     def __iter__(self):
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-
+        # fresh permutation per epoch (per __iter__ call), driven by the
+        # process-global `random` state seeded once via set_seed
         indices = list(range(self.n_chunks))
         if self.shuffle:
             import random
             random.shuffle(indices)
-
-        # shard by rank so each GPU gets unique data
-        indices = indices[rank::world_size]
 
         for idx in indices:
             start = idx * self.chunk_len
@@ -174,12 +177,30 @@ def parse_args():
     p.add_argument("--seq-len", type=int, default=None, help="Override training sequence length")
     p.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps")
     p.add_argument("--peak-lr", type=float, default=None, help="Override peak learning rate")
-    p.add_argument("--warmup-steps", type=int, default=None, help="Override warmup steps (0 to skip warmup)")
+    p.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="Override warmup steps (schedule shape). On resume the restored "
+        "scheduler step counter continues the original schedule — do NOT zero "
+        "this to 'skip' warmup, it rebuilds a different cosine instead.",
+    )
+    p.add_argument(
+        "--find-unused-params",
+        action="store_true",
+        help="Enable DDP find_unused_parameters (escape hatch — only needed if "
+        "some parameters receive no gradients, e.g. detach_segment_memory "
+        "geometries that truncate the store graph)",
+    )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 def main():
+    # lazy import — see the note at the top of the module
+    from accelerate import Accelerator, DistributedDataParallelKwargs
+    from accelerate.utils import set_seed
+
     args = parse_args()
     config = get_config(args.model, args.variant, args.ablation)
     train_cfg = config["training"]
@@ -203,17 +224,28 @@ def main():
 
     schedule_steps = int(train_cfg["total_tokens"] // batch_tokens)
     max_steps = args.max_steps or schedule_steps
+    # warmup stays as configured even on resume: the scheduler's step counter
+    # is restored from the checkpoint (register_for_checkpointing below), so
+    # the original schedule continues exactly and no re-warmup happens. The
+    # old warmup=0-on-resume rebuild did not prevent re-warmup (the restored
+    # counter already does) — it swapped in a different cosine, measured
+    # -1.6% to -12.2% LR vs the intended schedule over the run (2026-09-01).
     if args.warmup_steps is not None:
         warmup_steps = args.warmup_steps
-    elif args.resume:
-        warmup_steps = 0
     else:
         warmup_steps = train_cfg["warmup_steps"]
 
     # Accelerator
-    # find_unused_parameters=True needed because vmap(vmap(grad)) in the omega
-    # rule uses a functional interface that bypasses DDP's autograd tracking
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # find_unused_parameters defaults False: all parameters receive gradients
+    # now that detach_segment_memory is off (the detached first store segment
+    # was what left params without gradients — the old comment blamed vmap's
+    # functional interface, which was never the cause; probe-verified
+    # 2026-09-01). The flag costs a full graph traversal per iteration. If
+    # DDP errors with "expected to have finished reduction" on a future
+    # config, rerun with --find-unused-params and find which param went unused.
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=args.find_unused_params
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accum,
         log_with="wandb" if args.wandb else None,
@@ -253,21 +285,41 @@ def main():
         weight_decay=train_cfg["weight_decay"],
     )
 
-    # AcceleratedScheduler advances num_processes times per .step() call (default
-    # split_batches=False). Without compensation, configs.py warmup_steps in
-    # global-step units gets reached at global_step = warmup_steps / num_processes
-    # — e.g. on 4 GPUs warmup=2000 actually ends at global_step=500, ramping LR
-    # 4× faster than intended. Empirically caused a loss spike at step ~290 in
-    # job 40107853. Fix: scale the scheduler-internal warmup and total step
-    # counts by num_processes so they match the user-intended global-step units.
-    scheduler_warmup = warmup_steps * accelerator.num_processes
-    scheduler_total = schedule_steps * accelerator.num_processes
-    scheduler = cosine_with_warmup(optimizer, scheduler_warmup, scheduler_total)
+    # The scheduler is deliberately NOT passed through accelerator.prepare.
+    # A prepared AcceleratedScheduler advances num_processes times per .step()
+    # call, which required scaling warmup/total by num_processes to compensate
+    # (the uncompensated form ramped LR 4x too fast and caused the loss spike
+    # at step ~290 in job 40107853; the compensated form was verified exact on
+    # accelerate 1.14 — but it couples the schedule to an Accelerate internal).
+    # Keeping the scheduler unwrapped and stepping it exactly once per
+    # completed optimization step is exact by construction on any version.
+    # register_for_checkpointing carries its state through save_state /
+    # load_state. Checkpoints from before this change stored the scheduler
+    # under the prepared name; they are already incompatible with this branch
+    # (omega window fix), so there is no migration shim.
+    scheduler = cosine_with_warmup(
+        optimizer=optimizer, warmup_steps=warmup_steps, total_steps=schedule_steps
+    )
 
     # Prepare
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
+    model, optimizer, train_loader = accelerator.prepare(
+        model, optimizer, train_loader
     )
+    accelerator.register_for_checkpointing(scheduler)
+
+    # Validation loader — created and prepared ONCE; each validation pass
+    # re-iterates it. (The old per-validation accelerator.prepare re-wrapped a
+    # fresh loader every time, accumulating dataloader state in the
+    # accelerator and into every checkpoint.) Prepared before load_state so
+    # the set of registered dataloaders is identical at save and load time.
+    val_dataset = load_data(data_dir, seq_len, split="val")
+    if val_dataset is not None:
+        val_loader = accelerator.prepare(
+            DataLoader(val_dataset, batch_size=args.per_device_batch_size)
+        )
+    else:
+        val_loader = None
+        accelerator.print("No val.bin found — validation disabled")
 
     # Resume
     start_step = 0
@@ -296,20 +348,25 @@ def main():
     # -----------------------------------------------------------------------
 
     model.train()
-    train_iter = iter(train_loader)
 
-    # Skip past already-seen data on resume
+    # Skip past already-seen data on resume — FIRST pass only. The wrapper
+    # returned by skip_first_batches skips on every __iter__, so rebinding
+    # train_loader to it (as this code used to) silently dropped — and
+    # read-and-discarded — the first start_step * grad_accum batches of every
+    # subsequent epoch as well (probe-proven 2026-09-01). Epoch restarts below
+    # re-iterate the ORIGINAL loader.
     if start_step > 0:
         batches_to_skip = start_step * grad_accum
         accelerator.print(f"Skipping {batches_to_skip} batches for resume...")
         from accelerate.data_loader import skip_first_batches
 
-        train_loader = skip_first_batches(train_loader, batches_to_skip)
+        train_iter = iter(skip_first_batches(train_loader, num_batches=batches_to_skip))
+    else:
         train_iter = iter(train_loader)
 
     global_step = start_step
     tokens_this_run = 0
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=accelerator.device)
     loss_count = 0
     t0 = time.time()
 
@@ -336,7 +393,9 @@ def main():
         if accelerator.sync_gradients:
             scheduler.step()
 
-        running_loss += loss.detach().item()
+        # accumulate on device — .item() here would force a host sync on every
+        # micro-batch (~grad_accum syncs per optimization step)
+        running_loss += loss.detach()
         loss_count += 1
 
         if not accelerator.sync_gradients:
@@ -349,8 +408,8 @@ def main():
 
         # Log
         if global_step % args.log_every == 0:
-            avg_loss = running_loss / loss_count
-            running_loss = 0.0
+            avg_loss = (running_loss / loss_count).item()
+            running_loss.zero_()
             loss_count = 0
 
             elapsed = time.time() - t0
@@ -375,45 +434,37 @@ def main():
                     step=global_step,
                 )
 
-        # Validate
-        if global_step % args.validate_every == 0:
-            val_dataset = load_data(data_dir, seq_len, split="val")
-            if val_dataset is None:
-                if global_step == args.validate_every:
-                    accelerator.print("Skipping validation (no val.bin)")
-            else:
-                model.eval()
-                val_loader = DataLoader(
-                    val_dataset, batch_size=args.per_device_batch_size
-                )
-                val_loader = accelerator.prepare(val_loader)
+        # Validate — re-iterates the once-prepared val_loader (val.bin is
+        # unshuffled, so every pass scores the same first 50 batches)
+        if global_step % args.validate_every == 0 and val_loader is not None:
+            model.eval()
 
-                val_losses = []
-                with torch.no_grad():
-                    for i, val_batch in enumerate(val_loader):
-                        if i >= 50:
-                            break
-                        val_loss = model(val_batch, return_loss=True)
-                        val_losses.append(
-                            accelerator.gather(val_loss).mean().item()
-                        )
-
-                avg_val = sum(val_losses) / max(1, len(val_losses))
-                accelerator.print(
-                    f"step {global_step:>7d} | val_loss {avg_val:.4f} | "
-                    f"val_ppl {math.exp(min(avg_val, 20)):.1f}"
-                )
-
-                if args.wandb:
-                    accelerator.log(
-                        {
-                            "val/loss": avg_val,
-                            "val/perplexity": math.exp(min(avg_val, 20)),
-                        },
-                        step=global_step,
+            val_losses = []
+            with torch.no_grad():
+                for i, val_batch in enumerate(val_loader):
+                    if i >= 50:
+                        break
+                    val_loss = model(val_batch, return_loss=True)
+                    val_losses.append(
+                        accelerator.gather(val_loss).mean().item()
                     )
 
-                model.train()
+            avg_val = sum(val_losses) / max(1, len(val_losses))
+            accelerator.print(
+                f"step {global_step:>7d} | val_loss {avg_val:.4f} | "
+                f"val_ppl {math.exp(min(avg_val, 20)):.1f}"
+            )
+
+            if args.wandb:
+                accelerator.log(
+                    {
+                        "val/loss": avg_val,
+                        "val/perplexity": math.exp(min(avg_val, 20)),
+                    },
+                    step=global_step,
+                )
+
+            model.train()
 
         # Checkpoint
         if global_step % args.save_every == 0:
