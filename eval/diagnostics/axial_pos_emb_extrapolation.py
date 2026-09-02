@@ -8,7 +8,10 @@ normalization. A model trained at 1K context saw outer-axis inputs 0-135; a 4K
 eval feeds 0-512 and a 1M eval 0-125K. At random init (3 seeds) the embedding
 norm at the tail is 7.6x the trained-range mean at 4K, 30x at 16K, 243x at
 128K and ~1950x at 1M — and 6.7x the token-embedding norm even in-range
-(2026-09-02). Nothing in training pushes an unbounded integer->MLP map toward
+(2026-09-02). Those ratios are at raw token positions; the model feeds the
+interleaved longterm-mem positions (seq_len_with_longterm_mem), where the 4K
+tail is position 4347 -> ~8.0x, 16K -> ~32x, 128K -> ~257x, 1M -> ~2060x — the
+tool reports both. Nothing in training pushes an unbounded integer->MLP map toward
 saturation, but the trained weights are what matter: run this against a
 checkpoint trained with use_axial_pos_emb=True to confirm. The experiment
 config now disables the embedding (MAC_DEFAULTS use_axial_pos_emb=False).

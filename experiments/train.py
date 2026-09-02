@@ -332,6 +332,11 @@ def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position,
     accelerator.save_state(ckpt_dir)
     accelerator.wait_for_everyone()  # all ranks finished writing state files
     if accelerator.is_main_process:
+        # default=str keeps the dump from crashing on a non-JSON value, but it
+        # would embed that value's repr (e.g. a memory address for a callable)
+        # and make every later drift check fail spuriously. No such value is
+        # reachable from the CLI today (all sizes/variants/ablations round-trip
+        # cleanly); if one is ever added, serialize it deliberately.
         with open(os.path.join(ckpt_dir, "model_config.json"), "w") as f:
             json.dump(model_config, f, indent=2, sort_keys=True, default=str)
         meta = dict(step=step)
@@ -567,22 +572,27 @@ def main():
     if args.resume:
         resume_meta = read_checkpoint_meta(resume_dir=args.resume)
         start_step = resume_meta["step"]
+        # validate every schedule field the checkpoint recorded; warn only
+        # about absent ones (a checkpoint written before a field was added
+        # must still have the others checked — an all-or-nothing skip would
+        # silently disable the guard for every older checkpoint)
         missing = [key for key in schedule_meta if key not in resume_meta]
         if missing:
             accelerator.print(
                 f"WARNING: checkpoint meta.pt lacks schedule fields {missing} "
-                f"(pre-2026-09 format) — cannot validate the schedule shape"
+                f"(older format) — those fields cannot be validated; the rest are"
             )
-        else:
-            for field, current in schedule_meta.items():
-                saved = resume_meta[field]
-                if saved != current:
-                    raise ValueError(
-                        f"resume schedule mismatch on '{field}': checkpoint has "
-                        f"{saved}, this run computes {current}. Relaunch with "
-                        f"the original geometry (GPU count, batch size, "
-                        f"grad-accum, warmup)."
-                    )
+        for field, current in schedule_meta.items():
+            if field in missing:
+                continue
+            saved = resume_meta[field]
+            if saved != current:
+                raise ValueError(
+                    f"resume schedule mismatch on '{field}': checkpoint has "
+                    f"{saved}, this run computes {current}. Relaunch with "
+                    f"the original geometry (GPU count, batch size, "
+                    f"grad-accum, warmup)."
+                )
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
@@ -691,14 +701,14 @@ def main():
     # no lingering GradientState references and no masked end-of-dataloader
     # sync from an unfinished dispatcher generator.
     val_yields = 50
+    val_chunks_wanted = val_yields * args.per_device_batch_size * num_gpus
     val_dataset = load_data(
         data_dir,
         seq_len,
         split="val",
-        limit_chunks=val_yields * args.per_device_batch_size * num_gpus,
+        limit_chunks=val_chunks_wanted,
     )
     if val_dataset is not None and val_dataset.n_chunks > 0:
-        val_chunks_wanted = val_yields * args.per_device_batch_size * num_gpus
         if val_dataset.n_chunks < val_chunks_wanted:
             # the val statistics are a mean of per-batch means; with fewer
             # chunks than one full set of per-rank yields the last global

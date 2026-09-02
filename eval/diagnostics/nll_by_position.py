@@ -99,11 +99,30 @@ def nll_by_position(model, val_bin, seq_len, max_chunks, bucket, device, disable
     )
 
 
-def print_table(results, bucket, span_tokens):
+def spans_consistent(results):
+    """Whether every column covers the same val.bin span to within one chunk
+    of the LONGEST seq_len. The nominal same-span rule (n_chunks = span //
+    (L + 1), at least one) breaks when the span is smaller than one chunk of
+    the largest L, and iter_val_chunks silently yields fewer chunks when
+    val.bin is short — so the actual per-column span (chunks x (L + 1)) is
+    what gets reported and compared."""
+    spans = [r["span_tokens"] for r in results]
+    tolerance = max(r["seq_len"] for r in results) + 1
+    return max(spans) - min(spans) <= tolerance
+
+
+def print_table(results, bucket):
     seq_lens = [r["seq_len"] for r in results]
     max_len = max(seq_lens)
-    print(f"per-position NLL over the same {span_tokens:,}-token span of val.bin for every L "
-          f"(rows: nominal position range; a shorter L's last bucket is truncated at L)")
+    spans = [r["span_tokens"] for r in results]
+    if spans_consistent(results):
+        print(f"per-position NLL over the same ~{max(spans):,}-token span of val.bin for every L "
+              f"(rows: nominal position range; a shorter L's last bucket is truncated at L)")
+    else:
+        print("WARNING: columns cover DIFFERENT spans of val.bin — "
+              + ", ".join(f"L={r['seq_len']}: {r['span_tokens']:,} tokens" for r in results)
+              + " — do not read across columns (span smaller than one chunk of the largest L, "
+              "or val.bin too short)")
     header = f"{'position':>14}" + "".join(f"{f'L={L}':>12}" for L in seq_lens)
     print(header)
     print("-" * len(header))
@@ -117,6 +136,7 @@ def print_table(results, bucket, span_tokens):
     print("-" * len(header))
     print(f"{'overall':>14}" + "".join(f"{r['overall']:>12.4f}" for r in results))
     print(f"{'chunks':>14}" + "".join(f"{r['chunks']:>12d}" for r in results))
+    print(f"{'span tokens':>14}" + "".join(f"{r['span_tokens']:>12,d}" for r in results))
 
 
 def parse_args():
@@ -170,11 +190,15 @@ def main():
             device=args.device,
             disable_flex_attn=not args.use_flex_attn,
         )
-        print(f"  overall NLL {result['overall']:.4f} over {result['chunks']} chunks")
+        # the span actually covered — the requested one only when val.bin
+        # held enough chunks and the span is at least one chunk of this L
+        result["span_tokens"] = result["chunks"] * (seq_len + 1)
+        print(f"  overall NLL {result['overall']:.4f} over {result['chunks']} chunks "
+              f"({result['span_tokens']:,} tokens)")
         results.append(result)
 
     print()
-    print_table(results=results, bucket=args.bucket, span_tokens=span_tokens)
+    print_table(results=results, bucket=args.bucket)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
@@ -184,7 +208,8 @@ def main():
             variant=args.variant,
             ablation=args.ablation,
             bucket=args.bucket,
-            span_tokens=span_tokens,
+            requested_span_tokens=span_tokens,
+            spans_consistent=spans_consistent(results),
             results=results,
         ), f, indent=2)
     print(f"\nSaved → {args.output}")
