@@ -4,13 +4,24 @@ BABILong task-specific prompts and label definitions.
 Based on the official BABILong evaluation protocol (RMT-team/babilong).
 """
 
-# Valid answer labels per task (for label matching evaluation)
+# Valid answer labels per task (for label matching evaluation).
+#
+# Labels must use the SURFACE FORM the answer takes in the context. Scoring is
+# a length-normalized log-likelihood over each label's tokens, so a label that
+# the tokenizer segments differently from its in-context form is scored on a
+# string the model never saw AND normalized by a different token count. qa5's
+# names are capitalized in the dataset ("Fred gave the apple to Jeff"): under
+# T5, " Fred"/" Jeff"/" Mary"/" Bill" are single tokens while the lowercase
+# " fred"/" jeff"/" mary" split into 2-3 pieces (a bare "▁" plus fragments) —
+# a class-correlated normalization bias against the name answers (found by
+# review 2026-09-02). Matching in evaluate._target_matches is
+# case-insensitive, so capitalizing the labels changes only the scoring.
 TASK_LABELS = {
     "qa1": {"bathroom", "bedroom", "garden", "hallway", "kitchen", "office"},
     "qa2": {"bathroom", "bedroom", "garden", "hallway", "kitchen", "office"},
     "qa3": {"bathroom", "bedroom", "garden", "hallway", "kitchen", "office"},
     "qa4": {"bathroom", "bedroom", "garden", "hallway", "kitchen", "office"},
-    "qa5": {"bill", "fred", "jeff", "mary", "apple", "football", "milk"},
+    "qa5": {"Bill", "Fred", "Jeff", "Mary", "apple", "football", "milk"},
     "qa6": {"yes", "no"},
     "qa7": {"none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"},
     "qa8": {"apple", "football", "milk", "nothing"},
@@ -71,7 +82,7 @@ TASK_EXAMPLES = {
         {
             "context": "Fred gave the apple to Jeff. Jeff gave the apple to Bill.",
             "question": "Who did Jeff give the apple to?",
-            "answer": "bill",
+            "answer": "Bill",
         },
     ],
     "qa6": [
@@ -113,22 +124,25 @@ TASK_EXAMPLES = {
 
 
 def build_prompt(task, context, question):
-    """Build a few-shot prompt for a BABILong example."""
+    """Build a few-shot prompt for a BABILong example.
+
+    The template uses only plain-word delimiters ("Context:", "Question:",
+    "Answer:") joined by single spaces. The previous template used
+    `<context>`/`</context>` tags and newlines: T5's SentencePiece vocabulary
+    has no `<` piece (each tag became `<unk>` + fragments — 6 `<unk>` per
+    prompt) and its normalizer maps newlines to whitespace, so the scaffold
+    the model actually saw was not the one designed (found by review
+    2026-09-02). Shared by all candidates, so it never biased the argmax, but
+    the few-shot scaffold should be encodable.
+    """
     instruction = TASK_INSTRUCTIONS.get(task, TASK_INSTRUCTIONS["qa1"])
     examples = TASK_EXAMPLES.get(task, TASK_EXAMPLES["qa1"])
 
-    parts = [instruction, ""]
+    parts = [instruction]
 
     for ex in examples:
-        parts.append(f"<context>\n{ex['context']}\n</context>")
-        parts.append(f"Question: {ex['question']}")
-        parts.append(f"Answer: {ex['answer']}")
-        parts.append("")
+        parts.append(f"Context: {ex['context']} Question: {ex['question']} Answer: {ex['answer']}")
 
-    parts.append("Now answer the following:")
-    parts.append("")
-    parts.append(f"<context>\n{context}\n</context>")
-    parts.append(f"Question: {question}")
-    parts.append("Answer:")
+    parts.append(f"Now answer the following: Context: {context} Question: {question} Answer:")
 
-    return "\n".join(parts)
+    return " ".join(parts)
