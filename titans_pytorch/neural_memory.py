@@ -492,7 +492,10 @@ class NeuralMemory(Module):
         the genuine contradiction is Section 5's Eq (32) vs the appendix
         formulation.) Section 5 is the model-defining section and matches
         standard Muon semantics (lr outside the orthogonalization), so this
-        repo follows Section 5.
+        repo follows Section 5. One more source ambiguity: Section 5's Muon
+        equation is written with the exponential feature map φ*, while
+        Table 1 and the appendix formulation use the polynomial φ — this
+        implementation follows the polynomial form.
         omega_context=8 is our default; Figure 5 ("the effect of local context
         length c") shows the effect of window size without naming a single
         optimum.
