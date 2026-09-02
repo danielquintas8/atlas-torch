@@ -259,27 +259,52 @@ def length_label_to_tokens(length):
     return k * 1024 if k > 0 else 512
 
 
-def memory_ceiling_message(model, length, device, force):
-    """Return None when the estimated PEAK memory-state footprint (retrieve
-    state x STORE_PATH_PEAK_FACTOR) fits within 80% of the device, else a
-    message explaining the refusal (unless `force`, which downgrades it to a
-    warning printed by the caller)."""
+DEVICE_MEMORY_FRACTION = 0.8
+
+
+def device_total_memory_bytes(device):
+    """Total memory of a CUDA device, or None when the device is not CUDA /
+    CUDA is unavailable (the ceiling check is then skipped)."""
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
-    num_tokens = length_label_to_tokens(length)
+    return torch.cuda.get_device_properties(torch.device(device)).total_memory
+
+
+def memory_ceiling_for_tokens(model, num_tokens, label, force, device_total_bytes):
+    """Return None when the estimated PEAK memory-state footprint (retrieve
+    state x STORE_PATH_PEAK_FACTOR) at `num_tokens` input tokens fits within
+    DEVICE_MEMORY_FRACTION of `device_total_bytes`, else a message explaining
+    the refusal (unless `force`, which downgrades it to a warning printed by
+    the caller). `device_total_bytes=None` disables the check (no CUDA)."""
+    if device_total_bytes is None:
+        return None
     retrieve = estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens)
     peak = estimate_peak_memory_state_bytes(model=model, num_tokens=num_tokens)
-    total = torch.cuda.get_device_properties(torch.device(device)).total_memory
-    if peak <= 0.8 * total:
+    if peak <= DEVICE_MEMORY_FRACTION * device_total_bytes:
         return None
     return (
-        f"context {length} (~{num_tokens:,} tokens): the whole-sequence forward would hold "
+        f"{label} ({num_tokens:,} tokens): the whole-sequence forward would hold "
         f"~{retrieve / 1e9:.1f} GB of per-token memory-weight state for the final retrieve and "
         f"peak at ~{peak / 1e9:.1f} GB of live memory state (x{STORE_PATH_PEAK_FACTOR} store-path "
-        f"factor; device total {total / 1e9:.1f} GB). At 170M with two memory layers a 64 GB GPU "
-        f"fits roughly 7-9K tokens in bf16 and 3.5-4.7K in fp32; longer contexts need a "
-        f"chunked-inference forward that does not exist yet; --bf16 halves the footprint. "
+        f"factor; device total {device_total_bytes / 1e9:.1f} GB, limit "
+        f"{DEVICE_MEMORY_FRACTION:.0%}). At 170M with two memory layers a 64 GB GPU fits roughly "
+        f"7-9K tokens in bf16 and 3.5-4.7K in fp32; longer contexts need a chunked-inference "
+        f"forward that does not exist yet; --bf16 halves the footprint. "
         + ("Running anyway (--force)." if force else "Skipping (pass --force to try).")
+    )
+
+
+def memory_ceiling_message(model, length, device, force):
+    """Early exit on the NOMINAL split label ('4k' -> 4096 tokens). BABILong's
+    labels are not T5 token counts (English prose runs ~1.15-1.3x longer under
+    T5's 32K vocab, and the few-shot scaffold adds more), so evaluate_task
+    re-checks against the ACTUAL tokenized prompt before scoring."""
+    return memory_ceiling_for_tokens(
+        model=model,
+        num_tokens=length_label_to_tokens(length),
+        label=f"context {length} (nominal)",
+        force=force,
+        device_total_bytes=device_total_memory_bytes(device),
     )
 
 
@@ -320,8 +345,11 @@ def encode_prompt_and_candidates(tokenizer, prompt_text, candidates):
          if that suffix does not itself tokenize as the tail of the full
          prompt (a tokenizer whose segmentation is not whitespace-local), the
          full-prompt check is used instead;
-      2. no special token (T5's `</s>`) may reach the model — that is exactly
-         how the pre-fix scorer ended up scoring `</s>` instead of the answer.
+      2. no special token (T5's `</s>`) may appear at or before a scored row —
+         that is exactly how the pre-fix scorer ended up scoring `</s>`
+         instead of the answer. (score_example may append the PAD token AFTER
+         the candidate to equalize input lengths; those positions are never
+         scored and never in a scored row's causal past.)
 
     Raises ValueError (not assert — asserts are stripped under -O) on either.
     Returns (prompt_ids, {cand: cand_ids}).
@@ -370,8 +398,15 @@ def _candidate_rows_log_softmax(model, input_ids, rows, disable_flex_attn):
         # decision statistic, and a bf16 projection can flip close argmaxes
         bias = None if to_logits.bias is None else to_logits.bias.float()
         logits = F.linear(rows_hidden.float(), to_logits.weight.float(), bias)
-    else:
+    elif rows_hidden.dtype == torch.float32:
         logits = to_logits(rows_hidden)
+    else:
+        # never fall back silently to a reduced-precision projection
+        raise TypeError(
+            f"to_logits is a {type(to_logits).__name__}, not nn.Linear, and the hidden states are "
+            f"{rows_hidden.dtype}: the scorer cannot project in fp32. Run in float32 or give the "
+            f"scorer an nn.Linear output projection."
+        )
     return F.log_softmax(logits[0].float(), dim=-1)
 
 
@@ -390,8 +425,8 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
     together lets the boundary re-segment differently per candidate, and a
     tokenizer that appends specials (T5 appends `</s>`) shifts the scored
     positions. `encode_prompt_and_candidates` verifies joint == separate and
-    that no special token reaches the model; exactly the candidate's token
-    positions are scored.
+    that no special token appears at or before a scored row; exactly the
+    candidate's token positions are scored.
 
     Forward passes: when every candidate is a single token, ONE forward over
     the prompt scores all of them from the last row. Multi-token candidate
@@ -467,13 +502,15 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
             log_probs[cand] = lp
             details[cand] = {"sum": lp, "num_tokens": 1}
     else:
+        lengths = {len(ids) for ids in cand_ids.values()}
+        common_len = prompt_len + max(lengths)
         pad_id = tokenizer.pad_token_id
-        if pad_id is None:
+        if len(lengths) > 1 and pad_id is None:
+            # padding is only needed when the candidates differ in length
             raise ValueError(
                 "mixed-length candidate set needs a pad token to equalize the input "
                 "lengths (chunk-phase consistency, see score_example) — the tokenizer has none"
             )
-        common_len = prompt_len + max(len(ids) for ids in cand_ids.values())
         for cand, ids in cand_ids.items():
             # pad AFTER the candidate so every candidate's forward has the
             # same length (same chunk phase); the scored rows never see it
@@ -510,17 +547,69 @@ def target_in_candidates(target, candidates):
     return target.strip().lower() in lowered
 
 
-def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cuda", disable_flex_attn=True):
+def actual_length_ceiling(model, tokenizer, task, length, dataset, candidates, force, device_total_bytes):
+    """The memory-ceiling check against the ACTUAL tokenized prompt of the
+    first scorable example (plus the longest candidate), not the nominal
+    split label: '4k' prose tokenizes to more than 4096 T5 tokens and the
+    few-shot scaffold adds more — a label that passes can still OOM. Returns
+    (message_or_None, num_tokens_or_None)."""
+    for example in dataset:
+        if not target_in_candidates(target=example["target"], candidates=candidates):
+            continue
+        prompt_text = build_prompt(task=task, context=example["input"], question=example["question"])
+        prompt_ids, cand_ids = encode_prompt_and_candidates(
+            tokenizer=tokenizer, prompt_text=prompt_text, candidates=candidates
+        )
+        num_tokens = len(prompt_ids) + max(len(ids) for ids in cand_ids.values())
+        message = memory_ceiling_for_tokens(
+            model=model,
+            num_tokens=num_tokens,
+            label=f"{task}@{length} (actual first prompt)",
+            force=force,
+            device_total_bytes=device_total_bytes,
+        )
+        return message, num_tokens
+    return None, None
+
+
+def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cuda", disable_flex_attn=True,
+                  force=False, device_total_bytes=None, dataset=None):
     """Evaluate model on a single task at a single context length via
-    log-likelihood scoring over the closed candidate set (TASK_LABELS[task])."""
-    from datasets import load_dataset
+    log-likelihood scoring over the closed candidate set (TASK_LABELS[task]).
 
-    dataset = load_dataset("RMT-team/babilong", length, split=task)
+    Before the example loop the memory ceiling is re-checked against the
+    ACTUAL tokenized length of the first scorable prompt (see
+    actual_length_ceiling); when it does not fit and `force` is off the task
+    is skipped and the returned dict carries `skipped` with the reason.
+    `dataset` (an iterable of {'input','question','target'} dicts) and
+    `device_total_bytes` are injection points for tests; by default the
+    BABILong split is loaded from the hub and the device's total memory is
+    used."""
+    if dataset is None:
+        from datasets import load_dataset
 
-    if max_examples:
-        dataset = dataset.select(range(min(max_examples, len(dataset))))
+        dataset = load_dataset("RMT-team/babilong", length, split=task)
+
+        if max_examples:
+            dataset = dataset.select(range(min(max_examples, len(dataset))))
+    elif max_examples:
+        dataset = list(dataset)[:max_examples]
 
     candidates = sorted(TASK_LABELS[task])
+
+    ceiling, first_num_tokens = actual_length_ceiling(
+        model=model, tokenizer=tokenizer, task=task, length=length, dataset=dataset,
+        candidates=candidates, force=force, device_total_bytes=device_total_bytes,
+    )
+    if ceiling is not None:
+        print(f"  {ceiling}")
+        if not force:
+            return {
+                "accuracy": 0.0, "accuracy_all": 0.0, "correct": 0, "total": 0,
+                "n_excluded": 0, "results": [], "skipped": ceiling,
+                "first_prompt_tokens": first_num_tokens,
+            }
+
     correct = 0
     total = 0
     n_excluded = 0
@@ -578,6 +667,7 @@ def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cud
         "total": total,
         "n_excluded": n_excluded,
         "results": results,
+        "first_prompt_tokens": first_num_tokens,
     }
 
 
@@ -617,7 +707,8 @@ def parse_args():
     p.add_argument("--use-flex-attn", action="store_true",
                    help="Use flex attention (CUDA only); default disables it")
     p.add_argument("--force", action="store_true",
-                   help="Run a context length even when the estimated retrieve-state footprint exceeds device memory")
+                   help="Run a context length even when the estimated PEAK memory-state footprint "
+                        "(retrieve state x STORE_PATH_PEAK_FACTOR) exceeds 80%% of device memory")
     return p.parse_args()
 
 
@@ -697,7 +788,19 @@ def main():
                 max_examples=args.max_examples,
                 device=args.device,
                 disable_flex_attn=not args.use_flex_attn,
+                force=args.force,
+                device_total_bytes=device_total_memory_bytes(args.device),
             )
+
+            if result.get("skipped"):
+                # the ACTUAL tokenized prompt exceeded the ceiling the nominal
+                # label passed; recorded, not scored
+                all_results["tasks"][length][task] = {
+                    "skipped": result["skipped"],
+                    "first_prompt_tokens": result["first_prompt_tokens"],
+                }
+                write_results(all_results=all_results, output_path=output_path)
+                continue
 
             all_results["tasks"][length][task] = {
                 "accuracy": result["accuracy"],

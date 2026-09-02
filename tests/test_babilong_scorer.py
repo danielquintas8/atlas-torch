@@ -26,11 +26,17 @@ from torch.utils._pytree import tree_flatten
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.babilong.evaluate import (
+    DEVICE_MEMORY_FRACTION,
+    JOINT_CHECK_WINDOW_CHARS,
     STORE_PATH_PEAK_FACTOR,
+    _boundary_window,
     _candidate_rows_log_softmax,
     encode_prompt_and_candidates,
     estimate_peak_memory_state_bytes,
     estimate_retrieve_state_bytes,
+    evaluate_task,
+    memory_ceiling_for_tokens,
+    memory_ceiling_message,
     score_example,
 )
 from eval.babilong.prompts import TASK_LABELS, build_prompt
@@ -311,7 +317,11 @@ class LiveStorageTracker(TorchDispatchMode):
             if ptr in self.exclude or storage.nbytes() == 0:
                 continue
             nbytes, count = self.live.get(ptr, (storage.nbytes(), 0))
-            self.live[ptr] = (nbytes, count + 1)
+            # allocator address reuse: a finalizer delayed past a free (a
+            # tensor caught in a GC cycle) would leave the OLD size on record
+            # for a new, larger storage at the same address — an under-count,
+            # the unsafe direction for a ceiling constant. Keep the max.
+            self.live[ptr] = (max(nbytes, storage.nbytes()), count + 1)
             weakref.finalize(t, self._release, ptr)
         total = sum(nbytes for nbytes, _ in self.live.values())
         self.peak = max(self.peak, total)
@@ -332,16 +342,19 @@ def test_peak_memory_estimate_matches_live_storage():
     retrieve tensor alone (a review measured the retrieve-only estimate ~6x
     low — a guard that says 'fits' and then OOMs hours into a cluster eval).
     Measured with the live-storage tracker: one memory layer peaks within
-    [0.7, 1.3]x the calibrated estimate and the peak grows linearly with n;
-    for two layers the flat factor is an upper bound (measured 4.6-4.7x the
-    combined retrieve state vs 6.4x assumed)."""
+    [0.6, 1.05]x the calibrated estimate (measured 0.96-1.01; the bound is
+    TIGHT on the dangerous side — an estimate that is low is what lets a
+    length past the guard and into an OOM — and loose on the harmless side)
+    and the peak grows linearly with n; for two layers the flat factor is an
+    upper bound (measured 4.6-4.7x the combined retrieve state vs 6.4x
+    assumed)."""
     one_layer = _tiny_atlas_mac(mem_layers = (1,), dim = 64, heads = 4, dim_head = 16)
     peaks = {}
     for num_tokens in (256, 512):
         peak = _measured_peak(model = one_layer, num_tokens = num_tokens)
         estimate = estimate_peak_memory_state_bytes(model = one_layer, num_tokens = num_tokens)
         ratio = peak / estimate
-        assert 0.7 <= ratio <= 1.3, f'n={num_tokens}: measured peak / estimate = {ratio:.2f}'
+        assert 0.6 <= ratio <= 1.05, f'n={num_tokens}: measured peak / estimate = {ratio:.2f}'
         peaks[num_tokens] = peak
     growth = peaks[512] / peaks[256]
     assert 1.8 <= growth <= 2.2, f'peak must grow linearly with n, got x{growth:.2f} for 2x tokens'
@@ -413,6 +426,228 @@ def test_mixed_length_candidates_require_a_pad_token():
         score_example(model = stub, tokenizer = NoPad(), prompt_text = PROMPT, candidates = ["red", "hall-way"], device = "cpu")
 
 
+def test_uniform_multi_token_candidates_need_no_pad_token():
+    """A pad token is demanded only when padding is needed: a candidate set
+    whose members all have the same (multi-token) length runs on a pad-less
+    tokenizer, with every forward the same length and no pad appended."""
+    class NoPad(FakeTokenizer):
+        pad_token_id = None
+
+    tok = NoPad()
+    stub = StubModel(boosts = {})
+    candidates = ["hall-way", "bed-room"]
+    chosen, log_probs, num_tokens, details = score_example(
+        model = stub, tokenizer = tok, prompt_text = PROMPT, candidates = candidates, device = "cpu",
+    )
+    assert set(log_probs) == set(candidates)
+    assert len({len(ids) for ids in stub.calls}) == 1
+    prompt_ids = _fake_ids(tok, PROMPT)
+    for cand, ids in zip(candidates, stub.calls):
+        assert ids == prompt_ids + _fake_ids(tok, " " + cand), 'no padding appended for a uniform set'
+
+
+# ---------------------------------------------------------------------------
+# joint-tokenization guard: window and fallback (G1)
+# ---------------------------------------------------------------------------
+
+class RecordingFakeTokenizer(FakeTokenizer):
+    """FakeTokenizer that records every text it is asked to encode."""
+
+    def __init__(self):
+        super().__init__()
+        self.texts = []
+
+    def encode(self, text, add_special_tokens = True):
+        self.texts.append(text)
+        return super().encode(text, add_special_tokens = add_special_tokens)
+
+
+class FarContextTokenizer(RecordingFakeTokenizer):
+    """A tokenizer whose segmentation is NOT whitespace-local: the id of the
+    piece 'Answer:' depends on the FIRST character of the text (hundreds of
+    characters back). The full prompt starts with 'Z', the bounded window
+    does not, so the window's tokenization of the prompt tail differs from
+    the full prompt's — the guard's window precondition fails and the
+    full-prompt fallback must fire. Candidate pieces are unaffected, so a
+    consistent tokenizer still passes; only a planted re-segmentation may
+    raise."""
+
+    def encode(self, text, add_special_tokens = True):
+        ids = super().encode(text, add_special_tokens = add_special_tokens)
+        answer_id = self._id("Answer:")
+        if text.startswith("Z"):
+            ids = [i + 1000 if i == answer_id else i for i in ids]
+        return ids
+
+
+def _long_prompt(prefix = "Z"):
+    filler = " ".join(f"fact{i} is here." for i in range(60))     # ~900 chars
+    return f"{prefix}{filler} Where is Mary? Answer:"
+
+
+def test_fake_far_context_tokenizer_triggers_fallback_and_still_guards():
+    """(a) Window precondition fails -> the fallback re-runs the joint check
+    on the WHOLE prompt (asserted via the recorded encode texts), a consistent
+    tokenizer passes, and a planted boundary re-segmentation is still refused."""
+    prompt = _long_prompt()
+    assert len(prompt) > JOINT_CHECK_WINDOW_CHARS
+
+    tok = FarContextTokenizer()
+    prompt_ids = _fake_ids(tok, prompt)
+    window = _boundary_window(prompt)
+    assert len(window) < len(prompt) and not window.startswith("Z")
+    window_ids = _fake_ids(tok, window)
+    assert prompt_ids[-len(window_ids):] != window_ids, 'the precondition must FAIL for this tokenizer'
+
+    tok = FarContextTokenizer()
+    got_prompt_ids, cand_ids = encode_prompt_and_candidates(
+        tokenizer = tok, prompt_text = prompt, candidates = ["garden", "kitchen"]
+    )
+    assert got_prompt_ids == prompt_ids and set(cand_ids) == {"garden", "kitchen"}
+    # the joint-check encodes: end with " <cand>" and are longer than the bare
+    # candidate encode (" garden" alone is the separate candidate encode)
+    joint_texts = [
+        t for t in tok.texts
+        if (t.endswith(" garden") or t.endswith(" kitchen")) and len(t) > len(" kitchen")
+    ]
+    assert joint_texts and all(t.startswith(prompt) for t in joint_texts), (
+        'fallback did not execute: the joint check must run on the FULL prompt'
+    )
+    assert not any(t == window + " garden" for t in tok.texts), 'window path must not be used after the fallback'
+
+    class PlantedResegmentation(FarContextTokenizer):
+        def encode(self, text, add_special_tokens = True):
+            ids = super().encode(text, add_special_tokens = add_special_tokens)
+            if text.endswith(" garden") and len(text) > len(" garden"):
+                ids = ids[:-1] + [999]
+            return ids
+
+    with pytest.raises(ValueError, match = "joint tokenization"):
+        encode_prompt_and_candidates(
+            tokenizer = PlantedResegmentation(), prompt_text = prompt, candidates = ["garden"]
+        )
+
+
+def test_fake_window_path_taken_for_long_prompts():
+    """For a whitespace-local tokenizer the guard uses the bounded window (not
+    the full prompt) on long prompts, and the window reproduces the tail."""
+    prompt = _long_prompt(prefix = "")
+    tok = RecordingFakeTokenizer()
+    prompt_ids, _ = encode_prompt_and_candidates(tokenizer = tok, prompt_text = prompt, candidates = ["garden"])
+    window = _boundary_window(prompt)
+    assert JOINT_CHECK_WINDOW_CHARS <= len(window) < len(prompt)
+    assert prompt_ids[-len(_fake_ids(tok, window)):] == _fake_ids(tok, window)
+    assert (window + " garden") in tok.texts, 'the joint check must run on the window'
+    assert (prompt + " garden") not in tok.texts, 'the full prompt must not be re-encoded per candidate'
+
+
+# ---------------------------------------------------------------------------
+# memory ceiling: actual tokenized length (G2)
+# ---------------------------------------------------------------------------
+
+def test_actual_length_ceiling_fires_when_nominal_label_passes():
+    """The nominal '0k' label passes the ceiling, but the actual tokenized
+    prompt of the first example does not: evaluate_task must skip the task
+    BEFORE scoring anything, and run it under --force."""
+    model = _tiny_atlas_mac(mem_layers = (1,))
+    tok = FakeTokenizer()
+    # 600 tokens of context from a small vocabulary (the tiny MAC has 256 ids)
+    context = " ".join(f"w{i % 40}" for i in range(600))
+    dataset = [dict(input = context, question = "Where is Mary?", target = "garden")]
+    # device 'memory' sized so the nominal 0k (512 tokens) fits and 600+ does not
+    budget = estimate_peak_memory_state_bytes(model = model, num_tokens = 560) / DEVICE_MEMORY_FRACTION
+
+    assert memory_ceiling_for_tokens(model = model, num_tokens = 512, label = "0k", force = False,
+                                     device_total_bytes = budget) is None
+    calls = []
+
+    class CountingModel:
+        """Wraps the real model to prove no scoring forward happens."""
+        def __init__(self, inner):
+            self.inner = inner
+            self.to_logits = inner.to_logits
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+        def forward(self, *a, **k):
+            calls.append(1)
+            return self.inner.forward(*a, **k)
+
+    counting = CountingModel(model)
+    result = evaluate_task(
+        model = counting, tokenizer = tok, task = "qa1", length = "0k", device = "cpu",
+        dataset = dataset, device_total_bytes = budget,
+    )
+    assert result["skipped"] and "actual first prompt" in result["skipped"]
+    assert result["first_prompt_tokens"] > 600 and result["total"] == 0
+    assert calls == [], 'no scoring forward may run for a skipped task'
+
+    forced = evaluate_task(
+        model = counting, tokenizer = tok, task = "qa1", length = "0k", device = "cpu",
+        dataset = dataset, device_total_bytes = budget, force = True,
+    )
+    assert "skipped" not in forced and forced["total"] == 1 and calls
+
+    # liveness: with a generous budget the same task scores normally
+    normal = evaluate_task(
+        model = counting, tokenizer = tok, task = "qa1", length = "0k", device = "cpu",
+        dataset = dataset, device_total_bytes = budget * 100,
+    )
+    assert "skipped" not in normal and normal["total"] == 1
+
+
+def test_memory_ceiling_message_is_a_no_op_without_cuda():
+    model = _tiny_atlas_mac(mem_layers = (1,))
+    assert memory_ceiling_message(model = model, length = "512k", device = "cpu", force = False) is None
+
+
+# ---------------------------------------------------------------------------
+# fp32 projection under bf16 (G3)
+# ---------------------------------------------------------------------------
+
+def test_bf16_model_scores_with_fp32_projection():
+    """Under --bf16 the candidate rows are projected in fp32: the scorer's
+    log-probs equal an fp32 reference (to_logits.weight.float() @
+    hidden.float()) to 1e-4, while a bf16 projection of the same rows
+    deviates more (instrument liveness)."""
+    model = _tiny_atlas_mac(mem_layers = (1,)).to(torch.bfloat16)
+    tok = FakeTokenizer()
+    prompt_ids = _fake_ids(tok, PROMPT)
+    ids = torch.tensor([prompt_ids])
+
+    chosen, log_probs, num_tokens, details = score_example(
+        model = model, tokenizer = tok, prompt_text = PROMPT, candidates = QA1_CANDIDATES, device = "cpu",
+    )
+
+    with torch.no_grad():
+        hidden = model(ids, return_hidden = True)[:, -1]
+        assert hidden.dtype == torch.bfloat16
+        ref = torch.log_softmax(torch.nn.functional.linear(hidden.float(), model.to_logits.weight.float()), dim = -1)[0]
+        bf16 = torch.log_softmax(model.to_logits(hidden).float(), dim = -1)[0]
+
+    scorer_dev = max(abs(log_probs[c] - ref[_fake_ids(tok, " " + c)[0]].item()) for c in QA1_CANDIDATES)
+    bf16_dev = max(abs(bf16[_fake_ids(tok, " " + c)[0]].item() - ref[_fake_ids(tok, " " + c)[0]].item()) for c in QA1_CANDIDATES)
+    assert scorer_dev < 1e-4, scorer_dev
+    assert bf16_dev > scorer_dev, (bf16_dev, scorer_dev)
+
+
+def test_non_linear_projection_refused_when_not_fp32():
+    """No silent fallback to a reduced-precision projection: a non-Linear
+    to_logits with non-fp32 hidden states is a TypeError; with fp32 hidden
+    states the plain call is used (the stub path)."""
+    class Bf16Stub(StubModel):
+        def forward(self, ids, disable_flex_attn = False, return_hidden = False):
+            return super().forward(ids, disable_flex_attn, return_hidden).to(torch.bfloat16)
+
+    with pytest.raises(TypeError, match = "not nn.Linear"):
+        _candidate_rows_log_softmax(
+            model = Bf16Stub(boosts = {}), input_ids = torch.tensor([[5, 6, 7]]), rows = slice(2, 3), disable_flex_attn = True,
+        )
+    out = _candidate_rows_log_softmax(
+        model = StubModel(boosts = {}), input_ids = torch.tensor([[5, 6, 7]]), rows = slice(2, 3), disable_flex_attn = True,
+    )
+    assert out.shape == (1, VOCAB)
+
+
 # ---------------------------------------------------------------------------
 # real T5 tokenizer (skipped when not cached locally)
 # ---------------------------------------------------------------------------
@@ -480,6 +715,47 @@ def test_t5_prompt_template_has_no_unk(tokenizer):
         prompt = build_prompt(task = task, context = "Fred gave the apple to Jeff.", question = "Who has the apple?")
         ids = tokenizer.encode(prompt, add_special_tokens = False)
         assert tokenizer.unk_token_id not in ids, f"{task}: template produces <unk>"
+
+
+def test_t5_boundary_window_reproduces_tail_and_guard_catches_resegmentation(tokenizer):
+    """(b) Real T5, prompt > window: the bounded window reproduces the prompt's
+    token tail, the window path (not the short-prompt early return) is taken,
+    the consistent case passes, and a planted boundary re-segmentation on the
+    joint call is caught."""
+    filler = " ".join(f"Mary moved to the bathroom. John went to the hallway. Sandra took the milk." for _ in range(8))
+    prompt = f"{filler} Where is Mary? Answer:"
+    assert len(prompt) > JOINT_CHECK_WINDOW_CHARS
+    window = _boundary_window(prompt)
+    assert JOINT_CHECK_WINDOW_CHARS <= len(window) < len(prompt), 'window path must be taken'
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens = False)
+    window_ids = tokenizer.encode(window, add_special_tokens = False)
+    assert prompt_ids[-len(window_ids):] == window_ids, 'the window must reproduce the prompt tail'
+
+    class Recording:
+        eos_token_id = tokenizer.eos_token_id
+        pad_token_id = tokenizer.pad_token_id
+        unk_token_id = tokenizer.unk_token_id
+
+        def __init__(self, plant = False):
+            self.texts = []
+            self.plant = plant
+
+        def encode(self, text, add_special_tokens = True):
+            self.texts.append(text)
+            ids = tokenizer.encode(text, add_special_tokens = add_special_tokens)
+            if self.plant and text.endswith(" garden") and len(text) > len(" garden"):
+                ids = ids[:-1] + [ids[-1] + 1]        # joint form re-segments the candidate
+            return ids
+
+    rec = Recording()
+    got_prompt_ids, cand_ids = encode_prompt_and_candidates(
+        tokenizer = rec, prompt_text = prompt, candidates = QA1_CANDIDATES
+    )
+    assert got_prompt_ids == prompt_ids
+    assert (window + " garden") in rec.texts and (prompt + " garden") not in rec.texts, 'window path must be used'
+
+    with pytest.raises(ValueError, match = "joint tokenization"):
+        encode_prompt_and_candidates(tokenizer = Recording(plant = True), prompt_text = prompt, candidates = ["garden"])
 
 
 def test_t5_qa5_names_are_single_tokens(tokenizer):

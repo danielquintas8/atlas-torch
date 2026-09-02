@@ -357,6 +357,30 @@ def read_checkpoint_meta(resume_dir):
     return torch.load(meta_path, map_location="cpu", weights_only=True)
 
 
+def validate_resume_schedule(schedule_meta, resume_meta):
+    """Check every schedule-shape field the checkpoint recorded against the
+    values this run computes; raise ValueError naming the first mismatching
+    field. Fields the checkpoint lacks (written before they were added) are
+    returned as a sorted list for the caller to warn about — per-field, so
+    an older checkpoint still has every field it DOES carry validated (an
+    all-or-nothing skip silently disabled the guard for every older
+    checkpoint). Changing GPU count / batch size / warmup mid-run rebuilds a
+    different cosine against the restored step counter."""
+    missing = {key for key in schedule_meta if key not in resume_meta}
+    for field, current in schedule_meta.items():
+        if field in missing:
+            continue
+        saved = resume_meta[field]
+        if saved != current:
+            raise ValueError(
+                f"resume schedule mismatch on '{field}': checkpoint has "
+                f"{saved}, this run computes {current}. Relaunch with "
+                f"the original geometry (GPU count, batch size, "
+                f"grad-accum, warmup)."
+            )
+    return sorted(missing)
+
+
 def resume_data_position(resume_meta, n_chunks, chunks_per_yield):
     """Map a checkpoint's recorded data position to (epoch_base, skip_chunks).
 
@@ -572,27 +596,12 @@ def main():
     if args.resume:
         resume_meta = read_checkpoint_meta(resume_dir=args.resume)
         start_step = resume_meta["step"]
-        # validate every schedule field the checkpoint recorded; warn only
-        # about absent ones (a checkpoint written before a field was added
-        # must still have the others checked — an all-or-nothing skip would
-        # silently disable the guard for every older checkpoint)
-        missing = [key for key in schedule_meta if key not in resume_meta]
+        missing = validate_resume_schedule(schedule_meta=schedule_meta, resume_meta=resume_meta)
         if missing:
             accelerator.print(
                 f"WARNING: checkpoint meta.pt lacks schedule fields {missing} "
-                f"(older format) — those fields cannot be validated; the rest are"
+                f"(older format) — those fields cannot be validated; the rest were"
             )
-        for field, current in schedule_meta.items():
-            if field in missing:
-                continue
-            saved = resume_meta[field]
-            if saved != current:
-                raise ValueError(
-                    f"resume schedule mismatch on '{field}': checkpoint has "
-                    f"{saved}, this run computes {current}. Relaunch with "
-                    f"the original geometry (GPU count, batch size, "
-                    f"grad-accum, warmup)."
-                )
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)

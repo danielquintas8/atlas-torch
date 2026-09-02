@@ -5,6 +5,7 @@ import random
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -461,3 +462,39 @@ def test_apply_vanilla_empties_memory_layers():
     assert vanilla["model"]["neural_memory_layers"] == ()
     other = {k: v for k, v in vanilla["model"].items() if k != "neural_memory_layers"}
     assert other == {k: v for k, v in base["model"].items() if k != "neural_memory_layers"}
+
+
+def test_validate_resume_schedule_raises_on_present_mismatch():
+    from experiments.train import validate_resume_schedule
+
+    schedule = dict(warmup_steps = 2000, schedule_steps = 30000, batch_tokens = 500_000, grad_accum = 122, world_size = 4)
+    saved = dict(schedule, step = 100)
+    assert validate_resume_schedule(schedule_meta = schedule, resume_meta = saved) == []
+
+    saved_bad = dict(saved, world_size = 2)
+    with pytest.raises(ValueError, match = "world_size"):
+        validate_resume_schedule(schedule_meta = schedule, resume_meta = saved_bad)
+
+
+def test_validate_resume_schedule_checks_present_fields_when_one_is_absent():
+    """An older checkpoint lacking one field must still have the OTHERS
+    validated — the all-or-nothing skip silently disabled the guard for every
+    checkpoint written before a field was added (review, 2026-09-02)."""
+    from experiments.train import validate_resume_schedule
+
+    schedule = dict(warmup_steps = 2000, schedule_steps = 30000, batch_tokens = 500_000, grad_accum = 122, world_size = 4, vanilla = False)
+    saved = dict(schedule, step = 100)
+    del saved["vanilla"]                       # absent field
+    saved["batch_tokens"] = 250_000            # present AND mismatched
+    with pytest.raises(ValueError, match = "batch_tokens"):
+        validate_resume_schedule(schedule_meta = schedule, resume_meta = saved)
+
+
+def test_validate_resume_schedule_returns_missing_when_rest_matches():
+    from experiments.train import validate_resume_schedule
+
+    schedule = dict(warmup_steps = 2000, schedule_steps = 30000, batch_tokens = 500_000, grad_accum = 122, world_size = 4, vanilla = False)
+    saved = dict(schedule, step = 100)
+    del saved["vanilla"]
+    del saved["world_size"]
+    assert validate_resume_schedule(schedule_meta = schedule, resume_meta = saved) == ["vanilla", "world_size"]
