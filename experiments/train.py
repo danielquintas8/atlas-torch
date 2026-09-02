@@ -22,6 +22,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -808,17 +809,39 @@ def main():
             model.eval()
 
             val_losses = []
+            near_certain_fracs = []
             with torch.no_grad():
                 for val_batch in val_loader:
-                    val_loss = model(val_batch, return_loss=True)
+                    # Per-token NLL, mirroring what forward(return_loss=True)
+                    # does (inputs x[:, :-1], labels x[:, 1:], mean CE) but
+                    # keeping the token-level tensor: its mean IS val_loss, and
+                    # the fraction of near-certain tokens (NLL < 0.01, i.e.
+                    # p > ~0.99) is a memorization / repeated-structure signal —
+                    # a rising fraction between checkpoints is MAI's
+                    # memorization-aware epoch-cap trigger. Relevant here because
+                    # the pre-fix data pipeline repeated data unplanned.
+                    inputs, labels = val_batch[:, :-1], val_batch[:, 1:]
+                    logits = model(inputs)
+                    token_nll = F.cross_entropy(
+                        logits.float().reshape(-1, logits.shape[-1]),
+                        labels.reshape(-1),
+                        reduction="none",
+                    )
+                    val_loss = token_nll.mean()
+                    near_certain = (token_nll < 0.01).float().mean()
                     val_losses.append(
                         accelerator.gather(val_loss).mean().item()
                     )
+                    near_certain_fracs.append(
+                        accelerator.gather(near_certain).mean().item()
+                    )
 
             avg_val = sum(val_losses) / max(1, len(val_losses))
+            avg_near_certain = sum(near_certain_fracs) / max(1, len(near_certain_fracs))
             accelerator.print(
                 f"step {global_step:>7d} | val_loss {avg_val:.4f} | "
-                f"val_ppl {math.exp(min(avg_val, 20)):.1f}"
+                f"val_ppl {math.exp(min(avg_val, 20)):.1f} | "
+                f"val_frac_near_certain {avg_near_certain:.4f}"
             )
 
             if args.wandb:
@@ -826,6 +849,7 @@ def main():
                     {
                         "val/loss": avg_val,
                         "val/perplexity": math.exp(min(avg_val, 20)),
+                        "val/frac_near_certain": avg_near_certain,
                     },
                     step=global_step,
                 )

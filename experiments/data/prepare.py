@@ -4,6 +4,13 @@ Pre-tokenize FineWeb for offline training.
 Tokenizes with T5, saves as memory-mapped binary files (uint16).
 Can run locally (downloads from HuggingFace) or on BSC (from local parquet).
 
+Tokenizer property worth knowing (same tokenizer as the Atlas paper, Appendix E):
+T5's SentencePiece model has NO byte fallback — characters outside its vocab
+(`{ } < \\`, CJK, emoji, ...) become `<unk>` (id 2) — and its normalizer deletes
+all newlines and tabs, so document structure is gone after tokenization. The
+audit counters below record the cost on the corpus actually tokenized
+(meta.json: unk_tokens / unk_rate / docs_with_unk / newlines_dropped).
+
 Usage:
     # Local (downloads from HF):
     python experiments/data/prepare.py --output /tmp/fineweb-t5
@@ -121,9 +128,24 @@ def main():
     buffer = []
     shard_paths = []
 
+    # inherited-tokenizer audit counters (see module docstring). Counted over
+    # every document tokenized, including the final buffer whether or not it
+    # is flushed, so they describe the tokenizer's behaviour on the corpus.
+    unk_id = tokenizer.unk_token_id
+    n_docs = 0
+    unk_tokens = 0
+    docs_with_unk = 0
+    newlines_dropped = 0
+
     for example in tqdm(dataset, desc="Tokenizing", unit=" docs"):
         tokens = tokenizer.encode(example["text"])
         buffer.extend(tokens)
+
+        n_docs += 1
+        n_unk = tokens.count(unk_id)
+        unk_tokens += n_unk
+        docs_with_unk += n_unk > 0
+        newlines_dropped += example["text"].count("\n")
 
         while len(buffer) >= args.shard_size:
             chunk = buffer[: args.shard_size]
@@ -182,12 +204,21 @@ def main():
         os.remove(val_path)
         print("val split empty — removed val.bin (validation will be disabled)")
 
+    tokens_seen = total_tokens + (len(buffer) if args.max_tokens and total_tokens >= args.max_tokens else 0)
+    unk_rate = unk_tokens / max(1, tokens_seen)
+
     meta = dict(
         vocab_size=tokenizer.vocab_size,
         total_tokens=total_tokens,
         train_tokens=train_tokens,
         val_tokens=val_tokens,
         dtype="uint16",
+        # tokenizer audit (T5: no byte fallback, newlines/tabs deleted)
+        docs=n_docs,
+        unk_tokens=unk_tokens,
+        unk_rate=unk_rate,
+        docs_with_unk=docs_with_unk,
+        newlines_dropped=newlines_dropped,
     )
     with open(os.path.join(args.output, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -198,6 +229,12 @@ def main():
         print(f"  val.bin    {os.path.getsize(val_path) / 1e6:.1f} MB")
     print(f"  tokenizer/")
     print(f"  meta.json")
+    print(
+        f"\nTokenizer audit (T5, no byte fallback): {n_docs:,} docs, "
+        f"{unk_tokens:,} <unk> tokens ({unk_rate * 100:.3f}%), "
+        f"{docs_with_unk:,} docs with <unk>, "
+        f"{newlines_dropped:,} newlines in source text deleted by the normalizer"
+    )
 
 
 if __name__ == "__main__":
