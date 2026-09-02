@@ -430,3 +430,16 @@ def test_resume_data_position_roundtrip(tmp_path):
     assert resume_data_position(
         resume_meta = dict(step = 5), n_chunks = n_chunks, chunks_per_yield = chunks_per_yield,
     ) == (0, 0, False)
+
+
+def test_shipped_mac_config_disables_axial_pos_emb():
+    """Pin the shipped MAC config: the absolute axial positional embedding is
+    OFF (2026-09-02). It fed raw integer segment indices into an MLP, so every
+    eval beyond the 1K training length ran on out-of-distribution positional
+    inputs (random-init norm 7.6x the trained range at 4K, ~1950x at 1M).
+    Rotary carries within-window position and the memory is position-free."""
+    from experiments.configs import MAC_DEFAULTS, get_config
+
+    assert MAC_DEFAULTS["use_axial_pos_emb"] is False
+    resolved = get_config(model_size = "170m", variant = "atlas-mac")
+    assert resolved["model"]["use_axial_pos_emb"] is False

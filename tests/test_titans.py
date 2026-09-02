@@ -1099,3 +1099,39 @@ def test_omega_context_exceeding_batch_size_warns():
     warn, not fail."""
     with pytest.warns(UserWarning, match = 'omega_context'):
         NeuralMemory(dim = 16, chunk_size = 8, batch_size = 8, omega_context = 16)
+
+def test_mac_without_axial_pos_emb():
+    """The absolute axial positional embedding is optional (off in the experiment
+    config, 2026-09-02): it feeds raw integer segment indices into an MLP, so any
+    eval beyond the training length ran on out-of-distribution positions. With
+    the flag off, forward (loss) and cached sampling must both run, and no
+    axial params may remain in the state dict. The default (on) is kept for
+    library users — asserted as the liveness control."""
+    def build(use_axial_pos_emb):
+        return MemoryAsContextTransformer(
+            num_tokens = 256,
+            dim = 16,
+            depth = 2,
+            segment_len = 32,
+            num_persist_mem_tokens = 4,
+            num_longterm_mem_tokens = 4,
+            neural_mem_gate_attn_output = False,
+            use_axial_pos_emb = use_axial_pos_emb,
+        )
+
+    model = build(use_axial_pos_emb = False)
+    assert model.axial_pos_emb is None
+    assert not any('axial_pos_emb' in name for name in model.state_dict()), 'axial params must not exist when disabled'
+
+    ids = torch.randint(0, 256, (1, 129))
+    loss = model(ids, return_loss = True)
+    assert loss.isfinite()
+    loss.backward()
+
+    sampled = model.sample(ids[:, :16], 16 + 40, use_cache = True, temperature = 0., show_progress = False)
+    assert sampled.shape == (1, 40)
+
+    # liveness: the default still builds the embedding
+    default_model = build(use_axial_pos_emb = True)
+    assert default_model.axial_pos_emb is not None
+    assert any('axial_pos_emb' in name for name in default_model.state_dict())

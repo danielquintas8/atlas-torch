@@ -30,6 +30,10 @@ What this does not do for free is retain. The decay gate means the memory adapts
 | Detach Segment Memory | `neural_memory.py` | Truncated outer-loop backprop across segments — standard TTT approximation for memory efficiency |
 | `atlas_config()` | `neural_memory.py` | Convenience classmethod returning recommended Atlas defaults |
 
+#### Known deviations from the paper's MAC
+
+The transformer around the memory is lucidrains' MAC, not a line-by-line port of the paper's. The paper's MAC retrieves with the pre-update state M_{t−1} and writes the attention output into memory; this MAC reads the post-update per-token state and writes the residual-stream input view. Memory retrieval enters the residual stream rather than being prepended to the attention window as context tokens. These are inherited design choices, applied identically to both the Titans and Atlas variants, so within-repo comparisons are unaffected.
+
 ### Bug Fixes
 
 | Fix | File | Description |
@@ -40,6 +44,7 @@ What this does not do for free is retain. The decay gate means the memory adapts
 | Omega incompatibility guards | `neural_memory.py` | Assertions preventing omega with `num_kv_per_token > 1` or `store_with_lookahead_value` |
 | Omega window slide | `neural_memory.py` | Fixed shifted-gradient slice direction (2026-09-01): pre-fix, the window collapsed to a per-position gate multiplier with no cross-token mixing; now guarded by value-level tests against a brute-force reference of the paper equation |
 | Store-path gradient starvation | `experiments/configs.py` | `detach_segment_memory` off in the training config (2026-09-01): with the interleaved sequence exceeding `neural_memory_batch_size`, detach froze the learned memory init and cut store-side params off from most outer-loop gradient |
+| Absolute positional embedding out of distribution beyond the training length | `mac_transformer.py`, `experiments/configs.py` | New `use_axial_pos_emb` flag, off in the experiment config (2026-09-02): the continuous axial embedding feeds raw integer segment indices into an MLP, so at eval lengths beyond training its norm grew ~linearly with position (7.6× the trained range at 4K for a 1K-trained model, ~1950× at 1M); rotary already carries within-window position and the memory is position-free |
 
 Checkpoints trained before these fixes are incompatible with current code: strict loading fails (the new value conv adds parameters), and they are semantically stale under the fixed omega window — loading them with `strict=False` silently runs a randomly-initialized value conv in the store path. Do not evaluate old checkpoints on new code.
 
