@@ -46,6 +46,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from eval.babilong.evaluate import load_model
+from experiments.train import parse_memory_kwargs
 
 
 def iter_val_chunks(val_bin, seq_len, max_chunks):
@@ -169,6 +170,8 @@ def parse_args():
     p.add_argument("--variant", required=True,
                    choices=["titans-mac", "titans-mag", "atlas-mac", "atlas-mag"])
     p.add_argument("--ablation", default=None)
+    p.add_argument("--memory-kwarg", action="append", default=[], metavar="KEY=VALUE",
+                   help="Mirror of train.py --memory-kwarg for a checkpoint trained with overrides.")
     p.add_argument("--vanilla", action="store_true",
                    help="Memory-free baseline: build with neural_memory_layers=()")
     p.add_argument("--val-bin", required=True, help="Path to val.bin (uint16 memmap)")
@@ -197,7 +200,7 @@ def main():
         variant=args.variant,
         ablation=args.ablation,
         device=args.device,
-        vanilla=args.vanilla,
+        vanilla=args.vanilla, memory_kwargs=parse_memory_kwargs(items=args.memory_kwarg),
     )
 
     # same total token span for every seq_len, so the table's columns cover the

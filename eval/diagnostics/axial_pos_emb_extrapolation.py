@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 
 from experiments.configs import get_config
+from experiments.train import apply_memory_kwargs, parse_memory_kwargs
 
 AXIAL_PREFIX = "axial_pos_emb."
 
@@ -82,6 +83,8 @@ def parse_args():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--checkpoint", help="Checkpoint dir trained with use_axial_pos_emb=True")
     src.add_argument("--random-init", action="store_true", help="Reproduce the finding at random init")
+    p.add_argument("--memory-kwarg", action="append", default=[], metavar="KEY=VALUE",
+                   help="Mirror of train.py --memory-kwarg for a checkpoint trained with overrides.")
     p.add_argument("--seeds", type=int, default=3, help="Seeds for --random-init")
     p.add_argument("--train-seq-len", type=int, default=1084,
                    help="Positions the model actually saw in training (1024 tokens + longterm mem tokens = 1084)")
@@ -106,7 +109,8 @@ def fed_position(token_position, segment_len, num_longterm_mem_tokens):
 
 def main():
     args = parse_args()
-    model_cfg = get_config(model_size=args.model, variant=args.variant)["model"]
+    config = get_config(model_size=args.model, variant=args.variant)
+    model_cfg = apply_memory_kwargs(config=config, overrides=parse_memory_kwargs(items=args.memory_kwarg))["model"]
     dim = model_cfg["dim"]
     stride = args.stride or model_cfg["neural_memory_segment_len"]
     fed = [

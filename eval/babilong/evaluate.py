@@ -84,6 +84,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from titans_pytorch import MemoryAsContextTransformer
 from experiments.configs import get_config
+from experiments.train import apply_memory_kwargs, parse_memory_kwargs
 from eval.babilong.prompts import TASK_LABELS, build_prompt
 
 
@@ -131,16 +132,20 @@ def check_model_config_drift(checkpoint_dir, model_config):
         )
 
 
-def load_model(checkpoint_dir, model_size, variant, ablation=None, device="cuda", vanilla=False, dtype=None):
+def load_model(checkpoint_dir, model_size, variant, ablation=None, device="cuda", vanilla=False, dtype=None, memory_kwargs=None):
     """Load model from accelerate checkpoint.
 
     `vanilla` mirrors train.py --vanilla (neural_memory_layers=()): a
     memory-free baseline checkpoint has no NeuralMemory weights, so it can
-    only load into a memory-free model.
+    only load into a memory-free model. `memory_kwargs` mirrors train.py
+    --memory-kwarg: a checkpoint trained with overrides records them in
+    model_config.json, and the drift guard below refuses to load it into
+    the un-overridden config.
     """
     config = get_config(model_size=model_size, variant=variant, ablation=ablation)
     if vanilla:
         config["model"]["neural_memory_layers"] = ()
+    config = apply_memory_kwargs(config=config, overrides=memory_kwargs or {})
     check_model_config_drift(checkpoint_dir=checkpoint_dir, model_config=config["model"])
     model = MemoryAsContextTransformer(**config["model"])
 
@@ -837,6 +842,9 @@ def parse_args():
     p.add_argument("--variant", required=True,
                     choices=["titans-mac", "titans-mag", "atlas-mac", "atlas-mag"])
     p.add_argument("--ablation", default=None)
+    p.add_argument("--memory-kwarg", action="append", default=[], metavar="KEY=VALUE",
+                   help="Mirror of train.py --memory-kwarg for a checkpoint trained with overrides "
+                        "(repeatable; the drift guard refuses a mismatch).")
     p.add_argument("--vanilla", action="store_true",
                    help="Memory-free baseline: build with neural_memory_layers=() to match train.py --vanilla.")
     p.add_argument("--tokenizer-dir", default=None,
@@ -886,7 +894,7 @@ def main():
         variant=args.variant,
         ablation=args.ablation,
         device=args.device,
-        vanilla=args.vanilla,
+        vanilla=args.vanilla, memory_kwargs=parse_memory_kwargs(items=args.memory_kwarg),
         dtype=torch.bfloat16 if args.bf16 else None,
     )
 
