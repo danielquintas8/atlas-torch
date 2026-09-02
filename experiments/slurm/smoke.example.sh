@@ -62,8 +62,19 @@ ABLATION_FLAG=""
 if [ -n "${ABLATION}" ]; then
     ABLATION_FLAG="--ablation ${ABLATION}"
 fi
+# VANILLA=1 -> memory-free trunk; MEMORY_KWARGS="k=v ..." -> one-off NeuralMemory
+# overrides (e.g. use_sequential_scan=False for the scan throughput comparison);
+# RUN_SUFFIX keeps the smoke variants' logs and run dirs apart.
+VANILLA_FLAG=""
+if [ -n "${VANILLA}" ]; then
+    VANILLA_FLAG="--vanilla"
+fi
+MEMORY_FLAGS=""
+for kv in ${MEMORY_KWARGS}; do
+    MEMORY_FLAGS="${MEMORY_FLAGS} --memory-kwarg ${kv}"
+done
 
-RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}-smoke"
+RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}${VANILLA:+-vanilla}${RUN_SUFFIX}-smoke"
 
 scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
 
@@ -86,6 +97,8 @@ singularity exec --nv \
             experiments/train.py \
                 --model ${MODEL} \
                 ${ABLATION_FLAG} \
+                ${VANILLA_FLAG} \
+                ${MEMORY_FLAGS} \
                 --variant ${VARIANT} \
                 --data-dir ${DATA_DIR} \
                 --output-dir ${PROJECT_ROOT}/runs \
