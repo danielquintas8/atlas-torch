@@ -443,3 +443,21 @@ def test_shipped_mac_config_disables_axial_pos_emb():
     assert MAC_DEFAULTS["use_axial_pos_emb"] is False
     resolved = get_config(model_size = "170m", variant = "atlas-mac")
     assert resolved["model"]["use_axial_pos_emb"] is False
+
+
+def test_apply_vanilla_empties_memory_layers():
+    """--vanilla builds the memory-free baseline (neural_memory_layers=()) and
+    leaves everything else untouched; without the flag the config is
+    unchanged. eval/babilong/evaluate.py --vanilla mirrors this override."""
+    from experiments.configs import get_config
+    from experiments.train import apply_vanilla
+
+    base = get_config(model_size = "170m", variant = "atlas-mac")
+    untouched = apply_vanilla(config = copy.deepcopy(base), vanilla = False)
+    assert untouched["model"]["neural_memory_layers"] == base["model"]["neural_memory_layers"]
+    assert len(base["model"]["neural_memory_layers"]) > 0, 'liveness: the base config has memory layers'
+
+    vanilla = apply_vanilla(config = copy.deepcopy(base), vanilla = True)
+    assert vanilla["model"]["neural_memory_layers"] == ()
+    other = {k: v for k, v in vanilla["model"].items() if k != "neural_memory_layers"}
+    assert other == {k: v for k, v in base["model"].items() if k != "neural_memory_layers"}

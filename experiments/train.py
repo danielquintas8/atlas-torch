@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import re
@@ -298,22 +299,41 @@ def build_param_groups(model, weight_decay):
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position):
+def apply_vanilla(config, vanilla):
+    """--vanilla: memory-free baseline. Empties neural_memory_layers so the
+    model is the MAC trunk (sliding-window attention + persistent / longterm
+    mem tokens) with no NeuralMemory at all — the fair "does the memory
+    module buy anything" control. eval/babilong/evaluate.py --vanilla builds
+    the same config to load such a checkpoint."""
+    if vanilla:
+        config["model"]["neural_memory_layers"] = ()
+    return config
+
+
+def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position, model_config):
     """Save accelerate state + meta.pt marking the checkpoint complete.
 
     meta.pt is written by the main process AFTER a barrier, so its presence
     marks a fully-written checkpoint (all ranks done) — prune_checkpoints
     only counts dirs that have it. It carries the schedule-shape fields
-    (warmup_steps, schedule_steps, batch_tokens, grad_accum, world_size) so
-    resume can refuse a run whose shape silently changed, and the exact data
-    position (epochs_done, yields_this_epoch) counted by the training loop —
-    resume maps it straight back to (epoch_base, skip_chunks), see
-    resume_data_position.
+    (warmup_steps, schedule_steps, batch_tokens, grad_accum, world_size,
+    vanilla) so resume can refuse a run whose shape silently changed, and the
+    exact data position (epochs_done, yields_this_epoch) counted by the
+    training loop — resume maps it straight back to (epoch_base,
+    skip_chunks), see resume_data_position.
+
+    model_config.json records the resolved MemoryAsContextTransformer kwargs.
+    Strict state-dict loading catches parameter-set drift only; a
+    non-parameter field (neural_memory_batch_size, omega_context, ...) changes
+    eval semantics without changing any shape — the eval harness compares
+    this file against the config it builds and refuses on any difference.
     """
     ckpt_dir = os.path.join(output_dir, f"step-{step}")
     accelerator.save_state(ckpt_dir)
     accelerator.wait_for_everyone()  # all ranks finished writing state files
     if accelerator.is_main_process:
+        with open(os.path.join(ckpt_dir, "model_config.json"), "w") as f:
+            json.dump(model_config, f, indent=2, sort_keys=True, default=str)
         meta = dict(step=step)
         meta.update(schedule_meta)
         meta.update(data_position)
@@ -459,6 +479,13 @@ def parse_args():
         "after each save. Default None keeps all — the eval workflow scores "
         "multiple historical checkpoints, so rotation is opt-in.",
     )
+    p.add_argument(
+        "--vanilla",
+        action="store_true",
+        help="Memory-free baseline: neural_memory_layers=() (MAC trunk with no "
+        "NeuralMemory). Run name gets a -vanilla suffix; recorded in meta.pt and "
+        "validated on resume. eval/babilong/evaluate.py --vanilla loads it.",
+    )
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
     if args.keep_checkpoints is not None and args.keep_checkpoints < 1:
@@ -473,6 +500,7 @@ def main():
 
     args = parse_args()
     config = get_config(args.model, args.variant, args.ablation)
+    config = apply_vanilla(config=config, vanilla=args.vanilla)
     train_cfg = config["training"]
     if args.seq_len:
         train_cfg["seq_len"] = args.seq_len
@@ -483,6 +511,7 @@ def main():
     run_name = args.run_name or (
         f"{args.model}-{args.variant}"
         + (f"-{args.ablation}" if args.ablation else "")
+        + ("-vanilla" if args.vanilla else "")
     )
     output_dir = os.path.join(args.output_dir, run_name)
 
@@ -499,6 +528,7 @@ def main():
         batch_tokens=batch_tokens,
         grad_accum=grad_accum,
         world_size=num_gpus,
+        vanilla=bool(args.vanilla),
     )
 
     # Accelerator
@@ -668,6 +698,16 @@ def main():
         limit_chunks=val_yields * args.per_device_batch_size * num_gpus,
     )
     if val_dataset is not None and val_dataset.n_chunks > 0:
+        val_chunks_wanted = val_yields * args.per_device_batch_size * num_gpus
+        if val_dataset.n_chunks < val_chunks_wanted:
+            # the val statistics are a mean of per-batch means; with fewer
+            # chunks than one full set of per-rank yields the last global
+            # batch is ragged/padded and the mean is slightly biased
+            accelerator.print(
+                f"WARNING: val.bin holds {val_dataset.n_chunks} chunks < {val_chunks_wanted} "
+                f"wanted for {val_yields} equal per-rank yields — val_loss / "
+                f"val_frac_near_certain are mean-of-per-batch-means and slightly biased"
+            )
         val_loader = accelerator.prepare(
             DataLoader(val_dataset, batch_size=args.per_device_batch_size)
         )
@@ -816,10 +856,15 @@ def main():
                     # does (inputs x[:, :-1], labels x[:, 1:], mean CE) but
                     # keeping the token-level tensor: its mean IS val_loss, and
                     # the fraction of near-certain tokens (NLL < 0.01, i.e.
-                    # p > ~0.99) is a memorization / repeated-structure signal —
-                    # a rising fraction between checkpoints is MAI's
-                    # memorization-aware epoch-cap trigger. Relevant here because
-                    # the pre-fix data pipeline repeated data unplanned.
+                    # p > ~0.99) is a memorization / repeated-structure signal:
+                    # tokens the model predicts with near certainty are
+                    # disproportionately repeated or templated text, so a
+                    # fraction that RISES between checkpoints while val loss
+                    # falls says the improvement is memorization, not
+                    # generalization — the trigger the MAI-Base-1 technical
+                    # report uses for its memorization-aware per-source epoch
+                    # caps. Relevant here because the pre-fix data pipeline
+                    # repeated data unplanned.
                     inputs, labels = val_batch[:, :-1], val_batch[:, 1:]
                     logits = model(inputs)
                     token_nll = F.cross_entropy(
@@ -866,6 +911,7 @@ def main():
                 data_position=dict(
                     epochs_done=epochs_done, yields_this_epoch=yields_this_epoch
                 ),
+                model_config=config["model"],
             )
             prune_checkpoints(
                 accelerator=accelerator,
@@ -882,6 +928,7 @@ def main():
         data_position=dict(
             epochs_done=epochs_done, yields_this_epoch=yields_this_epoch
         ),
+        model_config=config["model"],
     )
     prune_checkpoints(
         accelerator=accelerator, output_dir=output_dir, keep=args.keep_checkpoints
