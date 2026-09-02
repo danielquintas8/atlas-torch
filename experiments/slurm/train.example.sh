@@ -33,6 +33,14 @@
 #     j=$(MODEL=170m VARIANT=atlas-mac RESUME=latest sbatch --parsable --dependency=afterany:$j experiments/slurm/train.sh)
 #   done
 # (afterany, not afterok: a job killed at the wall limit exits non-zero.)
+# Every job in the chain must repeat the SAME env (ABLATION, VANILLA, RUN_SUFFIX,
+# MEMORY_KWARGS, PEAK_LR, SAVE_EVERY): the run name decides which checkpoint
+# `latest` finds, and train.py refuses a resume whose peak LR or memory
+# overrides differ from the checkpoint's meta.pt.
+#
+# This file is a template: copy it to experiments/slurm/train.sh (gitignored,
+# holds the real account/paths) and re-copy after every update — an old
+# train.sh does not know RESUME=latest.
 
 ml singularity/4.1.5
 
@@ -72,13 +80,22 @@ elif [ -n "${RESUME}" ]; then
     RESUME_FLAG="--resume ${PROJECT_ROOT}/${RESUME}"
 fi
 VANILLA_FLAG=""
-if [ -n "${VANILLA}" ]; then
+VANILLA_SUFFIX=""
+if [ "${VANILLA}" = "1" ]; then        # exactly 1: VANILLA=0 must mean off
     VANILLA_FLAG="--vanilla"
+    VANILLA_SUFFIX="-vanilla"
+elif [ -n "${VANILLA}" ]; then
+    echo "VANILLA must be 1 or unset, got '${VANILLA}'" >&2; exit 2
 fi
 MEMORY_FLAGS=""
+set -f                                  # no glob expansion of the values
 for kv in ${MEMORY_KWARGS}; do
+    case "${kv}" in
+        *[\$\`\*\?\'\"]*|*=|=*) echo "MEMORY_KWARGS entry '${kv}' rejected: KEY=VALUE, no quotes/globs/shell chars (it is re-parsed by the container shell)" >&2; exit 2 ;;
+    esac
     MEMORY_FLAGS="${MEMORY_FLAGS} --memory-kwarg ${kv}"
 done
+set +f
 MAX_STEPS_FLAG=""
 if [ -n "${MAX_STEPS}" ]; then
     MAX_STEPS_FLAG="--max-steps ${MAX_STEPS}"
@@ -91,7 +108,7 @@ fi
 # Checkpoints: SAVE_EVERY=100 writes ~300 checkpoints x ~2-3 GB over a full
 # 15B run (600-900 GB of GPFS). train.py's --keep-checkpoints N rotates,
 # keeping only the newest N — opt-in because evals score historical checkpoints.
-RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}${VANILLA:+-vanilla}${RUN_SUFFIX}"
+RUN_NAME="${MODEL}-${VARIANT}${ABLATION:+-${ABLATION}}${VANILLA_SUFFIX}${RUN_SUFFIX}"
 
 # rename job to match variant (SBATCH --job-name is hardcoded; static directives can't use env vars)
 scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
