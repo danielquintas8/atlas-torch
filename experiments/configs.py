@@ -152,6 +152,15 @@ VARIANTS = {
 
 ABLATIONS = {
     "no-poly":  dict(polynomial_degree=None),
+    # NOT "atlas minus the window" (found 2026-09-02, decision pending): at
+    # omega_context=1 NeuralMemory leaves the omega path entirely (use_omega =
+    # omega_context > 1) and runs lucidrains' chunk-wise Titans memory — one
+    # gradient per 8-position store chunk at chunk-start weights, PER-CHUNK
+    # retrieve (per_token_retrieve is silently ignored at c=1; forcing it there
+    # crashes, no per-token weight states exist), attention-pooled chunk gates.
+    # So it differs from "atlas" in gradient granularity, base-weight staleness
+    # and retrieve granularity as well as the window; a no-omega-vs-atlas gap
+    # is not the window's effect alone.
     "no-omega": dict(omega_context=1, attn_pool_chunks=True),
     "no-muon":  dict(spectral_norm_surprises=False),
 }
