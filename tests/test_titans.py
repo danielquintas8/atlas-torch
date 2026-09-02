@@ -1083,6 +1083,161 @@ def test_shipped_atlas_memory_config_pins():
     assert atlas['per_token_retrieve'] is True
     assert atlas['spectral_norm_surprises'] is True
     assert atlas['polynomial_degree'] == 2
+    assert atlas['per_token_updates'] is True, 'the per-token store path must not depend on the window size (2026-09-02 ablation confound)'
+
+
+def _perturbation_reach(mem, seq, store, position):
+    """First retrieve position whose output changes when the STORE input at
+    `position` is perturbed with the queries fixed. `position` itself is the
+    per-token post-update read M_t(q_t); a later position means the retrieve
+    reads a coarser (per-chunk) state."""
+    with torch.no_grad():
+        base, _ = mem(seq, store_seq = store)
+        perturbed = store.clone()
+        perturbed[0, position] += 1.0
+        out, _ = mem(seq, store_seq = perturbed)
+    changed = ((out - base).abs().amax(dim = (0, 2)) > 1e-12).nonzero().flatten()
+    return int(changed[0]) if changed.numel() else None
+
+
+def _no_omega_test_memory(**overrides):
+    torch.manual_seed(0)
+    kwargs = NeuralMemory.atlas_config(dim_head = 8, heads = 4, use_sequential_scan = True)
+    kwargs.update(overrides)
+    return NeuralMemory(dim = 32, chunk_size = 8, batch_size = 64, **kwargs).double().eval()
+
+
+def test_no_omega_ablation_is_atlas_minus_the_window():
+    """ABLATIONS['no-omega'] must differ from the atlas memory by the omega window
+    and its gamma gates only. Before 2026-09-02, omega_context=1 silently left the
+    per-token path: per-chunk gradients at chunk-start weights, chunk-pooled gates,
+    eta folded into the gradient (washed out by Muon) and per-chunk retrieve — five
+    changes for one ablation. Behavioural probe: perturb the store input at one
+    position with the queries fixed; the per-token post-update read reaches the
+    retrieve at that position, the chunk-wise read only at the end of its chunk."""
+    from experiments.configs import MEMORY_CONFIGS, ABLATIONS
+
+    assert ABLATIONS['no-omega'] == dict(omega_context = 1), 'no-omega must touch the window only'
+
+    torch.manual_seed(1)
+    seq = torch.randn(1, 64, 32, dtype = torch.float64)
+    store = torch.randn(1, 64, 32, dtype = torch.float64)
+
+    atlas = _no_omega_test_memory(short_conv_size = 0)
+    no_omega = _no_omega_test_memory(short_conv_size = 0, **ABLATIONS['no-omega'])
+    chunk_wise = _no_omega_test_memory(
+        short_conv_size = 0, omega_context = 1, per_token_updates = False,
+        per_token_retrieve = False, spectral_norm_surprises = False,
+    )
+
+    assert no_omega.per_token_updates and no_omega.retrieve_chunk_size == 1
+    assert not hasattr(no_omega, 'to_context_gates'), 'the gamma gates belong to the window'
+    assert hasattr(atlas, 'to_context_gates')
+
+    for position in (3, 10, 21):
+        assert _perturbation_reach(atlas, seq, store, position) == position
+        assert _perturbation_reach(no_omega, seq, store, position) == position
+    # instrument: the chunk-wise path reads a coarser state — the change lands at the
+    # end of the store chunk (7 / 15 / 23), never at the position itself
+    assert [_perturbation_reach(chunk_wise, seq, store, p) for p in (3, 10, 21)] == [7, 15, 23]
+
+    # the shipped resolution (memory config + ablation) builds the per-token path
+    resolved = {**MEMORY_CONFIGS['atlas'], **ABLATIONS['no-omega'], 'dim_head': 8, 'heads': 4}
+    mem = NeuralMemory(dim = 32, chunk_size = 8, batch_size = 64, **resolved)
+    assert mem.per_token_updates and mem.retrieve_chunk_size == 1 and not hasattr(mem, 'to_context_gates')
+
+
+def test_per_token_path_at_c1_equals_window_with_only_newest_tap():
+    """The no-omega ablation and atlas share every parameter and code path except
+    the window: with the gamma gates forced to select only the newest tap (older
+    taps -> sigmoid(-60), newest -> sigmoid(60)) the omega_context=8 memory
+    reproduces the omega_context=1 per-token memory to fp64 precision. A path
+    difference anywhere else (gates, eta placement, scan, retrieve) breaks the
+    equality; the pre-fix chunk-wise fallback differed by O(1)."""
+    no_omega, atlas = _no_omega_test_memory(omega_context = 1), _no_omega_test_memory(omega_context = 8)
+    missing, unexpected = atlas.load_state_dict(no_omega.state_dict(), strict = False)
+    assert not unexpected
+    assert missing and all(key.startswith('to_context_gates') for key in missing), missing
+
+    heads, window = 4, 8
+    gate = atlas.to_context_gates[0]
+    with torch.no_grad():
+        gate.weight.zero_()
+        bias = torch.full((heads, window), -60.0, dtype = gate.bias.dtype)
+        bias[:, -1] = 60.0
+        gate.bias.copy_(bias.reshape(-1))
+
+    torch.manual_seed(1)
+    seq = torch.randn(2, 64, 32, dtype = torch.float64)
+    with torch.no_grad():
+        out_no_omega, _ = no_omega(seq)
+        out_atlas, _ = atlas(seq)
+    max_dev = (out_no_omega - out_atlas).abs().max().item()
+    assert torch.allclose(out_no_omega, out_atlas, atol = 1e-12, rtol = 0), f'max |dev| {max_dev:.3e}'
+
+    # instrument: opening every tap makes the window mix and the outputs diverge
+    with torch.no_grad():
+        gate.bias.fill_(60.0)
+        out_mixed, _ = atlas(seq)
+    assert (out_mixed - out_no_omega).abs().max().item() > 1e-3
+
+
+def test_no_omega_eta_stays_outside_newton_schulz_at_c1(monkeypatch):
+    """eta placement is part of what no-omega must share with atlas: on the
+    per-token path eta is applied per target position AFTER Newton-Schulz at
+    omega_context=1 exactly as at 8 (same code). Placement instrument: spy the
+    tensors handed to newtonschulz5 while scaling eta 10x through
+    default_step_transform_max_lr — on the per-token path they are identical
+    (eta has not been applied yet) while the retrieved output changes (eta is
+    live); on the chunk-wise path, the memory the old no-omega silently ran,
+    the same tensors scale 10x because eta is folded into the gradient as a
+    loss weight before NS-5 (whose skipped vector parameters and per-token
+    relative weights are then all that keeps eta alive there)."""
+    import titans_pytorch.neural_memory as neural_memory_module
+
+    original = neural_memory_module.newtonschulz5
+    torch.manual_seed(1)
+    seq = torch.randn(2, 64, 32, dtype = torch.float64)
+
+    def ns_inputs_and_output(max_lr, **overrides):
+        seen = []
+
+        def spy(update, **kwargs):
+            seen.append(update.detach().clone())
+            return original(update, **kwargs)
+
+        monkeypatch.setattr(neural_memory_module, 'newtonschulz5', spy)
+        with torch.no_grad():
+            out, _ = _no_omega_test_memory(default_step_transform_max_lr = max_lr, **overrides)(seq)
+        monkeypatch.setattr(neural_memory_module, 'newtonschulz5', original)
+        assert seen, 'instrument: Newton-Schulz was never entered'
+        return seen, out
+
+    small_inputs, small_out = ns_inputs_and_output(0.1, omega_context = 1)
+    large_inputs, large_out = ns_inputs_and_output(1.0, omega_context = 1)
+    assert len(small_inputs) == len(large_inputs)
+    for a, b in zip(small_inputs, large_inputs):
+        assert torch.equal(a, b), 'eta reached Newton-Schulz on the per-token path'
+    assert not torch.allclose(small_out, large_out, atol = 1e-8), 'eta has no effect on the no-omega path'
+
+    chunk_wise = dict(omega_context = 1, per_token_updates = False, per_token_retrieve = False)
+    small_inputs, _ = ns_inputs_and_output(0.1, **chunk_wise)
+    large_inputs, _ = ns_inputs_and_output(1.0, **chunk_wise)
+    for a, b in zip(small_inputs, large_inputs):
+        assert torch.allclose(10 * a, b, atol = 1e-9, rtol = 0), 'instrument: the chunk-wise path must fold eta into the gradient'
+
+
+def test_per_token_path_flags_refuse_contradictions():
+    """The store path is explicit: the two contradictory combinations fail loudly
+    instead of silently picking a path (the 2026-09-02 confound), and the library
+    default still follows the window."""
+    with pytest.raises(ValueError, match = 'per_token_updates'):
+        NeuralMemory(dim = 16, chunk_size = 8, omega_context = 1, per_token_retrieve = True)
+    with pytest.raises(ValueError, match = 'per_token_updates'):
+        NeuralMemory(dim = 16, chunk_size = 8, omega_context = 8, per_token_updates = False)
+    assert NeuralMemory(dim = 16, chunk_size = 8).per_token_updates is False
+    assert NeuralMemory(dim = 16, chunk_size = 8, omega_context = 4).per_token_updates is True
+
 
 def test_omega_weight_residual_asserts():
     """omega + accept_weight_residual must refuse to construct: prev_weights are
@@ -1251,9 +1406,10 @@ def _chunked_test_mac(
     ).eval()
 
 
-def _atlas_mem_kwargs():
+def _atlas_mem_kwargs(**overrides):
     kwargs = NeuralMemory.atlas_config()
     kwargs.update(dim_head = 8, heads = 4, use_sequential_scan = True)
+    kwargs.update(overrides)
     return kwargs
 
 
@@ -1267,6 +1423,7 @@ CHUNKED_CASES = {
     'memory-free trunk': dict(mem_layers = (), mem_kwargs = dict()),
     'atlas + axial pos emb ON': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs(), use_axial_pos_emb = True),
     'atlas, block attention (sliding off)': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs(), sliding = False),
+    'atlas no-omega (c=1, per-token path)': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs(omega_context = 1)),
 }
 
 
