@@ -1222,7 +1222,16 @@ def test_per_token_retrieve_tail_reads_last_complete_chunk_state():
 
 # chunked inference
 
-def _chunked_test_mac(mem_layers, mem_kwargs, use_axial_pos_emb = False, sliding = True, seed = 0):
+def _chunked_test_mac(
+    mem_layers,
+    mem_kwargs,
+    use_axial_pos_emb = False,
+    sliding = True,
+    seed = 0,
+    neural_memory_segment_len = 8,
+    neural_memory_batch_size = 64,
+    neural_mem_weight_residual = False,
+):
     torch.manual_seed(seed)
     return MemoryAsContextTransformer(
         num_tokens = 256,
@@ -1232,8 +1241,9 @@ def _chunked_test_mac(mem_layers, mem_kwargs, use_axial_pos_emb = False, sliding
         num_persist_mem_tokens = 4,
         num_longterm_mem_tokens = 4,
         neural_memory_layers = mem_layers,
-        neural_memory_segment_len = 8,
-        neural_memory_batch_size = 64,
+        neural_memory_segment_len = neural_memory_segment_len,
+        neural_memory_batch_size = neural_memory_batch_size,
+        neural_mem_weight_residual = neural_mem_weight_residual,
         use_flex_attn = False,
         sliding_window_attn = sliding,
         neural_memory_kwargs = mem_kwargs,
@@ -1272,7 +1282,10 @@ def test_chunked_forward_matches_parallel(case, chunk_len):
     K/V cache) and block (no previous window; only the head of the segment a
     chunk starts in) — on global interleaved positions. 200 tokens -> 248
     interleaved positions, so the last chunk is partial for both chunk
-    lengths, and chunk starts (64, 128, 192) sit mid-segment (segment 20)."""
+    lengths, and chunk starts (64, 128, 192) sit mid-segment (segment 20).
+    Chunk starts ON a segment boundary — the only place a sliding cache one
+    row short of `need` is visible — are covered by
+    test_chunked_forward_matches_parallel_at_window_boundary_starts."""
     model = _chunked_test_mac(**CHUNKED_CASES[case])
     torch.manual_seed(1)
     ids = torch.randint(0, 256, (2, 200))
@@ -1545,6 +1558,77 @@ def test_chunked_forward_rejects_gated_transition():
 
     # liveness: the same geometry without the gate is accepted
     model = _chunked_test_mac(**CHUNKED_CASES['atlas per-token retrieve'])
+    with torch.no_grad():
+        model.forward_chunked(ids, chunk_len = 64)
+
+
+def test_chunked_forward_matches_parallel_at_window_boundary_starts(monkeypatch):
+    """Sliding attention is fold-invariant whenever at least one full window
+    precedes a chunk, and the parametrized parity geometry never starts a
+    chunk on an attention segment boundary (64 % 20 = 4, 128 % 20 = 8,
+    192 % 20 = 12) — so a carried K/V cache one row short of `need` passes
+    every sliding parity case and is caught only by the block cases and the
+    shape test (adversarial review 2026-09-02). A chunk that starts ON a
+    segment boundary is where the short cache is visible: its first query
+    needs the key at exactly distance W. Geometry: W = 16 + 4 = 20, store
+    chunk 4, memory batch 20, chunk 40 = 2W (150 tokens -> 186 interleaved
+    positions; chunk starts 0/40/80/120/160, all on segment boundaries).
+    Parity is exactly 0.0 here, and dropping the oldest cached row deviates
+    by ~3 from the first position of the second chunk — the instrument
+    liveness the other sliding cases cannot provide."""
+    model = _chunked_test_mac(
+        mem_layers = (1, 3),
+        mem_kwargs = _atlas_mem_kwargs(),
+        neural_memory_segment_len = 4,
+        neural_memory_batch_size = 20,
+    ).double()
+    torch.manual_seed(1)
+    ids = torch.randint(0, 256, (2, 150))
+    chunk_len = 40
+    window = model.layers[0][5].total_segment_len
+    assert window == 20 and chunk_len % window == 0
+
+    with torch.no_grad():
+        reference = model(ids, return_hidden = True)
+        chunked = model.forward_chunked(ids, chunk_len = chunk_len, return_hidden = True)
+    max_dev = (reference - chunked).abs().max().item()
+    assert torch.allclose(reference, chunked, atol = 1e-10, rtol = 0), f'boundary-start fp64 hidden max |dev| {max_dev:.3e}'
+
+    # instrument liveness: a cache one row short must be caught here, from
+    # exactly the first token of the second chunk (token 32 is interleaved
+    # position 40: two 16-token segments plus 2 x 4 mem tokens)
+    original_forward = SegmentedAttention.forward
+
+    def one_row_short(self, seq, *args, prev_kv = None, **kwargs):
+        if prev_kv is not None:
+            prev_kv = tuple(t[..., 1:, :] for t in prev_kv)
+        return original_forward(self, seq, *args, prev_kv = prev_kv, **kwargs)
+
+    monkeypatch.setattr(SegmentedAttention, 'forward', one_row_short)
+    with torch.no_grad():
+        mutated = model.forward_chunked(ids, chunk_len = chunk_len, return_hidden = True)
+    per_token = (mutated - reference).abs().amax(dim = (0, 2))
+    deviating = (per_token > 1e-10).nonzero().flatten()
+    assert per_token.max().item() > 1e-3, 'the one-row-short cache mutant went undetected'
+    assert deviating.numel() > 0 and deviating[0].item() == 32
+
+
+def test_chunked_forward_rejects_weight_residual():
+    """neural_mem_weight_residual adds the previous memory layer's per-chunk
+    weight updates to a later layer's store; that slicing was never validated
+    across chunk boundaries, so chunked_inference_alignment refuses the config
+    instead of trusting it. The guard existed but nothing exercised it
+    (adversarial review 2026-09-02). The titans case is used because omega
+    refuses the residual at construction."""
+    kwargs = CHUNKED_CASES['titans (omega=1, per-chunk)']
+    model = _chunked_test_mac(**kwargs, neural_mem_weight_residual = True)
+    ids = torch.randint(0, 256, (1, 100))
+
+    with pytest.raises(ValueError, match = 'weight_residual'):
+        model.forward_chunked(ids, chunk_len = 64)
+
+    # liveness: the same geometry without the residual is accepted
+    model = _chunked_test_mac(**kwargs)
     with torch.no_grad():
         model.forward_chunked(ids, chunk_len = 64)
 
