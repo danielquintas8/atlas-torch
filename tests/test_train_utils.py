@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.train import MemmapTokenDataset, compute_schedule, cosine_with_warmup
-from experiments.train import apply_memory_kwargs, list_complete_checkpoints, parse_memory_kwargs, resolve_resume_dir
+from experiments.train import apply_memory_kwargs, atomic_torch_save, list_complete_checkpoints, parse_memory_kwargs, resolve_resume_dir, validate_resume_schedule
 
 
 def _write_bin(path, n_chunks, chunk_len):
@@ -535,17 +535,26 @@ def test_resolve_resume_latest_without_checkpoints_raises(tmp_path):
         resolve_resume_dir(resume = "latest", output_dir = str(tmp_path / "missing-run"))
 
 
-def test_parse_memory_kwargs_literals_and_strings():
-    parsed = parse_memory_kwargs(
-        ["use_sequential_scan=False", "omega_context=4", "default_step_transform_max_lr=1e-1", "model=None", "name= plain text "]
-    )
+def test_parse_memory_kwargs_literals_booleans_and_refusals():
+    """Shell-style booleans must parse as booleans and a non-literal must be
+    refused: the first version fell back to the raw string, so
+    `use_sequential_scan=false` silently meant True (review 2026-09-02)."""
+    parsed = parse_memory_kwargs(items = [
+        "use_sequential_scan=False", "use_accelerated_scan=false", "momentum=TRUE", "omega_context=4",
+        "default_step_transform_max_lr=1e-1", "model=None", "name='plain text'",
+    ])
     assert parsed == dict(
-        use_sequential_scan = False, omega_context = 4, default_step_transform_max_lr = 0.1, model = None, name = "plain text"
+        use_sequential_scan = False, use_accelerated_scan = False, momentum = True, omega_context = 4,
+        default_step_transform_max_lr = 0.1, model = None, name = "plain text",
     )
-    assert parse_memory_kwargs([]) == {} and parse_memory_kwargs(None) == {}
+    assert parsed["use_accelerated_scan"] is False and parsed["momentum"] is True
+    assert parse_memory_kwargs(items = []) == {} and parse_memory_kwargs(items = None) == {}
     for bad in ("use_sequential_scan", "=False", " =1"):
         with pytest.raises(ValueError, match = "KEY=VALUE"):
-            parse_memory_kwargs([bad])
+            parse_memory_kwargs(items = [bad])
+    for bad in ("use_sequential_scan=no", "name=plain text", "omega_context=eight"):
+        with pytest.raises(ValueError, match = "not a Python literal"):
+            parse_memory_kwargs(items = [bad])
 
 
 def test_apply_memory_kwargs_overrides_memory_and_refuses_vanilla():
@@ -556,3 +565,42 @@ def test_apply_memory_kwargs_overrides_memory_and_refuses_vanilla():
     vanilla = dict(model = dict(neural_memory_layers = (), neural_memory_kwargs = dict()))
     with pytest.raises(ValueError, match = "memory-free"):
         apply_memory_kwargs(config = vanilla, overrides = dict(omega_context = 1))
+
+
+def test_memory_overrides_and_peak_lr_are_validated_on_resume():
+    """A chained job that drops or changes MEMORY_KWARGS / PEAK_LR must be
+    refused, like a changed GPU count: both fields ride in schedule_meta and
+    validate_resume_schedule compares every field the checkpoint carries."""
+    saved = dict(warmup_steps = 2000, schedule_steps = 30000, batch_tokens = 500_000, grad_accum = 122,
+                 world_size = 4, vanilla = False, peak_lr = 3e-3, memory_kwargs_override = dict(use_sequential_scan = False))
+    assert validate_resume_schedule(schedule_meta = dict(saved), resume_meta = dict(saved)) == []
+    with pytest.raises(ValueError, match = "memory_kwargs_override"):
+        validate_resume_schedule(schedule_meta = {**saved, "memory_kwargs_override": {}}, resume_meta = dict(saved))
+    with pytest.raises(ValueError, match = "peak_lr"):
+        validate_resume_schedule(schedule_meta = {**saved, "peak_lr": 4e-4}, resume_meta = dict(saved))
+    # an older checkpoint without the fields: reported as missing, not refused
+    older = {k: v for k, v in saved.items() if k not in ("peak_lr", "memory_kwargs_override")}
+    assert validate_resume_schedule(schedule_meta = dict(saved), resume_meta = older) == ["memory_kwargs_override", "peak_lr"]
+
+
+def test_atomic_torch_save_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "meta.pt"
+    atomic_torch_save(obj = dict(step = 7), path = str(path))
+    assert torch.load(str(path))["step"] == 7
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["meta.pt"]
+
+
+def test_store_chunk_does_not_follow_omega_context():
+    """The store chunk stays 8 whatever the window: the window lives on the
+    segment axis since the 2026-09-01 fix, and coupling the chunk to
+    omega_context made an omega sweep change two knobs (and left the value
+    stale under --memory-kwarg, review 2026-09-02)."""
+    from experiments.configs import get_config, NEURAL_MEMORY_STORE_CHUNK
+
+    assert NEURAL_MEMORY_STORE_CHUNK == 8
+    base = get_config(model_size = "170m", variant = "atlas-mac")
+    swept = get_config(model_size = "170m", variant = "atlas-mac", **{"memory.omega_context": 64})
+    assert base["model"]["neural_memory_segment_len"] == swept["model"]["neural_memory_segment_len"] == 8
+    assert swept["model"]["neural_memory_kwargs"]["omega_context"] == 64
+    overridden = apply_memory_kwargs(config = get_config(model_size = "170m", variant = "atlas-mac"), overrides = dict(omega_context = 64))
+    assert overridden["model"]["neural_memory_segment_len"] == 8

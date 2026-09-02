@@ -311,26 +311,46 @@ def apply_vanilla(config, vanilla):
     return config
 
 
+_BOOL_WORDS = {"true": True, "false": False}
+
+
 def parse_memory_kwargs(items):
-    """--memory-kwarg KEY=VALUE (repeatable) -> dict. Values are parsed as
-    Python literals (True, 8, 1e-3, None, 'str'); anything that is not a
-    literal stays a string. Meant for smokes and sweeps that vary one memory
-    knob (use_sequential_scan, omega_context, ...) without editing configs.py;
-    the resolved value lands in model_config.json like any other setting."""
+    """--memory-kwarg KEY=VALUE (repeatable) -> dict. Values are Python
+    literals (True, 8, 1e-3, None, 'quoted string'); `true` / `false` in any
+    case are accepted as booleans because that is what shells and YAML
+    produce. Anything else is refused — an unparseable value must not fall
+    back to a truthy string (`use_sequential_scan=false` would silently mean
+    True; review 2026-09-02). Meant for smokes and sweeps that vary one
+    memory knob without editing configs.py; the resolved value lands in
+    model_config.json and in meta.pt (validated on resume)."""
     overrides = {}
     for item in items or ():
         if "=" not in item:
             raise ValueError(f"--memory-kwarg expects KEY=VALUE, got {item!r}")
         key, raw = item.split("=", 1)
-        key = key.strip()
+        key, raw = key.strip(), raw.strip()
         if not key:
             raise ValueError(f"--memory-kwarg expects KEY=VALUE, got {item!r}")
+        if raw.lower() in _BOOL_WORDS:
+            overrides[key] = _BOOL_WORDS[raw.lower()]
+            continue
         try:
-            value = ast.literal_eval(raw.strip())
-        except (ValueError, SyntaxError):
-            value = raw.strip()
-        overrides[key] = value
+            overrides[key] = ast.literal_eval(raw)
+        except (ValueError, SyntaxError) as err:
+            raise ValueError(
+                f"--memory-kwarg {key}: value {raw!r} is not a Python literal "
+                f"(quote strings: {key}='{raw}')"
+            ) from err
     return overrides
+
+
+def atomic_torch_save(obj, path):
+    """torch.save through a temp file + os.replace, so a kill mid-write
+    leaves no half-written file at `path` (meta.pt's presence means
+    'complete checkpoint' to --resume latest and to pruning)."""
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 def apply_memory_kwargs(config, overrides):
@@ -371,7 +391,7 @@ def resolve_resume_dir(resume, output_dir):
     editing a step number; any other value is returned unchanged."""
     if resume != "latest":
         return resume
-    checkpoints = list_complete_checkpoints(output_dir)
+    checkpoints = list_complete_checkpoints(output_dir=output_dir)
     if not checkpoints:
         raise FileNotFoundError(
             f"--resume latest: no complete step-* checkpoint (with meta.pt) under {output_dir}"
@@ -411,7 +431,7 @@ def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position,
         meta = dict(step=step)
         meta.update(schedule_meta)
         meta.update(data_position)
-        torch.save(meta, os.path.join(ckpt_dir, "meta.pt"))
+        atomic_torch_save(obj=meta, path=os.path.join(ckpt_dir, "meta.pt"))
     accelerator.print(f"Checkpoint saved → {ckpt_dir}")
 
 
@@ -511,7 +531,7 @@ def prune_checkpoints(accelerator, output_dir, keep):
     if not accelerator.is_main_process:
         return
 
-    step_dirs = list_complete_checkpoints(output_dir)  # numerically, oldest first
+    step_dirs = list_complete_checkpoints(output_dir=output_dir)  # numerically, oldest first
     for _, path in step_dirs[:-keep]:
         shutil.rmtree(path)
         accelerator.print(f"Pruned checkpoint {path}")
@@ -606,7 +626,8 @@ def main():
     args = parse_args()
     config = get_config(args.model, args.variant, args.ablation)
     config = apply_vanilla(config=config, vanilla=args.vanilla)
-    config = apply_memory_kwargs(config=config, overrides=parse_memory_kwargs(args.memory_kwarg))
+    memory_overrides = parse_memory_kwargs(items=args.memory_kwarg)
+    config = apply_memory_kwargs(config=config, overrides=memory_overrides)
     train_cfg = config["training"]
     if args.seq_len:
         train_cfg["seq_len"] = args.seq_len
@@ -635,6 +656,10 @@ def main():
         grad_accum=grad_accum,
         world_size=num_gpus,
         vanilla=bool(args.vanilla),
+        # not schedule shape, but silently changing either between chained
+        # jobs would relabel the run: validated field-by-field on resume
+        peak_lr=float(train_cfg["peak_lr"]),
+        memory_kwargs_override=dict(memory_overrides),
     )
 
     # Accelerator
@@ -681,6 +706,12 @@ def main():
                 f"WARNING: checkpoint meta.pt lacks schedule fields {missing} "
                 f"(older format) — those fields cannot be validated; the rest were"
             )
+
+    if start_step >= max_steps:
+        # an over-submitted chain job: nothing to train, and re-running the
+        # final save would rewrite a complete checkpoint in place
+        accelerator.print(f"Checkpoint step {start_step} >= max_steps {max_steps}: nothing to do")
+        return
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
