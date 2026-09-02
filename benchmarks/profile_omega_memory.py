@@ -1,4 +1,6 @@
-"""Profile the GPU memory footprint of the Omega Rule path in NeuralMemory.
+"""Profile the GPU memory footprint of the per-token store path in NeuralMemory (the path
+the Omega Rule runs on; --omega-context 1 profiles the no-omega ablation on that same path,
+not the chunk-wise path — numbers from before 2026-09-02 at c=1 are not comparable).
 
 This is the standalone version of the `ATLAS_LOG_OMEGA_MEM` instrumentation that
 used to live inside `NeuralMemory.store_memories`. It was pulled out of the
@@ -95,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--omega-context", type=int, default=8)
+    parser.add_argument("--omega-context", type=int, default=8, help="window size c on the per-token store path (atlas_config carries per_token_updates=True, so 1 profiles the no-omega ablation, not the chunk-wise path)")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument(

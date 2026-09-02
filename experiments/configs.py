@@ -96,9 +96,10 @@ _ATLAS_DEFAULTS = NeuralMemory.atlas_config()
 
 MEMORY_CONFIGS = {
     # lucidrains' chunk-wise Titans memory: one gradient per store chunk (per-token losses
-    # summed at the chunk-start weights), chunk-pooled gates, per-chunk retrieve reading the
-    # previous chunk's state (Titans' pre-update read). The BASELINE, not an ablation — the
-    # everything-else-equal ablation of the window is ABLATIONS["no-omega"] below.
+    # summed, at the same segment-start weights the per-token path uses), chunk-pooled
+    # gates, per-chunk retrieve reading the previous chunk's state (Titans' pre-update
+    # read). The BASELINE, not an ablation — the everything-else-equal ablation of the
+    # window is ABLATIONS["no-omega"] below.
     "titans": dict(
         momentum=True,
         momentum_order=1,
@@ -160,8 +161,9 @@ ABLATIONS = {
     # (from atlas_config) keeps the per-token store path — per-token gradients at
     # segment-start weights, per-token gates, eta outside Newton-Schulz, Muon, poly,
     # conv, per-token retrieve. Before 2026-09-02 omega_context=1 silently switched
-    # to lucidrains' chunk-wise path (per-chunk gradients and retrieve, pooled gates,
-    # eta washed out by Muon), so the ablation changed five things at once. Costs an
+    # to lucidrains' chunk-wise path (per-chunk gradients, scan and retrieve, pooled
+    # gates, eta folded into the gradient with its magnitude normalized away by Muon on
+    # matrix parameters), so the ablation changed five things at once. Costs an
     # Atlas run (per-token gradients), not a Titans one — that is the price of the
     # attribution being real. Guarded by test_no_omega_ablation_is_atlas_minus_the_window.
     "no-omega": dict(omega_context=1),
@@ -272,6 +274,6 @@ if __name__ == "__main__":
 
     print(f"=== {size} / {variant}" + (f" / {ablation}" if ablation else "") + " ===")
     print(f"Model:    dim={model['dim']}, depth={model['depth']}, heads={model['heads']}, dim_head={dim_head}")
-    print(f"Memory:   {n_mem_layers} layers, heads={mem['heads']}, omega={mem.get('omega_context', 1)}, poly={mem.get('polynomial_degree', 'none')}")
+    print(f"Memory:   {n_mem_layers} layers, heads={mem['heads']}, omega={mem.get('omega_context', 1)}, per_token_updates={mem.get('per_token_updates', mem.get('omega_context', 1) > 1)}, poly={mem.get('polynomial_degree', 'none')}")
     print(f"Training: lr={training['peak_lr']}, tokens={training['total_tokens']/1e9:.0f}B, seq_len={training['seq_len']}")
     print(f"Batch:    {training['batch_tokens']/1e6:.1f}M tokens/batch → {training['batch_tokens'] // training['seq_len']} seqs/batch")

@@ -529,6 +529,14 @@ class NeuralMemory(Module):
         rank-≤dim_head compression of φ(k), so Proposition 2's O(d_k^p)
         capacity bound does not apply on this path. Treat project_back=False
         as a Phase 3+ scaling question (see GitHub issue #17).
+        per_token_updates=True: the per-token store path is selected explicitly,
+        not by the window size. Before 2026-09-02 it was implied by
+        omega_context > 1, so omega_context=1 silently ran lucidrains'
+        chunk-wise path and the no-omega ablation changed the gradient, gate,
+        eta-placement, scan and retrieve granularity along with the window.
+        With the flag, omega_context=1 is the paper's c = 1 ablation row and
+        differs from the shipped stack by the window and its gates only.
+
         per_token_retrieve=True: the paper has no standalone retrieval
         equation for Atlas — the appendix defines write recurrences only. The
         DOT sections read with the post-update state (y_t = M_t(q_t)), and
@@ -589,7 +597,7 @@ class NeuralMemory(Module):
         polynomial_degree: int | None = None,
         poly_project_back = True,
         omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = no window (Titans' per-token rule). window truncates at neural-memory batch (segment) boundaries. this value selects the WINDOW only — the store path is selected by per_token_updates.
-        per_token_updates: bool | None = None,  # per-token store path: one gradient per token at the segment-start weights, per-token momentum / decay / eta gates, eta per target position outside momentum and Newton-Schulz, per-position scan; the omega window is applied on top when omega_context > 1. None = True iff omega_context > 1. explicit True at omega_context = 1 is the paper's 'w/o Omega' ablation (Titans' rule inside Atlas's machinery; costs the per-token path's memory). False = lucidrains' chunk-wise path: one summed gradient per store chunk at chunk-start weights, chunk-pooled gates, per-chunk retrieve (incompatible with omega_context > 1 and with per_token_retrieve).
+        per_token_updates: bool | None = None,  # per-token store path: one gradient per token at the segment-start weights, per-token momentum / decay / eta gates, eta per target position outside momentum and Newton-Schulz, per-position scan; the omega window is applied on top when omega_context > 1. None = True iff omega_context > 1. explicit True at omega_context = 1 is the paper's c = 1 ablation row (Table 'ablation'; Section 3.2: c = 1 with gamma = 1 recovers Titans' memory, which is why no context gates exist at c = 1) — Titans' rule inside Atlas's machinery, at the per-token path's memory cost and at this path's base point (every gradient in a neural_memory_batch_size segment is taken at the segment-start weights, the paper's parallel form with b = that segment). False = lucidrains' chunk-wise path: one summed gradient per store chunk at the SAME segment-start weights, chunk-pooled gates, per-chunk scan and retrieve (incompatible with omega_context > 1 and with per_token_retrieve).
         per_token_retrieve: bool = False,  # per-token retrieve: each y_t reads the post-update per-token weight state (our convention; the paper has no standalone Atlas retrieval equation). requires ~chunk_size× more memory and the per-token store path (per_token_updates). default False uses the per-chunk approximation.
         short_conv_size: int = 0,  # causal depthwise conv on keys/values/queries (paper Section 5 architectural backbone, kernel size). 0 = disabled.
         detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
@@ -661,7 +669,6 @@ class NeuralMemory(Module):
                     'exist only on the per-token store path (the chunk-wise path keeps one state per store chunk)'
                 )
             self.retrieve_chunk_size = 1
-
 
         # batch size
 
@@ -819,7 +826,8 @@ class NeuralMemory(Module):
         self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
         # per-token gradient function for the per-token store path (Atlas Section 3.3)
-        # computes one gradient per token within each chunk, all w.r.t. same chunk-start weights
+        # computes one gradient per token within each vmap chunk, all w.r.t. the same segment-start
+        # weights (repeated per chunk; the chunk-wise path uses the same base point)
 
         if per_token_updates:
             def single_token_forward_and_loss(params, single_input, single_lr, single_target):
@@ -1192,9 +1200,10 @@ class NeuralMemory(Module):
                 prev_weights = prev_weights.apply(lambda t: t[:, :num_chunks])
 
             if exists(self.to_learned_weight_residual_mix):
-                # weight residual operates at chunk granularity (prev_weights is per-chunk)
-                chunked_seq_for_mix = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size) if per_token else chunked_seq
-                mix = self.to_learned_weight_residual_mix(chunked_seq_for_mix)
+                # weight residual operates at chunk granularity (prev_weights is per-chunk);
+                # only reachable on the chunk-wise path, where chunked_seq is already pooled
+                # (the per-token path asserts accept_weight_residual off)
+                mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 

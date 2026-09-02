@@ -1110,9 +1110,10 @@ def _no_omega_test_memory(**overrides):
 def test_no_omega_ablation_is_atlas_minus_the_window():
     """ABLATIONS['no-omega'] must differ from the atlas memory by the omega window
     and its gamma gates only. Before 2026-09-02, omega_context=1 silently left the
-    per-token path: per-chunk gradients at chunk-start weights, chunk-pooled gates,
-    eta folded into the gradient (washed out by Muon) and per-chunk retrieve — five
-    changes for one ablation. Behavioural probe: perturb the store input at one
+    per-token path: one summed gradient per store chunk (at the same segment-start
+    weights), chunk-pooled gates, eta folded into the gradient (its magnitude then
+    normalized away by Muon on matrix parameters), a per-chunk scan and per-chunk
+    retrieve — five changes for one ablation. Behavioural probe: perturb the store input at one
     position with the queries fixed; the per-token post-update read reaches the
     retrieve at that position, the chunk-wise read only at the end of its chunk."""
     from experiments.configs import MEMORY_CONFIGS, ABLATIONS
@@ -1125,9 +1126,9 @@ def test_no_omega_ablation_is_atlas_minus_the_window():
 
     atlas = _no_omega_test_memory(short_conv_size = 0)
     no_omega = _no_omega_test_memory(short_conv_size = 0, **ABLATIONS['no-omega'])
+    # the control differs from no_omega by the store path alone
     chunk_wise = _no_omega_test_memory(
-        short_conv_size = 0, omega_context = 1, per_token_updates = False,
-        per_token_retrieve = False, spectral_norm_surprises = False,
+        short_conv_size = 0, omega_context = 1, per_token_updates = False, per_token_retrieve = False,
     )
 
     assert no_omega.per_token_updates and no_omega.retrieve_chunk_size == 1
@@ -1153,7 +1154,11 @@ def test_per_token_path_at_c1_equals_window_with_only_newest_tap():
     taps -> sigmoid(-60), newest -> sigmoid(60)) the omega_context=8 memory
     reproduces the omega_context=1 per-token memory to fp64 precision. A path
     difference anywhere else (gates, eta placement, scan, retrieve) breaks the
-    equality; the pre-fix chunk-wise fallback differed by O(1)."""
+    equality; the pre-fix chunk-wise fallback differed by O(1). 61 tokens, not
+    a multiple of the store chunk: the retrieve's per-token branch then pads
+    the cached remainder, and a retrieve keyed on the window instead of the
+    path crashes there (mutation, adversarial review 2026-09-02) — every
+    other c=1 input in this file is chunk-aligned and never enters it."""
     no_omega, atlas = _no_omega_test_memory(omega_context = 1), _no_omega_test_memory(omega_context = 8)
     missing, unexpected = atlas.load_state_dict(no_omega.state_dict(), strict = False)
     assert not unexpected
@@ -1168,7 +1173,7 @@ def test_per_token_path_at_c1_equals_window_with_only_newest_tap():
         gate.bias.copy_(bias.reshape(-1))
 
     torch.manual_seed(1)
-    seq = torch.randn(2, 64, 32, dtype = torch.float64)
+    seq = torch.randn(2, 61, 32, dtype = torch.float64)
     with torch.no_grad():
         out_no_omega, _ = no_omega(seq)
         out_atlas, _ = atlas(seq)
