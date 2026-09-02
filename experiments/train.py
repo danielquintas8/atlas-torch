@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -310,6 +311,74 @@ def apply_vanilla(config, vanilla):
     return config
 
 
+def parse_memory_kwargs(items):
+    """--memory-kwarg KEY=VALUE (repeatable) -> dict. Values are parsed as
+    Python literals (True, 8, 1e-3, None, 'str'); anything that is not a
+    literal stays a string. Meant for smokes and sweeps that vary one memory
+    knob (use_sequential_scan, omega_context, ...) without editing configs.py;
+    the resolved value lands in model_config.json like any other setting."""
+    overrides = {}
+    for item in items or ():
+        if "=" not in item:
+            raise ValueError(f"--memory-kwarg expects KEY=VALUE, got {item!r}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--memory-kwarg expects KEY=VALUE, got {item!r}")
+        try:
+            value = ast.literal_eval(raw.strip())
+        except (ValueError, SyntaxError):
+            value = raw.strip()
+        overrides[key] = value
+    return overrides
+
+
+def apply_memory_kwargs(config, overrides):
+    """Apply --memory-kwarg overrides to config['model']['neural_memory_kwargs'].
+    Refused for a memory-free (--vanilla) config: the overrides would be
+    recorded in model_config.json and change nothing."""
+    if not overrides:
+        return config
+    if not config["model"].get("neural_memory_layers"):
+        raise ValueError(
+            f"--memory-kwarg {sorted(overrides)} given for a memory-free model (--vanilla): "
+            f"the overrides would apply to no memory layer"
+        )
+    config["model"]["neural_memory_kwargs"] = {**config["model"]["neural_memory_kwargs"], **overrides}
+    return config
+
+
+def list_complete_checkpoints(output_dir):
+    """(step, path) for every step-<N> directory in output_dir that holds
+    meta.pt (written after the post-save barrier, so presence = complete),
+    sorted numerically, oldest first. Partial saves are invisible here."""
+    pattern = re.compile(r"^step-(\d+)$")
+    step_dirs = []
+    if not os.path.isdir(output_dir):
+        return step_dirs
+    for entry in os.listdir(output_dir):
+        match = pattern.match(entry)
+        full = os.path.join(output_dir, entry)
+        if match and os.path.isdir(full) and os.path.exists(os.path.join(full, "meta.pt")):
+            step_dirs.append((int(match.group(1)), full))
+    step_dirs.sort()
+    return step_dirs
+
+
+def resolve_resume_dir(resume, output_dir):
+    """--resume latest -> the newest COMPLETE step-* checkpoint of this run
+    (output_dir/run_name), so a chained SLURM job resumes without anyone
+    editing a step number; any other value is returned unchanged."""
+    if resume != "latest":
+        return resume
+    checkpoints = list_complete_checkpoints(output_dir)
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"--resume latest: no complete step-* checkpoint (with meta.pt) under {output_dir}"
+        )
+    return checkpoints[-1][1]
+
+
 def save_checkpoint(accelerator, step, output_dir, schedule_meta, data_position, model_config):
     """Save accelerate state + meta.pt marking the checkpoint complete.
 
@@ -442,15 +511,7 @@ def prune_checkpoints(accelerator, output_dir, keep):
     if not accelerator.is_main_process:
         return
 
-    pattern = re.compile(r"^step-(\d+)$")
-    step_dirs = []
-    for entry in os.listdir(output_dir):
-        match = pattern.match(entry)
-        full = os.path.join(output_dir, entry)
-        if match and os.path.isdir(full) and os.path.exists(os.path.join(full, "meta.pt")):
-            step_dirs.append((int(match.group(1)), full))
-
-    step_dirs.sort()  # numerically, oldest first
+    step_dirs = list_complete_checkpoints(output_dir)  # numerically, oldest first
     for _, path in step_dirs[:-keep]:
         shutil.rmtree(path)
         accelerator.print(f"Pruned checkpoint {path}")
@@ -472,7 +533,22 @@ def parse_args():
         "--ablation", default=None, choices=["no-poly", "no-omega", "no-muon"]
     )
     p.add_argument("--run-name", default=None)
-    p.add_argument("--resume", default=None, help="Checkpoint dir to resume from")
+    p.add_argument(
+        "--resume",
+        default=None,
+        help="Checkpoint dir to resume from, or 'latest' for the newest complete "
+        "step-* checkpoint of this run (output-dir/run-name) — the form chained "
+        "SLURM jobs use",
+    )
+    p.add_argument(
+        "--memory-kwarg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override one NeuralMemory kwarg (repeatable; Python-literal values), "
+        "e.g. --memory-kwarg use_sequential_scan=False --memory-kwarg omega_context=4. "
+        "For smokes and sweeps; recorded in model_config.json. Refused with --vanilla.",
+    )
     p.add_argument("--data-dir", default=None, help="Path to pre-tokenized data (from prepare.py) or HF dataset")
     p.add_argument("--output-dir", default="runs")
     p.add_argument("--wandb", action="store_true")
@@ -530,6 +606,7 @@ def main():
     args = parse_args()
     config = get_config(args.model, args.variant, args.ablation)
     config = apply_vanilla(config=config, vanilla=args.vanilla)
+    config = apply_memory_kwargs(config=config, overrides=parse_memory_kwargs(args.memory_kwarg))
     train_cfg = config["training"]
     if args.seq_len:
         train_cfg["seq_len"] = args.seq_len
@@ -594,6 +671,8 @@ def main():
     # warmup-zeroing.
     start_step = 0
     if args.resume:
+        args.resume = resolve_resume_dir(resume=args.resume, output_dir=output_dir)
+        accelerator.print(f"Resuming from {args.resume}")
         resume_meta = read_checkpoint_meta(resume_dir=args.resume)
         start_step = resume_meta["step"]
         missing = validate_resume_schedule(schedule_meta=schedule_meta, resume_meta=resume_meta)

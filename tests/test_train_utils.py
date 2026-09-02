@@ -11,6 +11,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.train import MemmapTokenDataset, compute_schedule, cosine_with_warmup
+from experiments.train import apply_memory_kwargs, list_complete_checkpoints, parse_memory_kwargs, resolve_resume_dir
 
 
 def _write_bin(path, n_chunks, chunk_len):
@@ -498,3 +499,60 @@ def test_validate_resume_schedule_returns_missing_when_rest_matches():
     del saved["vanilla"]
     del saved["world_size"]
     assert validate_resume_schedule(schedule_meta = schedule, resume_meta = saved) == ["vanilla", "world_size"]
+
+
+def _make_checkpoint(root, step, complete = True):
+    path = root / f"step-{step}"
+    path.mkdir()
+    if complete:
+        (path / "meta.pt").write_bytes(b"x")
+    return str(path)
+
+
+def test_resolve_resume_latest_picks_newest_complete_checkpoint(tmp_path):
+    """--resume latest (chained SLURM jobs) must pick the numerically newest
+    step-* directory that holds meta.pt: a partial save killed mid-write has
+    no meta.pt and must be skipped even when its step number is the highest,
+    and step-900 sorts after step-1000 lexicographically but not numerically."""
+    _make_checkpoint(tmp_path, 900)
+    newest_complete = _make_checkpoint(tmp_path, 1000)
+    _make_checkpoint(tmp_path, 1100, complete = False)
+    (tmp_path / "step-notanumber").mkdir()
+    (tmp_path / "logs").mkdir()
+
+    assert [step for step, _ in list_complete_checkpoints(output_dir = str(tmp_path))] == [900, 1000]
+    assert resolve_resume_dir(resume = "latest", output_dir = str(tmp_path)) == newest_complete
+    # explicit paths pass through untouched; None stays None
+    assert resolve_resume_dir(resume = "/some/where/step-5", output_dir = str(tmp_path)) == "/some/where/step-5"
+    assert resolve_resume_dir(resume = None, output_dir = str(tmp_path)) is None
+
+
+def test_resolve_resume_latest_without_checkpoints_raises(tmp_path):
+    _make_checkpoint(tmp_path, 10, complete = False)
+    with pytest.raises(FileNotFoundError, match = "no complete step-"):
+        resolve_resume_dir(resume = "latest", output_dir = str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        resolve_resume_dir(resume = "latest", output_dir = str(tmp_path / "missing-run"))
+
+
+def test_parse_memory_kwargs_literals_and_strings():
+    parsed = parse_memory_kwargs(
+        ["use_sequential_scan=False", "omega_context=4", "default_step_transform_max_lr=1e-1", "model=None", "name= plain text "]
+    )
+    assert parsed == dict(
+        use_sequential_scan = False, omega_context = 4, default_step_transform_max_lr = 0.1, model = None, name = "plain text"
+    )
+    assert parse_memory_kwargs([]) == {} and parse_memory_kwargs(None) == {}
+    for bad in ("use_sequential_scan", "=False", " =1"):
+        with pytest.raises(ValueError, match = "KEY=VALUE"):
+            parse_memory_kwargs([bad])
+
+
+def test_apply_memory_kwargs_overrides_memory_and_refuses_vanilla():
+    config = dict(model = dict(neural_memory_layers = (1, 3), neural_memory_kwargs = dict(omega_context = 8, momentum = True)))
+    out = apply_memory_kwargs(config = copy.deepcopy(config), overrides = dict(omega_context = 1, use_sequential_scan = False))
+    assert out["model"]["neural_memory_kwargs"] == dict(omega_context = 1, momentum = True, use_sequential_scan = False)
+    assert apply_memory_kwargs(config = copy.deepcopy(config), overrides = {}) == config
+    vanilla = dict(model = dict(neural_memory_layers = (), neural_memory_kwargs = dict()))
+    with pytest.raises(ValueError, match = "memory-free"):
+        apply_memory_kwargs(config = vanilla, overrides = dict(omega_context = 1))
