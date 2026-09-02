@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from eval.babilong.evaluate import (
     DEVICE_MEMORY_FRACTION,
     JOINT_CHECK_WINDOW_CHARS,
-    STORE_PATH_PEAK_FACTOR,
+    PEAK_FACTOR,
     _boundary_window,
     _candidate_rows_log_softmax,
     encode_prompt_and_candidates,
@@ -228,10 +228,10 @@ def test_qa5_labels_use_in_context_surface_form():
     assert not any(label in TASK_LABELS["qa5"] for label in ("bill", "fred", "jeff", "mary"))
 
 
-def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head = 8, seed = 0):
+def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head = 8, seed = 0, batch_size = 1024):
     """A tiny atlas-config MAC in the geometry the tail-quirk test uses
-    (store chunk 8, one neural-memory batch segment), memory-free when
-    mem_layers is empty."""
+    (store chunk 8, one neural-memory batch segment of `batch_size`
+    interleaved positions), memory-free when mem_layers is empty."""
     from titans_pytorch import MemoryAsContextTransformer
     from titans_pytorch.neural_memory import NeuralMemory
 
@@ -245,7 +245,7 @@ def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head =
         num_tokens = 256, dim = dim, depth = 4, segment_len = 64,
         num_persist_mem_tokens = 4, num_longterm_mem_tokens = 4,
         neural_memory_layers = mem_layers, neural_memory_segment_len = 8,
-        neural_memory_batch_size = 1024, use_flex_attn = False,
+        neural_memory_batch_size = batch_size, use_flex_attn = False,
         sliding_window_attn = True, neural_memory_kwargs = mem_kwargs,
         use_axial_pos_emb = False,
     ).eval()
@@ -265,9 +265,9 @@ def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_
     seen = []
     orig = nm.NeuralMemory.retrieve_memories
 
-    def spy(self, seq, weights):
+    def spy(self, seq, weights, **kwargs):
         seen.append(sum(t.numel() * t.element_size() for t in weights.values()))
-        return orig(self, seq, weights)
+        return orig(self, seq, weights, **kwargs)
 
     monkeypatch.setattr(nm.NeuralMemory, "retrieve_memories", spy)
     num_tokens = 100
@@ -289,7 +289,7 @@ class LiveStorageTracker(TorchDispatchMode):
     (views share one entry) with a refcount released by weakref finalizers
     on the Python tensor wrappers. Storages that already existed (parameters,
     buffers, inputs) are excluded. Same instrument that produced
-    STORE_PATH_PEAK_FACTOR."""
+    the PEAK_FACTOR / attention-path measurements in evaluate.py."""
 
     def __init__(self, exclude_tensors):
         super().__init__()
@@ -328,45 +328,88 @@ class LiveStorageTracker(TorchDispatchMode):
         return out
 
 
-def _measured_peak(model, num_tokens):
+def _measured_peak(model, num_tokens, chunk_len = None):
     ids = torch.randint(0, 256, (1, num_tokens))
     exclude = list(model.parameters()) + list(model.buffers()) + [ids]
     tracker = LiveStorageTracker(exclude_tensors = exclude)
     with torch.no_grad(), tracker:
-        model(ids, return_hidden = True)
+        if chunk_len is None:
+            model(ids, return_hidden = True)
+        else:
+            for _ in model.iter_chunked_hidden(ids, chunk_len = chunk_len):
+                pass
     return tracker.peak
 
 
-def test_peak_memory_estimate_matches_live_storage():
-    """The ceiling guard must estimate what the forward PEAKS at, not the
-    retrieve tensor alone (a review measured the retrieve-only estimate ~6x
-    low — a guard that says 'fits' and then OOMs hours into a cluster eval).
-    Measured with the live-storage tracker: one memory layer peaks within
-    [0.6, 1.05]x the calibrated estimate (measured 0.96-1.01; the bound is
-    TIGHT on the dangerous side — an estimate that is low is what lets a
-    length past the guard and into an OOM — and loose on the harmless side)
-    and the peak grows linearly with n; for two layers the flat factor is an
-    upper bound (measured 4.6-4.7x the combined retrieve state vs 6.4x
-    assumed)."""
-    one_layer = _tiny_atlas_mac(mem_layers = (1,), dim = 64, heads = 4, dim_head = 16)
-    peaks = {}
-    for num_tokens in (256, 512):
-        peak = _measured_peak(model = one_layer, num_tokens = num_tokens)
-        estimate = estimate_peak_memory_state_bytes(model = one_layer, num_tokens = num_tokens)
-        ratio = peak / estimate
-        assert 0.6 <= ratio <= 1.05, f'n={num_tokens}: measured peak / estimate = {ratio:.2f}'
-        peaks[num_tokens] = peak
-    growth = peaks[512] / peaks[256]
-    assert 1.8 <= growth <= 2.2, f'peak must grow linearly with n, got x{growth:.2f} for 2x tokens'
+NEVER_UNDER_GEOMETRIES = {
+    'one memory layer': (1,),
+    'two memory layers': (1, 4),
+    'memory-free trunk': (),
+}
 
-    # liveness of the instrument: the retrieve-only figure is far below the peak
-    retrieve_only = estimate_retrieve_state_bytes(model = one_layer, num_tokens = 512)
-    assert peaks[512] / retrieve_only > 4.0
 
-    two_layers = _tiny_atlas_mac(mem_layers = (1, 4), dim = 64, heads = 4, dim_head = 16)
-    peak2 = _measured_peak(model = two_layers, num_tokens = 256)
-    ratio2 = peak2 / estimate_peak_memory_state_bytes(model = two_layers, num_tokens = 256)
-    assert 0.6 <= ratio2 <= 1.0, f'two layers: flat factor {STORE_PATH_PEAK_FACTOR} must be an upper bound, got {ratio2:.2f}'
+@pytest.mark.parametrize("geometry", list(NEVER_UNDER_GEOMETRIES))
+def test_peak_memory_estimate_never_under_measured(geometry):
+    """The ceiling guard must estimate what the forward PEAKS at and must
+    never estimate BELOW it — an under-estimate is what lets a length past
+    the guard and into an OOM hours into a cluster eval (the retrieve-only
+    estimate was ~6x low; a later two-term fit was 45% low at 8 segments).
+    Re-measured here with the live-storage tracker at batch 256 interleaved
+    positions across 1-8.5 memory segments, whole-sequence and chunked, for
+    both shipped geometries (the ratio to the retrieve state is highest with
+    one memory layer). Bounded loose above (2.5x) so the guard cannot become
+    absurdly conservative either."""
+    model = _tiny_atlas_mac(
+        mem_layers = NEVER_UNDER_GEOMETRIES[geometry], dim = 64, heads = 4, dim_head = 16, batch_size = 256,
+    )
+    measured, estimate = {}, {}
+    for num_tokens in (256, 1024, 2048):
+        measured[('whole', num_tokens)] = _measured_peak(model = model, num_tokens = num_tokens)
+        estimate[('whole', num_tokens)] = estimate_peak_memory_state_bytes(model = model, num_tokens = num_tokens)
+    for chunk_len in (256, 512):
+        measured[('chunked', chunk_len)] = _measured_peak(model = model, num_tokens = 2048, chunk_len = chunk_len)
+        estimate[('chunked', chunk_len)] = estimate_peak_memory_state_bytes(
+            model = model, num_tokens = 2048, chunk_len = chunk_len,
+        )
+
+    ratios = {key: estimate[key] / measured[key] for key in measured}
+    for key, ratio in ratios.items():
+        # >= 1.0 is the hard side (an estimate below the measurement is the
+        # "guard says fits, then OOMs" failure); the upper bound only keeps the
+        # deliberately conservative flat factor from becoming absurd. It was 4.0
+        # until the carried memory state stopped pinning the previous chunk's
+        # scan outputs (clone, 2026-09-02): measured chunked peaks dropped
+        # 12-19%, pushing the two-layer chunked ratio to 4.17 while every
+        # estimate stayed above its measurement.
+        assert 1.0 <= ratio <= 5.0, f'{geometry} {key}: estimate / measured = {ratio:.2f}; all: {ratios}'
+
+    # liveness of the instrument: the whole-sequence peak keeps growing with
+    # the length, and (with a memory) the retrieve-only figure is well below
+    # the one-segment peak (measured 4.6-6.2x at 256 tokens)
+    assert measured[('whole', 2048)] > 1.5 * measured[('whole', 1024)]
+    retrieve_256 = estimate_retrieve_state_bytes(model = model, num_tokens = 256)
+    if retrieve_256 > 0:
+        assert measured[('whole', 256)] / retrieve_256 > 3.0
+
+    # chunked: the peak is set by the chunk, not by the 2048-token sequence
+    assert measured[('chunked', 256)] < 0.5 * measured[('whole', 2048)]
+
+
+def test_peak_memory_estimate_chunked_is_bounded_by_chunk():
+    """With chunked inference the estimate depends on the chunk, not the
+    sequence: equal for 4K and 1M tokens at the same chunk_len, and equal to
+    the whole-sequence estimate for a sequence that fits in one chunk."""
+    model = _tiny_atlas_mac(mem_layers = (1, 4), dim = 64, heads = 4, dim_head = 16)
+    chunk = model.neural_memory_batch_size
+    short = estimate_peak_memory_state_bytes(model = model, num_tokens = 4096, chunk_len = chunk)
+    long = estimate_peak_memory_state_bytes(model = model, num_tokens = 1_000_000, chunk_len = chunk)
+    assert short == long
+    assert long < estimate_peak_memory_state_bytes(model = model, num_tokens = 1_000_000)
+    small = 300   # fewer interleaved positions than one chunk
+    assert (
+        estimate_peak_memory_state_bytes(model = model, num_tokens = small, chunk_len = chunk)
+        == estimate_peak_memory_state_bytes(model = model, num_tokens = small)
+    )
 
 
 def test_mixed_length_candidates_padded_to_common_length():
@@ -764,3 +807,94 @@ def test_t5_qa5_names_are_single_tokens(tokenizer):
     for name in ("Bill", "Fred", "Jeff", "Mary"):
         assert len(tokenizer.encode(" " + name, add_special_tokens = False)) == 1
     assert any(len(tokenizer.encode(" " + n, add_special_tokens = False)) > 1 for n in ("fred", "jeff", "mary"))
+
+
+def test_score_example_chunked_matches_whole_sequence():
+    """score_example(chunk_len=...) — the chunked forward feeding the scorer —
+    must give the same candidate log-probs as the whole-sequence path, on a
+    prompt spanning several chunks, for both the single-token branch and the
+    padded multi-token branch (the real-T5 candidates; skipped if the
+    tokenizer is not cached). Chunk = one memory segment of the tiny MAC
+    (1024 interleaved positions)."""
+    transformers = pytest.importorskip("transformers")
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained("google-t5/t5-base", local_files_only = True)
+    except Exception as err:  # noqa: BLE001
+        pytest.skip(f"T5 tokenizer not cached locally: {err}")
+
+    model = _tiny_atlas_mac(mem_layers = (1, 4), dim = 32, heads = 4, dim_head = 8)
+    model.token_emb = torch.nn.Embedding(VOCAB, 32)
+    model.to_logits = torch.nn.Linear(32, VOCAB, bias = False)
+    torch.manual_seed(3)
+    with torch.no_grad():
+        model.token_emb.weight.normal_(std = 0.02)
+        model.to_logits.weight.normal_(std = 0.02)
+
+    filler = " ".join(["Mary went to the garden and John moved to the office."] * 200)
+    prompt = f"Context: {filler} Question: Where is Mary? Answer:"
+    prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens = False))
+    # chunks are counted in interleaved positions: the prompt must span > 2 chunks
+    assert model.seq_len_with_longterm_mem(prompt_tokens) > 2 * model.neural_memory_batch_size
+
+    for candidates in (["garden", "office", "kitchen"], ["garden", "hallway", "ten"]):
+        whole = score_example(model = model, tokenizer = tokenizer, prompt_text = prompt,
+                              candidates = candidates, device = "cpu")
+        chunked = score_example(model = model, tokenizer = tokenizer, prompt_text = prompt,
+                                candidates = candidates, device = "cpu",
+                                chunk_len = model.neural_memory_batch_size)
+        assert whole[0] == chunked[0]
+        for cand in candidates:
+            assert abs(whole[1][cand] - chunked[1][cand]) < 1e-4, (cand, whole[1][cand], chunked[1][cand])
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [["garden", "office"], ["garden", "hall-way", "of-fi-ce"]],
+    ids = ["single-token branch", "padded multi-token branch"],
+)
+def test_score_example_chunk_len_reaches_the_chunked_forward(monkeypatch, candidates):
+    """Both scorer branches (single-token: one forward over the prompt;
+    multi-token: one padded forward per candidate) must route chunk_len into
+    iter_chunked_hidden and never call the whole-sequence forward. A branch
+    that silently ran the whole-sequence forward would pass every value-level
+    parity test (the numbers are identical) and OOM at the first long length
+    on the cluster — the multi-token branch did exactly that before this
+    test. Spied on the model class with the fake tokenizer (runs on the
+    cluster); fp64 model so the two paths agree to rounding."""
+    from titans_pytorch import MemoryAsContextTransformer
+
+    tok = FakeTokenizer()
+    model = _tiny_atlas_mac(mem_layers = (1,), batch_size = 64).double()
+    chunk = model.neural_memory_batch_size
+    prompt = " ".join(["Mary moved to the bathroom. John went to the hallway."] * 30) + " Where is Mary? Answer:"
+    assert model.seq_len_with_longterm_mem(len(_fake_ids(tok, prompt))) > 2 * chunk
+
+    chunked_calls, whole_calls = [], []
+    original_iter = MemoryAsContextTransformer.iter_chunked_hidden
+    original_forward = MemoryAsContextTransformer.forward
+
+    def spy_iter(self, x, chunk_len):
+        chunked_calls.append(chunk_len)
+        return original_iter(self, x, chunk_len = chunk_len)
+
+    def spy_forward(self, *args, **kwargs):
+        whole_calls.append(1)
+        return original_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryAsContextTransformer, "iter_chunked_hidden", spy_iter)
+    monkeypatch.setattr(MemoryAsContextTransformer, "forward", spy_forward)
+
+    whole = score_example(model = model, tokenizer = tok, prompt_text = prompt, candidates = candidates, device = "cpu")
+    assert whole_calls and not chunked_calls, 'without chunk_len the whole-sequence forward must run'
+    whole_calls.clear()
+
+    chunked = score_example(
+        model = model, tokenizer = tok, prompt_text = prompt, candidates = candidates, device = "cpu", chunk_len = chunk,
+    )
+    assert not whole_calls, 'a scorer branch ran the whole-sequence forward despite chunk_len'
+    single_token_set = all(len(_fake_ids(tok, " " + cand)) == 1 for cand in candidates)
+    assert chunked_calls == [chunk] * (1 if single_token_set else len(candidates))
+
+    assert whole[0] == chunked[0]
+    for cand in candidates:
+        assert abs(whole[1][cand] - chunked[1][cand]) < 1e-6, (cand, whole[1][cand], chunked[1][cand])

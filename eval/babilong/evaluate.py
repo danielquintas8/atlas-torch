@@ -35,23 +35,39 @@ Memory ceiling (measured 2026-09-02): with per-token retrieve the model's
 whole-sequence forward materializes every token's memory-weight state for the
 final retrieve — 0.59 MB/token PER memory layer in bf16 at 170M (1.18 MB/token
 for the two shipped layers; double in fp32): 4.8 GB @4K, 19 GB @16K, 39 GB
-@32K, 78 GB @64K, 1.2 TB @1M for the retrieve state alone. The store path
-holds several per-token-sized copies on top of that at the same time (grads,
-negated surprises, momentum, the post-Newton-Schulz update, scan outputs): a
-live-tensor high-water tracker measured peak live storage = 6.1-6.4x the
-retrieve state for one memory layer (4.6-4.7x the two-layer total, i.e.
-9.2-9.4x one layer's), linear in the sequence length. The ceiling estimate
-applies STORE_PATH_PEAK_FACTOR (6.4, the single-layer measurement — a
-conservative upper bound for two layers) to the retrieve state and refuses a
-context length past 80% of device memory unless --force is given. On a 64 GB
-H100 at 170M/2 layers that is roughly 7-9K tokens in bf16 (conservative
-estimate 6.8K; the measured two-layer factor gives 9K) and 3.5-4.7K in fp32;
-32K and beyond need a chunked-inference forward (segment-wise parallel
-forward with a carried memory state) that does not exist yet. Cheap
-store-path win left for future work: `grads` stays alive after
-`surprises = grads.mul(-1)` in NeuralMemory.store_memories, so one per-token
-copy is avoidable under no_grad — deliberately not changed (the training
-path shares that code and autograd needs the original tensor).
+@32K, 78 GB @64K, 1.2 TB @1M for the retrieve state alone. The forward peaks
+well above that (live-tensor high-water tracker, tiny atlas MACs, CPU): the
+store path holds several per-token-sized copies on top of the retrieve state
+(grads, negated surprises, momentum, post-Newton-Schulz update, scan outputs,
+the per-segment `updates` list, the final concatenation, the retrieve's
+rearranged copy) plus the attention / residual path's own copies — measured
+2.8-10x the retrieve state across toy geometries and lengths (highest within
+one memory segment and where the attention path is a large share; with that
+path subtracted the memory-only ratio is 3.7-5.6x within one segment and
+1-1.6x at 4-8 segments). The estimate is PEAK_FACTOR (8, above every raw
+ratio) x R(positions processed at once) + the attention / residual path
+(_attention_path_bytes), never under any measured peak; a length is refused
+past 80% of device memory unless --force is given. On a 64 GB H100 at
+170M/2 layers that is ~9.6 MB per interleaved position: roughly 5K tokens
+whole-sequence in bf16 under the estimate (~2.5K fp32; the measured
+two-layer ratios would allow 2-3x more — chunked inference makes the
+whole-sequence cap moot).
+
+Chunked inference (--chunk-len, MemoryAsContextTransformer.iter_chunked_hidden)
+removes the ceiling: the sequence is processed in chunks of `chunk_len`
+INTERLEAVED positions (a multiple of neural_memory_batch_size — 1024 in the
+shipped config — so chunk boundaries coincide with the memory's segment
+boundaries), carrying only the memory state and each attention layer's
+un-rotated keys/values for the last two attention segments across chunks
+(each chunk is folded into attention segments exactly as the whole-sequence
+forward folds the full sequence, so attention memory is linear in the chunk).
+Output equals the whole-sequence forward (parity-tested, fp64-exact); peak
+memory is O(chunk): ~10 GB by the estimate (~6 GB at the measured ratios) at
+170M in bf16 with 1024-position chunks, at any context length. Cheap store-path win left for
+future work: `grads` stays alive after `surprises = grads.mul(-1)` in
+NeuralMemory.store_memories, so one per-token copy is avoidable under no_grad
+— deliberately not changed (the training path shares that code and autograd
+needs the original tensor).
 """
 
 import argparse
@@ -197,21 +213,56 @@ def memory_layers(model):
     return [layer[4] for layer in model.layers if layer[4] is not None]
 
 
-# Peak live storage of a no_grad whole-sequence forward, relative to the
-# retrieve state alone. Measured 2026-09-02 with an allocator-independent
-# live-tensor high-water tracker (a TorchDispatchMode summing the bytes of
-# storages created inside the forward that are still referenced; parameters
-# and inputs excluded — see tests/test_babilong_scorer.py::LiveStorageTracker)
-# on CPU, tiny atlas MACs with per-token retrieve: ONE memory layer peaks at
-# 6.14-6.44x its retrieve state; TWO layers at 4.59-4.71x their combined
-# retrieve state (9.2-9.4x one layer's); linear in n. The store path holds the
-# per-token grads, the negated surprises, the momentum, the post-Newton-Schulz
-# update and the scan outputs simultaneously — each the size of the retrieve
-# state. 6.4 (the single-layer number) is used as a conservative upper bound
-# for any layer count. CUDA-calibrate on the first BSC run with
+# Peak live storage of a no_grad forward, relative to the retrieve state R(N)
+# (N = interleaved positions processed at once). Measured 2026-09-02 with an
+# allocator-independent live-tensor high-water tracker (a TorchDispatchMode
+# summing the bytes of storages created inside the forward that are still
+# referenced; parameters and inputs excluded — see
+# tests/test_babilong_scorer.py::LiveStorageTracker) on CPU, tiny atlas MACs
+# with per-token retrieve, neural_memory_batch_size 256 interleaved
+# positions, one and two memory layers, 256-2048 tokens (1-8.5 memory
+# segments), whole-sequence and chunked (256 / 512-position chunks).
+#
+# The store path holds several per-token-sized copies on top of the retrieve
+# state (grads, negated surprises, momentum, post-Newton-Schulz update, scan
+# outputs, the per-segment `updates` list, the final concatenation, the
+# retrieve's rearranged copy), and the attention / residual path holds its
+# own per-position copies, which at toy scale are a large share of the peak:
+#
+#     measured peak / R(N)          whole 256 / 1024 / 2048 tokens   chunked 256 / 512
+#     dim 32, one memory layer       9.96 / 9.25 / 9.13               12.4 / 9.8
+#     dim 32, two memory layers      6.02 / 5.33 / 5.21                7.2 / 5.4
+#     dim 64, one memory layer       6.21 / 3.54 / 3.42                8.8 / 5.5
+#     dim 64, two memory layers      4.60 / 2.90 / 2.78                5.8 / 3.6
+#
+# (memory dim_head 8 / 16 with 4 heads; attention 8 heads x 64 at both, so
+# the attention path is a larger share at dim 32 — the raw ratio is not a
+# property of the memory alone, which is why an earlier two-term fit of it
+# (3.4x asymptote + a one-segment transient, no attention term) was up to
+# 45% under on another geometry.) With the attention / residual path
+# estimated separately (_attention_path_bytes, never under the memory-free
+# trunk by 9-17%) and subtracted, the memory-only ratio is 3.7-5.6 within
+# one segment and 1-1.6 at 4-8 whole-sequence segments. The estimate keeps
+# one flat factor above every raw ratio on the retrieve state of the
+# positions processed at once, plus the attention path — deliberately
+# conservative (estimate / measured 1.27-3.32 with a memory layer, largest
+# for long whole-sequence runs, which chunked inference replaces anyway)
+# until a two-term memory model is validated on the target device.
+#
+# tests/test_babilong_scorer.py::test_peak_memory_estimate_never_under_measured
+# re-measures on every run and fails if the estimate drops under a measured
+# peak or exceeds 4x it. CUDA-calibrate on the first BSC run with
 # torch.cuda.max_memory_allocated() and update: this is a CPU measurement of
-# the mechanism, not a measurement of the target device.
-STORE_PATH_PEAK_FACTOR = 6.4
+# the mechanism, not of the target device.
+PEAK_FACTOR = 8.0
+
+# attention / residual path (see _attention_path_bytes), copy counts per
+# folded row or per position, from the same tracker on the memory-free
+# trunk (never under at either toy geometry, whole and chunked):
+ATTENTION_HEAD_COPIES = 20        # q, k, v (3), rotated q, k (2), k, v with the previous window (4) and with the persistent tokens (4), out + merged (2), margin
+ATTENTION_SCORE_COPIES = 2        # scores + probabilities
+RESIDUAL_COPIES_PER_LAYER = 4     # attn_in, attn_out, ff_in, ff_out kept for the memory's qkv selector
+RESIDUAL_TRANSIENT_COPIES = 48    # hyper-connection streams, feed-forward inner activations (~5 dim), norms, residual adds
 
 
 def estimate_retrieve_state_bytes(model, num_tokens):
@@ -231,25 +282,75 @@ def estimate_retrieve_state_bytes(model, num_tokens):
     than the parameter list suggests.
     """
     positions = model.seq_len_with_longterm_mem(num_tokens) if num_tokens > 0 else 0
-    total = 0
-    for mem in memory_layers(model):
-        state_values = sum(p.numel() for p in mem.memory_model_parameters)
-        if not mem.per_head_learned_parameters:
-            state_values *= mem.heads
-        elem_bytes = next(iter(mem.memory_model_parameters)).element_size()
-        per_position = state_values * elem_bytes
-        if mem.omega_context <= 1:
-            per_position /= mem.store_chunk_size
-        total += per_position * positions
-    return int(total)
+    return int(sum(_per_position_state_bytes(mem) for mem in memory_layers(model)) * positions)
 
 
-def estimate_peak_memory_state_bytes(model, num_tokens):
-    """Estimated peak live storage of a no_grad whole-sequence forward at
-    `num_tokens` input tokens: the retrieve state times STORE_PATH_PEAK_FACTOR
-    (see the constant's note for the measurement and why it is an upper bound
-    for more than one memory layer)."""
-    return int(estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens) * STORE_PATH_PEAK_FACTOR)
+def _per_position_state_bytes(mem):
+    """Bytes of memory-weight state one memory layer emits per interleaved
+    position (per store chunk when the omega rule is off)."""
+    state_values = sum(p.numel() for p in mem.memory_model_parameters)
+    if not mem.per_head_learned_parameters:
+        state_values *= mem.heads
+    elem_bytes = next(iter(mem.memory_model_parameters)).element_size()
+    per_position = state_values * elem_bytes
+    if mem.omega_context <= 1:
+        per_position /= mem.store_chunk_size
+    return per_position
+
+
+def _attention_path_bytes(model, positions, chunked):
+    """Bytes held by the attention / residual path at the peak of a forward
+    over `positions` interleaved positions (one chunk of them when
+    `chunked`): one layer's head-sized transients over the folded rows
+    (q / k / v, rotated q / k, k / v with the previous window and with the
+    persistent tokens, the attention output and its merge), its scores and
+    probabilities (rows x heads x (2 segments + persistent tokens)), every
+    layer's un-rotated keys / values (the whole-sequence forward keeps all
+    of them until it returns; the chunked one holds two segments per layer),
+    and the residual-stream copies: the four per-layer branch tensors the
+    memory's qkv selector keeps (`mem_input_layers`, twice when chunked —
+    the previous chunk's die as the next is built) plus transient copies
+    (hyper-connection streams, feed-forward inner activations, norms). Small
+    next to the memory state for any model with a memory layer; it is what
+    bounds a memory-free (vanilla) model."""
+    attn = model.layers[0][5]
+    _, heads, num_persist, dim_head = attn.persistent_memory.shape
+    window = attn.total_segment_len
+    elem = attn.to_qkv.weight.element_size()
+    depth = len(model.layers)
+    dim = model.token_emb.weight.shape[1]
+
+    # the folded rows: the chunk plus up to two cached segments in front of it
+    rows = positions + (2 * window if chunked else 0)
+    head_transients = ATTENTION_HEAD_COPIES * heads * dim_head * elem * rows
+    scores = ATTENTION_SCORE_COPIES * heads * (2 * window + num_persist) * elem * rows
+    kv_caches = 2 * heads * dim_head * elem * depth * (min(positions, 2 * window) if chunked else positions)
+    residual_copies = RESIDUAL_COPIES_PER_LAYER * depth * (2 if chunked else 1) + RESIDUAL_TRANSIENT_COPIES
+    residual = residual_copies * dim * elem * positions
+    return head_transients + scores + kv_caches + residual
+
+
+def estimate_peak_memory_state_bytes(model, num_tokens, chunk_len=None):
+    """Estimated peak live storage of a no_grad forward at `num_tokens` input
+    tokens: PEAK_FACTOR x the retrieve state of the positions processed at
+    once, plus the attention / residual path's per-position bytes (see the
+    constants' note for the measurement and the never-under test).
+
+    `chunk_len` (interleaved positions) = chunked inference: at most
+    `chunk_len` positions are processed at once and only the compact memory
+    state and two attention segments of keys / values cross chunk boundaries,
+    so the estimate is O(chunk_len) and independent of the sequence length."""
+    positions = model.seq_len_with_longterm_mem(num_tokens) if num_tokens > 0 else 0
+    chunked = chunk_len is not None and positions > chunk_len
+    if chunked:
+        positions = chunk_len
+
+    per_position = [_per_position_state_bytes(mem) for mem in memory_layers(model)]
+
+    return int(
+        PEAK_FACTOR * sum(per_position) * positions
+        + _attention_path_bytes(model=model, positions=positions, chunked=chunked)
+    )
 
 
 def length_label_to_tokens(length):
@@ -270,31 +371,37 @@ def device_total_memory_bytes(device):
     return torch.cuda.get_device_properties(torch.device(device)).total_memory
 
 
-def memory_ceiling_for_tokens(model, num_tokens, label, force, device_total_bytes):
-    """Return None when the estimated PEAK memory-state footprint (retrieve
-    state x STORE_PATH_PEAK_FACTOR) at `num_tokens` input tokens fits within
-    DEVICE_MEMORY_FRACTION of `device_total_bytes`, else a message explaining
-    the refusal (unless `force`, which downgrades it to a warning printed by
-    the caller). `device_total_bytes=None` disables the check (no CUDA)."""
+def memory_ceiling_for_tokens(model, num_tokens, label, force, device_total_bytes, chunk_len=None):
+    """Return None when the estimated PEAK memory-state footprint at
+    `num_tokens` input tokens (see estimate_peak_memory_state_bytes) fits
+    within DEVICE_MEMORY_FRACTION of `device_total_bytes`, else a message
+    explaining the refusal (unless `force`, which downgrades it to a warning
+    printed by the caller). `device_total_bytes=None` disables the check (no
+    CUDA). With `chunk_len` (chunked inference) the estimate is O(chunk)."""
     if device_total_bytes is None:
         return None
     retrieve = estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens)
-    peak = estimate_peak_memory_state_bytes(model=model, num_tokens=num_tokens)
+    peak = estimate_peak_memory_state_bytes(model=model, num_tokens=num_tokens, chunk_len=chunk_len)
     if peak <= DEVICE_MEMORY_FRACTION * device_total_bytes:
         return None
+    mode = (
+        f"chunked inference with {chunk_len:,}-position chunks would still peak"
+        if chunk_len is not None else
+        f"the whole-sequence forward would hold ~{retrieve / 1e9:.1f} GB of per-token "
+        f"memory-weight state for the final retrieve and peak"
+    )
     return (
-        f"{label} ({num_tokens:,} tokens): the whole-sequence forward would hold "
-        f"~{retrieve / 1e9:.1f} GB of per-token memory-weight state for the final retrieve and "
-        f"peak at ~{peak / 1e9:.1f} GB of live memory state (x{STORE_PATH_PEAK_FACTOR} store-path "
-        f"factor; device total {device_total_bytes / 1e9:.1f} GB, limit "
-        f"{DEVICE_MEMORY_FRACTION:.0%}). At 170M with two memory layers a 64 GB GPU fits roughly "
-        f"7-9K tokens in bf16 and 3.5-4.7K in fp32; longer contexts need a chunked-inference "
-        f"forward that does not exist yet; --bf16 halves the footprint. "
+        f"{label} ({num_tokens:,} tokens): {mode} at ~{peak / 1e9:.1f} GB of live storage "
+        f"(x{PEAK_FACTOR:g} the retrieve state of the positions processed at once, plus the "
+        f"attention path; device total {device_total_bytes / 1e9:.1f} GB, "
+        f"limit {DEVICE_MEMORY_FRACTION:.0%}). At 170M with two memory layers a 64 GB GPU fits "
+        f"roughly 5K tokens whole-sequence in bf16 under this estimate (~2.5K fp32); "
+        f"--chunk-len 1024 makes the footprint O(chunk) (a few GB) at any length; --bf16 halves it. "
         + ("Running anyway (--force)." if force else "Skipping (pass --force to try).")
     )
 
 
-def memory_ceiling_message(model, length, device, force):
+def memory_ceiling_message(model, length, device, force, chunk_len=None):
     """Early exit on the NOMINAL split label ('4k' -> 4096 tokens). BABILong's
     labels are not T5 token counts (English prose runs ~1.15-1.3x longer under
     T5's 32K vocab, and the few-shot scaffold adds more), so evaluate_task
@@ -305,6 +412,7 @@ def memory_ceiling_message(model, length, device, force):
         label=f"context {length} (nominal)",
         force=force,
         device_total_bytes=device_total_memory_bytes(device),
+        chunk_len=chunk_len,
     )
 
 
@@ -385,13 +493,40 @@ def encode_prompt_and_candidates(tokenizer, prompt_text, candidates):
     return prompt_ids, cand_ids
 
 
-def _candidate_rows_log_softmax(model, input_ids, rows, disable_flex_attn):
+def _rows_from_chunked_hidden(model, input_ids, rows, chunk_len):
+    """Hidden states for the token positions in `rows` (a slice) gathered from
+    the chunked forward: each chunk's hidden states are consumed as they are
+    produced and only the needed rows are kept, so nothing O(L) survives."""
+    start, stop = rows.start, rows.stop
+    pieces = []
+    for chunk_start, hidden in model.iter_chunked_hidden(input_ids, chunk_len=chunk_len):
+        chunk_stop = chunk_start + hidden.shape[1]
+        lo, hi = max(start, chunk_start), min(stop, chunk_stop)
+        if lo < hi:
+            pieces.append(hidden[:, lo - chunk_start:hi - chunk_start])
+        if chunk_stop >= stop:
+            break   # rows complete; later chunks are not needed
+    if not pieces:
+        raise RuntimeError(
+            f"chunked forward yielded no rows for {rows} (sequence length {input_ids.shape[1]})"
+        )
+    out = torch.cat(pieces, dim=1)
+    if out.shape[1] != stop - start:
+        raise RuntimeError(f"chunked forward yielded {out.shape[1]} rows for {rows}, expected {stop - start}")
+    return out
+
+
+def _candidate_rows_log_softmax(model, input_ids, rows, disable_flex_attn, chunk_len=None):
     """Log-softmax over the vocab for the given positions only. The forward
     returns pre-logit hidden states; only the needed rows are projected, so
     the [L, vocab] logits tensor is never materialized (it was 8.4 GB fp32 at
-    64K on its own)."""
-    hidden = model.forward(input_ids, disable_flex_attn=disable_flex_attn, return_hidden=True)
-    rows_hidden = hidden[:, rows]
+    64K on its own). With `chunk_len` the hidden states come from the chunked
+    forward (memory O(chunk_len) instead of O(L))."""
+    if chunk_len is None:
+        hidden = model.forward(input_ids, disable_flex_attn=disable_flex_attn, return_hidden=True)
+        rows_hidden = hidden[:, rows]
+    else:
+        rows_hidden = _rows_from_chunked_hidden(model=model, input_ids=input_ids, rows=rows, chunk_len=chunk_len)
     to_logits = model.to_logits
     if isinstance(to_logits, torch.nn.Linear):
         # project in fp32 even under --bf16: the candidate log-probs are the
@@ -411,7 +546,7 @@ def _candidate_rows_log_softmax(model, input_ids, rows, disable_flex_attn):
 
 
 @torch.no_grad()
-def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disable_flex_attn=True):
+def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disable_flex_attn=True, chunk_len=None):
     """Pick the candidate with the highest log-likelihood under the model.
 
     Closed-answer-set protocol for a pretrained-only (non-instruction-tuned)
@@ -495,7 +630,8 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         rows = slice(prompt_len - 1, prompt_len)
         log_softmax = _candidate_rows_log_softmax(
-            model=model, input_ids=input_ids, rows=rows, disable_flex_attn=disable_flex_attn
+            model=model, input_ids=input_ids, rows=rows, disable_flex_attn=disable_flex_attn,
+            chunk_len=chunk_len,
         )
         for cand, ids in cand_ids.items():
             lp = log_softmax[0, ids[0]].item()
@@ -520,7 +656,8 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
             # at position prompt_len + j is scored by row prompt_len - 1 + j
             rows = slice(prompt_len - 1, prompt_len - 1 + len(ids))
             log_softmax = _candidate_rows_log_softmax(
-                model=model, input_ids=input_ids, rows=rows, disable_flex_attn=disable_flex_attn
+                model=model, input_ids=input_ids, rows=rows, disable_flex_attn=disable_flex_attn,
+                chunk_len=chunk_len,
             )
             total_lp = sum(log_softmax[j, target].item() for j, target in enumerate(ids))
             log_probs[cand] = total_lp / len(ids)
@@ -547,7 +684,8 @@ def target_in_candidates(target, candidates):
     return target.strip().lower() in lowered
 
 
-def actual_length_ceiling(model, tokenizer, task, length, dataset, candidates, force, device_total_bytes):
+def actual_length_ceiling(model, tokenizer, task, length, dataset, candidates, force, device_total_bytes,
+                          chunk_len=None):
     """The memory-ceiling check against the ACTUAL tokenized prompt of the
     first scorable example (plus the longest candidate), not the nominal
     split label: '4k' prose tokenizes to more than 4096 T5 tokens and the
@@ -567,13 +705,14 @@ def actual_length_ceiling(model, tokenizer, task, length, dataset, candidates, f
             label=f"{task}@{length} (actual first prompt)",
             force=force,
             device_total_bytes=device_total_bytes,
+            chunk_len=chunk_len,
         )
         return message, num_tokens
     return None, None
 
 
 def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cuda", disable_flex_attn=True,
-                  force=False, device_total_bytes=None, dataset=None):
+                  force=False, device_total_bytes=None, dataset=None, chunk_len=None):
     """Evaluate model on a single task at a single context length via
     log-likelihood scoring over the closed candidate set (TASK_LABELS[task]).
 
@@ -600,6 +739,7 @@ def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cud
     ceiling, first_num_tokens = actual_length_ceiling(
         model=model, tokenizer=tokenizer, task=task, length=length, dataset=dataset,
         candidates=candidates, force=force, device_total_bytes=device_total_bytes,
+        chunk_len=chunk_len,
     )
     if ceiling is not None:
         print(f"  {ceiling}")
@@ -634,6 +774,7 @@ def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cud
             candidates=candidates,
             device=device,
             disable_flex_attn=disable_flex_attn,
+            chunk_len=chunk_len,
         )
         elapsed = time.time() - t0
 
@@ -707,8 +848,15 @@ def parse_args():
     p.add_argument("--use-flex-attn", action="store_true",
                    help="Use flex attention (CUDA only); default disables it")
     p.add_argument("--force", action="store_true",
-                   help="Run a context length even when the estimated PEAK memory-state footprint "
-                        "(retrieve state x STORE_PATH_PEAK_FACTOR) exceeds 80%% of device memory")
+                   help="Run a context length even when the estimated PEAK live storage "
+                        "(PEAK_FACTOR x retrieve state + the attention path) "
+                        "exceeds 80%% of device memory")
+    p.add_argument("--chunk-len", type=int, default=None,
+                   help="Chunked inference: process the sequence in chunks of this many INTERLEAVED "
+                        "positions (tokens + longterm-mem tokens), carrying only the memory state and the "
+                        "attention window across chunks — memory O(chunk) instead of O(L). Must be a "
+                        "multiple of neural_memory_batch_size (1024 in the shipped config; use 1024). "
+                        "Output equals the whole-sequence forward.")
     return p.parse_args()
 
 
@@ -735,6 +883,11 @@ def main():
         vanilla=args.vanilla,
         dtype=torch.bfloat16 if args.bf16 else None,
     )
+
+    if args.chunk_len is not None:
+        # a misaligned chunk length fails here, before any data is loaded,
+        # not inside the first scored example
+        model.chunked_inference_alignment(args.chunk_len)
 
     # Load tokenizer
     tokenizer_dir = args.tokenizer_dir
@@ -763,13 +916,16 @@ def main():
         "ablation": args.ablation,
         "checkpoint": args.checkpoint,
         "dtype": "bfloat16" if args.bf16 else "float32",
+        "chunk_len": args.chunk_len,
         "tasks": {},
         "skipped_lengths": {},
     }
 
     for length in args.lengths:
         print(f"\n=== Context length: {length} ===")
-        ceiling = memory_ceiling_message(model=model, length=length, device=args.device, force=args.force)
+        ceiling = memory_ceiling_message(
+            model=model, length=length, device=args.device, force=args.force, chunk_len=args.chunk_len
+        )
         if ceiling is not None:
             print(f"  {ceiling}")
             if not args.force:
@@ -790,6 +946,7 @@ def main():
                 disable_flex_attn=not args.use_flex_attn,
                 force=args.force,
                 device_total_bytes=device_total_memory_bytes(args.device),
+                chunk_len=args.chunk_len,
             )
 
             if result.get("skipped"):

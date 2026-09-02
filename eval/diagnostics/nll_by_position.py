@@ -51,16 +51,42 @@ from eval.babilong.evaluate import load_model
 def iter_val_chunks(val_bin, seq_len, max_chunks):
     """Yield the first `max_chunks` consecutive (seq_len + 1)-token chunks."""
     data = np.memmap(val_bin, dtype=np.uint16, mode="r")
-    chunk_len = seq_len + 1
-    n_chunks = len(data) // chunk_len
-    for idx in range(min(n_chunks, max_chunks)):
-        start = idx * chunk_len
-        yield torch.from_numpy(data[start : start + chunk_len].astype(np.int64))
+    record_len = seq_len + 1   # a val record; unrelated to the inference chunk_len
+    n_records = len(data) // record_len
+    for idx in range(min(n_records, max_chunks)):
+        start = idx * record_len
+        yield torch.from_numpy(data[start : start + record_len].astype(np.int64))
 
 
 @torch.no_grad()
-def nll_by_position(model, val_bin, seq_len, max_chunks, bucket, device, disable_flex_attn):
-    """Mean per-bucket NLL over the first `max_chunks` val chunks at `seq_len`."""
+def _token_nll(model, inputs, labels, disable_flex_attn, chunk_len):
+    """Per-token NLL of `labels` given `inputs` (b=1). With `chunk_len` the
+    hidden states come from the chunked forward, projected and scored per
+    chunk, so nothing O(seq_len) beyond the NLL vector itself is held."""
+    if chunk_len is None:
+        logits = model(inputs, disable_flex_attn=disable_flex_attn)
+        return F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            reduction="none",
+        )
+
+    parts = []
+    for start, hidden in model.iter_chunked_hidden(inputs, chunk_len=chunk_len):
+        logits = model.to_logits(hidden)
+        parts.append(F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            labels[:, start:start + hidden.shape[1]].reshape(-1),
+            reduction="none",
+        ))
+    return torch.cat(parts)
+
+
+@torch.no_grad()
+def nll_by_position(model, val_bin, seq_len, max_chunks, bucket, device, disable_flex_attn, chunk_len=None):
+    """Mean per-bucket NLL over the first `max_chunks` val chunks at `seq_len`.
+    `chunk_len` (interleaved positions) = chunked inference, see
+    MemoryAsContextTransformer.iter_chunked_hidden."""
     num_buckets = (seq_len + bucket - 1) // bucket
     bucket_sums = torch.zeros(num_buckets, dtype=torch.float64)
     bucket_counts = torch.zeros(num_buckets, dtype=torch.float64)
@@ -70,11 +96,8 @@ def nll_by_position(model, val_bin, seq_len, max_chunks, bucket, device, disable
     for chunk in iter_val_chunks(val_bin=val_bin, seq_len=seq_len, max_chunks=max_chunks):
         x = chunk[None].to(device)
         inputs, labels = x[:, :-1], x[:, 1:]
-        logits = model(inputs, disable_flex_attn=disable_flex_attn)
-        token_nll = F.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]),
-            labels.reshape(-1),
-            reduction="none",
+        token_nll = _token_nll(
+            model=model, inputs=inputs, labels=labels, disable_flex_attn=disable_flex_attn, chunk_len=chunk_len
         ).cpu().double()
         bucket_sums.index_add_(0, bucket_index, token_nll)
         bucket_counts.index_add_(0, bucket_index, torch.ones_like(token_nll))
@@ -156,6 +179,11 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--use-flex-attn", action="store_true",
                    help="Use flex attention (CUDA only); default disables it, matching the BABILong harness")
+    p.add_argument("--chunk-len", type=int, default=None,
+                   help="Chunked inference: process each sequence in chunks of this many INTERLEAVED "
+                        "positions (a multiple of neural_memory_batch_size, 1024 in the shipped config), "
+                        "carrying only the memory state and attention window — memory O(chunk) instead of "
+                        "O(seq_len); output equals the whole-sequence forward")
     p.add_argument("--output", default="results/nll_by_position.json")
     return p.parse_args()
 
@@ -189,6 +217,7 @@ def main():
             bucket=args.bucket,
             device=args.device,
             disable_flex_attn=not args.use_flex_attn,
+            chunk_len=args.chunk_len,
         )
         # the span actually covered — the requested one only when val.bin
         # held enough chunks and the span is at least one chunk of this L
