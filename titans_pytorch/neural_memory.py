@@ -49,7 +49,10 @@ NeuralMemState = namedtuple('NeuralMemState', [
     'cache_store_segment',
     'states',
     'updates',
-])
+    'retrieve_conv_cache',   # last (short_conv_size - 1) pre-conv query rows, so a
+                             # continued call's query conv sees the same left
+                             # context as the whole-sequence forward (None without conv)
+], defaults = (None,))       # retrieve_conv_cache defaults to None: 5-field constructors keep working
 
 def mem_state_detach(
     state: NeuralMemState
@@ -297,11 +300,25 @@ class CausalDepthwiseConv1d(Module):
         self.pad = kernel_size - 1
         self.conv = nn.Conv1d(channels, channels, kernel_size, groups = channels, bias = False)
 
-    def forward(self, x):
+    def forward(self, x, prev = None):
+        """`prev` (b, <= kernel_size - 1, channels): the PRE-conv rows that
+        precede `x` in the sequence this call continues (chunked / cached
+        inference). They stand in for the zero left-padding, so the output at
+        every position of `x` equals the whole-sequence forward's."""
         if x.shape[1] == 0:
             return x
+
+        pad = self.pad
+
+        # kernel size 1 has no left context: prev[:, -0:] would be the whole tensor
+
+        if exists(prev) and pad > 0:
+            prev = prev[:, -pad:]
+            x = cat((prev, x), dim = 1)
+            pad = pad - prev.shape[1]
+
         x = x.transpose(1, 2)
-        x = F.pad(x, (self.pad, 0))
+        x = F.pad(x, (pad, 0))
         x = self.conv(x)
         return x.transpose(1, 2)
 
@@ -1305,7 +1322,10 @@ class NeuralMemory(Module):
 
                 momentums = stack(momentums)
 
-                next_last_momentum[param_name] = momentums[:, :, -1]
+                # .clone(): the carried state must not be a view of the full per-token
+                # scan output, or the previous chunk's O(chunk) momentum tensors stay
+                # alive across chunked-inference calls (found 2026-09-02)
+                next_last_momentum[param_name] = momentums[:, :, -1].clone()
 
                 if learned_combine and self.learned_combine_include_zeroth:
                     momentums = cat((rearrange(surprise, '... -> 1 ...'), momentums), dim = 0)
@@ -1332,7 +1352,9 @@ class NeuralMemory(Module):
             update = scan_fn(1. - decay_factor, update, prev = last_update, remove_prev = False)
 
             updates[param_name] = update
-            next_last_update[param_name] = update[:, -1]
+            # .clone(): same reason as the momentum carry above — a view would pin
+            # the whole per-token weight-state tensor across chunks
+            next_last_update[param_name] = update[:, -1].clone()
 
         # determine next state for the storing of memories
 
@@ -1351,7 +1373,22 @@ class NeuralMemory(Module):
         self,
         seq,
         weights: dict[str, Tensor],
+        conv_cache: Tensor | None = None,
     ):
+        """Returns (retrieved, next_conv_cache). `conv_cache` = the previous
+        call's last pre-conv query rows (NeuralMemState.retrieve_conv_cache):
+        with it, the query conv of a continued call sees the same left context
+        as the whole-sequence forward instead of zero padding — the one place
+        the memory's chained calls diverged from the parallel forward (the
+        key / value convs run per memory segment in the parallel forward and
+        in chunked inference, whose chunk boundaries sit on segment boundaries).
+        NOT so for token-by-token decoding: `sample()`'s store cache flushes
+        every store chunk, so whenever neural_memory_batch_size exceeds the
+        store chunk the key / value convs zero-pad at every flush while the
+        parallel forward pads once per segment — decode stays off parallel for
+        omega=1 + short conv too (measured 1.27 max logit deviation at batch
+        size 64 vs 8.9e-16 when the batch size equals the store chunk,
+        2026-09-02)."""
         chunk_size = self.retrieve_chunk_size
 
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
@@ -1395,10 +1432,26 @@ class NeuralMemory(Module):
 
         queries = self.to_queries(seq)
 
-        # maybe short causal conv
+        # maybe short causal conv — carrying the left context across calls
+
+        next_conv_cache = None
 
         if exists(self.query_conv):
-            queries = self.query_conv(queries)
+            front = int(need_pad)
+            carries_context = self.query_conv.pad > 0   # kernel size 1 has nothing to carry
+
+            if carries_context:
+                real_rows = queries[:, front:front + seq_len]
+                # clone: a view would keep the whole call's query rows alive in the returned state
+                next_conv_cache = safe_cat((conv_cache, real_rows), dim = 1)[:, -self.query_conv.pad:].clone()
+
+            if exists(conv_cache) and carries_context:
+                # continuing a sequence: the front pad row is not a real token,
+                # the real rows are convolved over the carried context instead
+                convolved = self.query_conv(queries[:, front:], prev = conv_cache)
+                queries = cat((queries[:, :front], convolved), dim = 1)
+            else:
+                queries = self.query_conv(queries)
 
         # maybe multihead
 
@@ -1467,7 +1520,7 @@ class NeuralMemory(Module):
         if need_pad:
             values = values[:, 1:]
 
-        return values[:, :seq_len]
+        return values[:, :seq_len], next_conv_cache
 
     def forward(
         self,
@@ -1499,9 +1552,9 @@ class NeuralMemory(Module):
         # handle previous state init
 
         if not exists(state):
-            state = (0, None, None, None, None)
+            state = (0, None, None, None, None, None)
 
-        seq_index, weights, cache_store_seq, past_state, updates = state
+        seq_index, weights, cache_store_seq, past_state, updates, retrieve_conv_cache = state
 
         # store
 
@@ -1643,10 +1696,13 @@ class NeuralMemory(Module):
             last_update, _ = next_neural_mem_state.states
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
 
-        retrieved = self.retrieve_memories(
+        retrieved, next_conv_cache = self.retrieve_memories(
             retrieve_seq,
-            updates
+            updates,
+            conv_cache = retrieve_conv_cache,
         )
+
+        next_neural_mem_state = next_neural_mem_state._replace(retrieve_conv_cache = next_conv_cache)
 
         # maybe detach
 
