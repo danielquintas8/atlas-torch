@@ -318,7 +318,7 @@ def _attention_path_bytes(model, positions, chunked):
     window = attn.total_segment_len
     elem = attn.to_qkv.weight.element_size()
     depth = len(model.layers)
-    dim = model.token_emb.weight.shape[1]
+    dim = attn.to_qkv.in_features  # residual width; token_emb may be a custom module without .weight
 
     # the folded rows: the chunk plus up to two cached segments in front of it
     rows = positions + (2 * window if chunked else 0)

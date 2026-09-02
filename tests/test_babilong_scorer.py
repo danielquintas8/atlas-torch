@@ -588,6 +588,19 @@ def test_fake_window_path_taken_for_long_prompts():
 # memory ceiling: actual tokenized length (G2)
 # ---------------------------------------------------------------------------
 
+def test_attention_path_estimate_accepts_custom_token_emb():
+    """`_attention_path_bytes` must not read `token_emb.weight`: the MAC accepts
+    any embedding module (`_chunk_hidden` takes its dtype from the embedded
+    tokens themselves), and a module without `.weight` crashed the estimator
+    (adversarial review 2026-09-02). The residual width is read from the
+    attention projection instead, so the estimate is unchanged by the swap."""
+    model = _tiny_atlas_mac(mem_layers = ())
+    reference = estimate_peak_memory_state_bytes(model = model, num_tokens = 512)
+    model.token_emb = torch.nn.Sequential(torch.nn.Embedding(256, 32), torch.nn.Identity())
+    assert not hasattr(model.token_emb, "weight")
+    assert estimate_peak_memory_state_bytes(model = model, num_tokens = 512) == reference
+
+
 def test_actual_length_ceiling_fires_when_nominal_label_passes():
     """The nominal '0k' label passes the ceiling, but the actual tokenized
     prompt of the first example does not: evaluate_task must skip the task
