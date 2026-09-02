@@ -1219,3 +1219,352 @@ def test_per_token_retrieve_tail_reads_last_complete_chunk_state():
     others = [length for length in deviations if length % 8 != 7]
     assert all(deviations[length] > 1e-3 for length in completing), deviations
     assert all(deviations[length] < 1e-5 for length in others), deviations
+
+# chunked inference
+
+def _chunked_test_mac(mem_layers, mem_kwargs, use_axial_pos_emb = False, sliding = True, seed = 0):
+    torch.manual_seed(seed)
+    return MemoryAsContextTransformer(
+        num_tokens = 256,
+        dim = 32,
+        depth = 3,
+        segment_len = 16,
+        num_persist_mem_tokens = 4,
+        num_longterm_mem_tokens = 4,
+        neural_memory_layers = mem_layers,
+        neural_memory_segment_len = 8,
+        neural_memory_batch_size = 64,
+        use_flex_attn = False,
+        sliding_window_attn = sliding,
+        neural_memory_kwargs = mem_kwargs,
+        use_axial_pos_emb = use_axial_pos_emb,
+    ).eval()
+
+
+def _atlas_mem_kwargs():
+    kwargs = NeuralMemory.atlas_config()
+    kwargs.update(dim_head = 8, heads = 4, use_sequential_scan = True)
+    return kwargs
+
+
+def _titans_mem_kwargs():
+    return dict(dim_head = 8, heads = 4, momentum = True, qk_rmsnorm = True, attn_pool_chunks = True)
+
+
+CHUNKED_CASES = {
+    'atlas per-token retrieve': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs()),
+    'titans (omega=1, per-chunk)': dict(mem_layers = (1, 3), mem_kwargs = _titans_mem_kwargs()),
+    'memory-free trunk': dict(mem_layers = (), mem_kwargs = dict()),
+    'atlas + axial pos emb ON': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs(), use_axial_pos_emb = True),
+    'atlas, block attention (sliding off)': dict(mem_layers = (1, 3), mem_kwargs = _atlas_mem_kwargs(), sliding = False),
+}
+
+
+@pytest.mark.parametrize('chunk_len', (64, 128))
+@pytest.mark.parametrize('case', list(CHUNKED_CASES))
+def test_chunked_forward_matches_parallel(case, chunk_len):
+    """iter_chunked_hidden / forward_chunked must reproduce the whole-sequence
+    forward exactly: same longterm-mem interleave, same axial embedding at
+    global interleaved positions (when enabled), same memory segmentation
+    (chunk boundaries coincide with neural_memory_batch_size boundaries on
+    the interleaved axis — the parallel forward's own segments), and the
+    attention's exact segment fold — sliding (previous window carried as the
+    K/V cache) and block (no previous window; only the head of the segment a
+    chunk starts in) — on global interleaved positions. 200 tokens -> 248
+    interleaved positions, so the last chunk is partial for both chunk
+    lengths, and chunk starts (64, 128, 192) sit mid-segment (segment 20)."""
+    model = _chunked_test_mac(**CHUNKED_CASES[case])
+    torch.manual_seed(1)
+    ids = torch.randint(0, 256, (2, 200))
+
+    # fp32: the two paths accumulate in a different order and the memory
+    # (Newton-Schulz, decay scans) and the axial SiLU MLP amplify rounding to
+    # ~1e-3 on hidden states (measured 8e-5 titans, 1e-3 atlas, 3e-3 axial);
+    # a real chunking bug (the pre-fix query-conv context loss) was 3.4.
+    with torch.no_grad():
+        reference = model(ids, return_hidden = True)
+        chunked = model.forward_chunked(ids, chunk_len = chunk_len, return_hidden = True)
+    max_dev_fp32 = (reference - chunked).abs().max().item()
+    assert max_dev_fp32 < 1e-2, f'{case} chunk {chunk_len}: fp32 hidden max |dev| {max_dev_fp32:.3e}'
+
+    # fp64: the semantic guarantee — the chunked forward IS the whole-sequence
+    # forward (measured exactly 0.0 for every case and chunk length). Built
+    # fresh (same seed -> same init): a model that already ran in fp32 shows
+    # ~7e-7 rounding after .double() — the rotary embedding fills its
+    # non-persistent `cached_freqs` buffer on the first call, and .double()
+    # widens the buffer without recomputing the fp32-rounded values.
+    #
+    # Exact 0.0 is GEOMETRY-DEPENDENT, not a law: with num_residual_streams=1
+    # the adversarial review (2026-09-02) measured 1.6e-4 fp64 drift at 900
+    # tokens that is purely numerical — batched-kernel rounding differs at the
+    # ULP level between 129 and 65 weight sets in retrieve_memories (4.4e-16),
+    # and the deviation grows exponentially with position at random init (a
+    # 1e-15 embedding perturbation reproduces the slope). At streams=4 the
+    # hyper-connection residual absorbs ULP-level differences, which is why
+    # these cases sit at 0.0. A real semantic bug shows deviations of 3+
+    # (mutation evidence: dropping the query-conv cache gives 3.4). Keep the
+    # tight tolerance here — on this geometry it is the right instrument —
+    # but a new geometry that drifts at 1e-4 is a numerics observation, not
+    # a chunking defect, until the deviation is orders of magnitude larger.
+    model = _chunked_test_mac(**CHUNKED_CASES[case]).double()
+    with torch.no_grad():
+        reference = model(ids, return_hidden = True)
+        chunked = model.forward_chunked(ids, chunk_len = chunk_len, return_hidden = True)
+        reference_logits = model(ids)
+        chunked_logits = model.forward_chunked(ids, chunk_len = chunk_len)
+    max_dev = (reference - chunked).abs().max().item()
+    assert torch.allclose(reference, chunked, atol = 1e-10, rtol = 0), f'{case} chunk {chunk_len}: fp64 hidden max |dev| {max_dev:.3e}'
+    assert torch.allclose(reference_logits, chunked_logits, atol = 1e-10, rtol = 0)
+
+    # the generator tiles exactly the original token axis, in order
+
+    starts, lengths = [], []
+    with torch.no_grad():
+        for start, hidden in model.iter_chunked_hidden(ids, chunk_len = chunk_len):
+            starts.append(start)
+            lengths.append(hidden.shape[1])
+
+    assert starts[0] == 0
+    assert all(s == sum(lengths[:i]) for i, s in enumerate(starts))
+    assert sum(lengths) == 200
+
+
+def test_chunked_forward_rejects_misaligned_chunk_lengths():
+    """Chunk boundaries must sit on the memory's segment boundaries (multiples
+    of neural_memory_batch_size on the interleaved axis) and on store-chunk
+    multiples; without a batch size the parallel forward is one segment and
+    no chunk boundary can match it."""
+    model = _chunked_test_mac(**CHUNKED_CASES['atlas per-token retrieve'])
+    ids = torch.randint(0, 256, (1, 100))
+
+    with pytest.raises(ValueError):
+        model.forward_chunked(ids, chunk_len = 48)   # multiple of 8, not of 64
+
+    with pytest.raises(ValueError):
+        model.forward_chunked(ids, chunk_len = 68)   # not a multiple of the store chunk
+
+    torch.manual_seed(0)
+    no_batch = MemoryAsContextTransformer(
+        num_tokens = 256, dim = 32, depth = 2, segment_len = 16,
+        num_persist_mem_tokens = 4, num_longterm_mem_tokens = 4,
+        neural_memory_layers = (1,), neural_memory_segment_len = 8,
+        neural_memory_batch_size = None, use_flex_attn = False,
+        sliding_window_attn = True, neural_memory_kwargs = _atlas_mem_kwargs(),
+        use_axial_pos_emb = False,
+    ).eval()
+
+    with pytest.raises(ValueError):
+        no_batch.forward_chunked(ids, chunk_len = 64)
+
+    # attention-only model: no memory segmentation to align with, so any
+    # positive chunk length is accepted and still reproduces the forward
+    # (chunk 50 starts mid-segment: 50 = 2 x 20 + 10)
+    trunk = _chunked_test_mac(**CHUNKED_CASES['memory-free trunk']).double()
+    trunk.chunked_inference_alignment(50)
+    with torch.no_grad():
+        reference = trunk(ids, return_hidden = True)
+        chunked = trunk.forward_chunked(ids, chunk_len = 50, return_hidden = True)
+    assert torch.allclose(reference, chunked, atol = 1e-10, rtol = 0)
+
+    with pytest.raises(ValueError):
+        trunk.forward_chunked(ids, chunk_len = 0)
+
+
+def test_chunked_forward_carried_kv_cache_is_bounded():
+    """The keys / values handed to the attention with each chunk (`prev_kv`)
+    reach back exactly to the previous segment boundary — the head of the
+    segment the chunk starts in plus the previous window — so they never
+    exceed 2 x attn_window_size - 1 positions: the O(1) attention state that
+    makes chunked inference O(chunk). Liveness: chunk 64 starts mid-segment
+    (64 = 3 x 20 + 4), so some call must carry MORE than one window."""
+    model = _chunked_test_mac(**CHUNKED_CASES['atlas per-token retrieve'])
+    ids = torch.randint(0, 256, (1, 300))
+    seen = []
+    original = SegmentedAttention.forward
+
+    def spy(self, seq, *args, prev_kv = None, **kwargs):
+        if prev_kv is not None:
+            seen.append(prev_kv[0].shape[-2])
+        return original(self, seq, *args, prev_kv = prev_kv, **kwargs)
+
+    SegmentedAttention.forward = spy
+    try:
+        with torch.no_grad():
+            model.forward_chunked(ids, chunk_len = 64)
+    finally:
+        SegmentedAttention.forward = original
+
+    window = model.attn_window_size
+    num_positions = model.seq_len_with_longterm_mem(300)
+    assert seen, 'no chunk after the first carried a cache'
+    assert max(seen) <= 2 * window - 1, seen
+    assert max(seen) > window, seen
+    # per chunk start: the head of its segment plus the previous window
+    # (starts 64, 128, 192, 256, 320 -> heads 4, 8, 12, 16, 0 at window 20)
+    expected = {start % window + window for start in range(64, num_positions, 64)}
+    assert set(seen) == expected, (sorted(set(seen)), sorted(expected))
+
+
+def test_chunked_forward_peak_memory_is_bounded_by_chunk():
+    """The point of the mode: at 2048 tokens the chunked forward's live
+    storage high-water mark is a fraction of the whole-sequence forward's
+    (measured with the allocator-independent tracker; chunk = one memory
+    segment)."""
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_babilong_scorer import LiveStorageTracker
+
+    model = _chunked_test_mac(**CHUNKED_CASES['atlas per-token retrieve'])
+    ids = torch.randint(0, 256, (1, 2048))
+    exclude = list(model.parameters()) + list(model.buffers()) + [ids]
+
+    tracker = LiveStorageTracker(exclude_tensors = exclude)
+    with torch.no_grad(), tracker:
+        model(ids, return_hidden = True)
+    whole = tracker.peak
+
+    tracker = LiveStorageTracker(exclude_tensors = exclude)
+    with torch.no_grad(), tracker:
+        for _ in model.iter_chunked_hidden(ids, chunk_len = 64):
+            pass
+    chunked = tracker.peak
+
+    assert chunked < 0.4 * whole, f'chunked peak {chunked / 1e6:.1f} MB vs whole {whole / 1e6:.1f} MB'
+
+
+def test_chunked_forward_attention_memory_is_linear_in_chunk():
+    """The chunked attention folds [cache ∥ chunk] into segments like the
+    whole-sequence forward, so its live storage is linear in the chunk
+    length. Measured on the memory-free trunk (nothing but the attention /
+    residual path) at chunks 1024 / 2048 / 4096 over 8192 tokens: doubling
+    the chunk must at most ~double the peak. The previous dense
+    chunk x (cache + chunk) mask and scores scaled quadratically (x14 from
+    1024 to 4096 at this geometry against ~x4 here)."""
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_babilong_scorer import LiveStorageTracker
+
+    model = _chunked_test_mac(**CHUNKED_CASES['memory-free trunk'])
+    ids = torch.randint(0, 256, (1, 8192))
+    exclude = list(model.parameters()) + list(model.buffers()) + [ids]
+
+    peaks = {}
+    for chunk_len in (1024, 2048, 4096):
+        tracker = LiveStorageTracker(exclude_tensors = exclude)
+        with torch.no_grad(), tracker:
+            for _ in model.iter_chunked_hidden(ids, chunk_len = chunk_len):
+                pass
+        peaks[chunk_len] = tracker.peak
+
+    assert peaks[2048] <= 2.3 * peaks[1024], peaks
+    assert peaks[4096] <= 2.3 * peaks[2048], peaks
+    # liveness: the peak does scale with the chunk (the tracker sees the chunk-sized tensors)
+    assert peaks[4096] >= 2.5 * peaks[1024], peaks
+
+
+def test_neural_mem_chaining_atlas_config_carries_query_conv_context():
+    """Chained calls of the memory at a segment boundary must equal one call
+    over the whole sequence for the ATLAS config too. The store-side key /
+    value convs run per memory segment on both paths, but the query conv
+    (retrieve side) spans the whole call — before the retrieve_conv_cache
+    field the first short_conv_size - 1 positions of every continued call
+    were convolved over zero padding instead of the previous call's rows
+    (measured deviation ~1.0 at exactly those 3 positions, 0 elsewhere).
+    fp64 so the check is exactness, not tolerance."""
+    torch.manual_seed(0)
+    seq = torch.randn(2, 128, 32, dtype = torch.float64)
+    cfg = NeuralMemory.atlas_config()
+    torch.manual_seed(1)
+    mem = NeuralMemory(dim = 32, chunk_size = 8, dim_head = 8, heads = 4, batch_size = 64,
+                       use_sequential_scan = True, **cfg).double().eval()
+    assert exists(mem.query_conv) and mem.query_conv.pad == 3
+
+    with torch.no_grad():
+        whole, _ = mem(seq)
+        first, state = mem(seq[:, :64])
+        second, next_state = mem(seq[:, 64:], state = state)
+
+    assert state.retrieve_conv_cache.shape == (2, 3, 32)
+    assert torch.allclose(whole[:, :64], first, atol = 1e-10, rtol = 0)
+    assert torch.allclose(whole[:, 64:], second, atol = 1e-10, rtol = 0)
+
+    # liveness: without the carried context the same call diverges at
+    # exactly the first kernel_size - 1 positions
+    with torch.no_grad():
+        uncarried, _ = mem(seq[:, 64:], state = state._replace(retrieve_conv_cache = None))
+    bad = ((whole[:, 64:] - uncarried).abs().amax(dim = (0, 2)) > 1e-6).nonzero().flatten().tolist()
+    assert bad == [0, 1, 2]
+
+
+def test_neural_mem_chaining_kernel_one_query_conv_carries_nothing():
+    """short_conv_size = 1: the query conv has no left context (pad 0). The
+    cache must stay None — `rows[:, -0:]` is the WHOLE tensor, so an
+    unguarded slice would carry every query row of every call — and chained
+    calls must still equal the whole-sequence forward exactly (fp64)."""
+    torch.manual_seed(0)
+    seq = torch.randn(2, 128, 32, dtype = torch.float64)
+    cfg = NeuralMemory.atlas_config()
+    cfg.update(short_conv_size = 1)
+    torch.manual_seed(1)
+    mem = NeuralMemory(dim = 32, chunk_size = 8, dim_head = 8, heads = 4, batch_size = 64,
+                       use_sequential_scan = True, **cfg).double().eval()
+    assert exists(mem.query_conv) and mem.query_conv.pad == 0
+
+    with torch.no_grad():
+        whole, _ = mem(seq)
+        first, state = mem(seq[:, :64])
+        second, next_state = mem(seq[:, 64:], state = state)
+
+    assert state.retrieve_conv_cache is None
+    assert next_state.retrieve_conv_cache is None
+    assert torch.allclose(whole[:, :64], first, atol = 1e-10, rtol = 0)
+    assert torch.allclose(whole[:, 64:], second, atol = 1e-10, rtol = 0)
+
+    # the conv itself ignores a passed context at kernel 1
+    rows = torch.randn(2, 5, mem.query_conv.conv.in_channels, dtype = torch.float64)
+    with torch.no_grad():
+        assert torch.equal(mem.query_conv(rows, prev = rows[:, :2]), mem.query_conv(rows))
+
+def test_chunked_forward_rejects_gated_transition():
+    """gated_transition is refused by chunked_inference_alignment: the
+    whole-sequence forward's segment concatenation drops each non-final
+    segment's last entry and substitutes the next segment's first entry — the
+    GATED lerp(weights, last_update, sigmoid(transition_gate)) state — so the
+    last token of every memory segment retrieves with the gated state, while
+    a chunk boundary there would retrieve with the un-gated one (adversarial
+    review 2026-09-02: 2-3 max deviation from the first boundary onward with
+    the guard silent). Replicating the boundary semantics chunkwise is out of
+    scope; the guard must refuse instead of silently diverging."""
+    kwargs = dict(CHUNKED_CASES['atlas per-token retrieve'])
+    kwargs['mem_kwargs'] = {**kwargs['mem_kwargs'], 'gated_transition': True}
+    model = _chunked_test_mac(**kwargs)
+    ids = torch.randint(0, 256, (1, 100))
+
+    with pytest.raises(ValueError, match = 'gated_transition'):
+        model.forward_chunked(ids, chunk_len = 64)
+
+    # liveness: the same geometry without the gate is accepted
+    model = _chunked_test_mac(**CHUNKED_CASES['atlas per-token retrieve'])
+    with torch.no_grad():
+        model.forward_chunked(ids, chunk_len = 64)
+
+
+def test_carried_memory_state_owns_its_storage():
+    """The carried state (last_update, last_momentum) must be state-sized
+    copies, not views of the full per-token scan outputs: a view pins the
+    previous chunk's O(chunk) scan tensors across chunked-inference calls
+    (adversarial review 2026-09-02 measured the chunk-256 peak dropping 81 ->
+    73 MB once cloned). Asserts each carried tensor's storage is exactly its
+    own bytes."""
+    mem = NeuralMemory(dim = 16, chunk_size = 8, dim_head = 8, heads = 2, batch_size = 64, **NeuralMemory.atlas_config())
+    seq = torch.randn(1, 64, 16)
+
+    with torch.no_grad():
+        _, state = mem(seq)
+
+    last_update, last_momentum = state.states
+    for name, t in list(last_update.items()) + list(last_momentum.items()):
+        assert t.untyped_storage().nbytes() == t.numel() * t.element_size(), (
+            f'carried state {name} shares storage with a larger tensor '
+            f'({t.untyped_storage().nbytes()} bytes for {t.numel() * t.element_size()} own bytes)'
+        )
