@@ -82,17 +82,41 @@ def parse_args():
     p.add_argument("--seeds", type=int, default=3, help="Seeds for --random-init")
     p.add_argument("--train-seq-len", type=int, default=1084,
                    help="Positions the model actually saw in training (1024 tokens + longterm mem tokens = 1084)")
-    p.add_argument("--positions", type=int, nargs="+", default=[4095, 16383, 131071, 1048575])
+    p.add_argument("--positions", type=int, nargs="+", default=[4095, 16383, 131071, 1048575],
+                   help="TOKEN positions (0-indexed) to probe. They are converted to the positions the "
+                        "model actually feeds the embedding — the interleaved longterm-mem tokens push "
+                        "every token later (token 4095 is fed at position 4347 in the 170m config, "
+                        "~8.0x rather than the 7.6x quoted for the raw position); both are reported.")
     p.add_argument("--stride", type=int, default=None,
                    help="Axial stride (default: config neural_memory_segment_len)")
     return p.parse_args()
 
 
+def fed_position(token_position, segment_len, num_longterm_mem_tokens):
+    """Position at which token `token_position` reaches the embedding once the
+    longterm-mem tokens are interleaved (mirrors
+    MemoryAsContextTransformer.seq_len_with_longterm_mem for a length of
+    token_position + 1, minus one)."""
+    seq_len = token_position + 1
+    return ((seq_len - 1) // segment_len) * num_longterm_mem_tokens + seq_len - 1
+
+
 def main():
     args = parse_args()
-    model_cfg = get_config(args.model, args.variant)["model"]
+    model_cfg = get_config(model_size=args.model, variant=args.variant)["model"]
     dim = model_cfg["dim"]
     stride = args.stride or model_cfg["neural_memory_segment_len"]
+    fed = [
+        fed_position(
+            token_position=pos,
+            segment_len=model_cfg["segment_len"],
+            num_longterm_mem_tokens=model_cfg["num_longterm_mem_tokens"],
+        )
+        for pos in args.positions
+    ]
+    print("token position -> fed position (interleaved longterm-mem tokens included): "
+          + ", ".join(f"{t} -> {f}" for t, f in zip(args.positions, fed)))
+    print()
 
     if args.checkpoint:
         state_dict = load_state_dict(checkpoint_dir=args.checkpoint)
@@ -108,7 +132,7 @@ def main():
         if "token_emb.weight" in state_dict:
             token_emb_norm = state_dict["token_emb.weight"].float().norm(dim=-1).mean().item()
         report(pos_emb=pos_emb, token_emb_norm=token_emb_norm, train_seq_len=args.train_seq_len,
-               positions=args.positions, stride=stride, label=f"checkpoint {args.checkpoint}")
+               positions=fed, stride=stride, label=f"checkpoint {args.checkpoint}")
         return
 
     for seed in range(args.seeds):
@@ -116,7 +140,7 @@ def main():
         pos_emb = ContinuousAxialPositionalEmbedding(dim=dim, num_axial_dims=2)
         token_emb_norm = nn.Embedding(model_cfg["num_tokens"], dim).weight.norm(dim=-1).mean().item()
         report(pos_emb=pos_emb, token_emb_norm=token_emb_norm, train_seq_len=args.train_seq_len,
-               positions=args.positions, stride=stride, label=f"random init seed {seed}")
+               positions=fed, stride=stride, label=f"random init seed {seed}")
 
 
 if __name__ == "__main__":

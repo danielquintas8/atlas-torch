@@ -17,10 +17,14 @@ intended uses:
 
 Reads val.bin (uint16 memmap, same chunking convention as
 experiments.train.MemmapTokenDataset: consecutive non-overlapping chunks of
-seq_len + 1 tokens), runs the full parallel forward on the first
---max-chunks chunks for each --seq-lens value, computes per-token NLL (fp32
-cross-entropy over inputs x[:, :-1] / labels x[:, 1:]) and reports the mean
-NLL per --bucket positions plus the overall mean. Writes JSON to --output.
+seq_len + 1 tokens), runs the full parallel forward over the SAME total
+token span for every --seq-lens value — span = --max-chunks x (min seq_len + 1)
+tokens from the start of val.bin, so a longer L uses proportionally fewer
+chunks and the columns of the table cover the same text — computes per-token
+NLL (fp32 cross-entropy over inputs x[:, :-1] / labels x[:, 1:]) and reports
+the mean NLL per --bucket positions plus the overall mean. Bucket rows are
+labelled by nominal position range; the last bucket of a shorter L is
+truncated at L. Writes JSON to --output.
 
 Usage:
     python eval/diagnostics/nll_by_position.py \
@@ -95,14 +99,16 @@ def nll_by_position(model, val_bin, seq_len, max_chunks, bucket, device, disable
     )
 
 
-def print_table(results, bucket):
+def print_table(results, bucket, span_tokens):
     seq_lens = [r["seq_len"] for r in results]
     max_len = max(seq_lens)
+    print(f"per-position NLL over the same {span_tokens:,}-token span of val.bin for every L "
+          f"(rows: nominal position range; a shorter L's last bucket is truncated at L)")
     header = f"{'position':>14}" + "".join(f"{f'L={L}':>12}" for L in seq_lens)
     print(header)
     print("-" * len(header))
     for b in range((max_len + bucket - 1) // bucket):
-        start, end = b * bucket, min((b + 1) * bucket, max_len)
+        start, end = b * bucket, (b + 1) * bucket
         row = f"{f'{start}-{end}':>14}"
         for r in results:
             cell = r["buckets"][b]["nll"] if b < len(r["buckets"]) else None
@@ -124,9 +130,10 @@ def parse_args():
                    help="Memory-free baseline: build with neural_memory_layers=()")
     p.add_argument("--val-bin", required=True, help="Path to val.bin (uint16 memmap)")
     p.add_argument("--seq-lens", type=int, nargs="+", default=[1024, 2048, 4096, 8192])
-    p.add_argument("--max-chunks", type=int, default=32, help="Chunks per seq-len")
+    p.add_argument("--max-chunks", type=int, default=32,
+                   help="Chunks at the SHORTEST seq-len; longer seq-lens get proportionally fewer so every column covers the same token span")
     p.add_argument("--bucket", type=int, default=256, help="Positions per reported bucket")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--use-flex-attn", action="store_true",
                    help="Use flex attention (CUDA only); default disables it, matching the BABILong harness")
     p.add_argument("--output", default="results/nll_by_position.json")
@@ -145,14 +152,20 @@ def main():
         vanilla=args.vanilla,
     )
 
+    # same total token span for every seq_len, so the table's columns cover the
+    # same text: --max-chunks applies to the shortest L, longer Ls get fewer
+    # chunks (at least one)
+    span_tokens = args.max_chunks * (min(args.seq_lens) + 1)
+
     results = []
     for seq_len in args.seq_lens:
-        print(f"\n=== seq_len {seq_len} ===")
+        n_chunks = max(1, span_tokens // (seq_len + 1))
+        print(f"\n=== seq_len {seq_len} ({n_chunks} chunks, {n_chunks * (seq_len + 1):,} tokens) ===")
         result = nll_by_position(
             model=model,
             val_bin=args.val_bin,
             seq_len=seq_len,
-            max_chunks=args.max_chunks,
+            max_chunks=n_chunks,
             bucket=args.bucket,
             device=args.device,
             disable_flex_attn=not args.use_flex_attn,
@@ -161,7 +174,7 @@ def main():
         results.append(result)
 
     print()
-    print_table(results=results, bucket=args.bucket)
+    print_table(results=results, bucket=args.bucket, span_tokens=span_tokens)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
@@ -171,6 +184,7 @@ def main():
             variant=args.variant,
             ablation=args.ablation,
             bucket=args.bucket,
+            span_tokens=span_tokens,
             results=results,
         ), f, indent=2)
     print(f"\nSaved → {args.output}")
