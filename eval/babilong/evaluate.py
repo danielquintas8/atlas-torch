@@ -33,11 +33,25 @@ produced before this fix was an end-of-text prior, not an answer likelihood.
 
 Memory ceiling (measured 2026-09-02): with per-token retrieve the model's
 whole-sequence forward materializes every token's memory-weight state for the
-final retrieve — 0.59 MB/token in bf16 at 170M with two memory layers (1.2 MB
-in fp32): 4.8 GB @4K, 19 GB @16K, 39 GB @32K, 78 GB @64K, 1.2 TB @1M. This
-script estimates that footprint per context length and refuses to run past
-the device's memory unless --force is given; ≥128K needs a chunked-inference
-forward that does not exist yet. --bf16 halves the footprint.
+final retrieve — 0.59 MB/token PER memory layer in bf16 at 170M (1.18 MB/token
+for the two shipped layers; double in fp32): 4.8 GB @4K, 19 GB @16K, 39 GB
+@32K, 78 GB @64K, 1.2 TB @1M for the retrieve state alone. The store path
+holds several per-token-sized copies on top of that at the same time (grads,
+negated surprises, momentum, the post-Newton-Schulz update, scan outputs): a
+live-tensor high-water tracker measured peak live storage = 6.1-6.4x the
+retrieve state for one memory layer (4.6-4.7x the two-layer total, i.e.
+9.2-9.4x one layer's), linear in the sequence length. The ceiling estimate
+applies STORE_PATH_PEAK_FACTOR (6.4, the single-layer measurement — a
+conservative upper bound for two layers) to the retrieve state and refuses a
+context length past 80% of device memory unless --force is given. On a 64 GB
+H100 at 170M/2 layers that is roughly 7-9K tokens in bf16 (conservative
+estimate 6.8K; the measured two-layer factor gives 9K) and 3.5-4.7K in fp32;
+32K and beyond need a chunked-inference forward (segment-wise parallel
+forward with a carried memory state) that does not exist yet. Cheap
+store-path win left for future work: `grads` stays alive after
+`surprises = grads.mul(-1)` in NeuralMemory.store_memories, so one per-token
+copy is avoidable under no_grad — deliberately not changed (the training
+path shares that code and autograd needs the original tensor).
 """
 
 import argparse
@@ -108,7 +122,7 @@ def load_model(checkpoint_dir, model_size, variant, ablation=None, device="cuda"
     memory-free baseline checkpoint has no NeuralMemory weights, so it can
     only load into a memory-free model.
     """
-    config = get_config(model_size, variant, ablation)
+    config = get_config(model_size=model_size, variant=variant, ablation=ablation)
     if vanilla:
         config["model"]["neural_memory_layers"] = ()
     check_model_config_drift(checkpoint_dir=checkpoint_dir, model_config=config["model"])
@@ -183,29 +197,59 @@ def memory_layers(model):
     return [layer[4] for layer in model.layers if layer[4] is not None]
 
 
+# Peak live storage of a no_grad whole-sequence forward, relative to the
+# retrieve state alone. Measured 2026-09-02 with an allocator-independent
+# live-tensor high-water tracker (a TorchDispatchMode summing the bytes of
+# storages created inside the forward that are still referenced; parameters
+# and inputs excluded — see tests/test_babilong_scorer.py::LiveStorageTracker)
+# on CPU, tiny atlas MACs with per-token retrieve: ONE memory layer peaks at
+# 6.14-6.44x its retrieve state; TWO layers at 4.59-4.71x their combined
+# retrieve state (9.2-9.4x one layer's); linear in n. The store path holds the
+# per-token grads, the negated surprises, the momentum, the post-Newton-Schulz
+# update and the scan outputs simultaneously — each the size of the retrieve
+# state. 6.4 (the single-layer number) is used as a conservative upper bound
+# for any layer count. CUDA-calibrate on the first BSC run with
+# torch.cuda.max_memory_allocated() and update: this is a CPU measurement of
+# the mechanism, not a measurement of the target device.
+STORE_PATH_PEAK_FACTOR = 6.4
+
+
 def estimate_retrieve_state_bytes(model, num_tokens):
     """Bytes of memory-weight state the whole-sequence forward holds for the
-    final retrieve at `num_tokens` input tokens.
+    final retrieve at `num_tokens` input tokens — the retrieve tensor ALONE.
+    The forward peaks well above it; see estimate_peak_memory_state_bytes.
 
     Every memory layer's decay scan emits one weight state per token when the
     omega rule is on (per-token store granularity; the per-token retrieve
     reads them all at once), or one per store chunk otherwise. The states for
     ALL tokens of the sequence are concatenated before the retrieve, so the
-    footprint is linear in the sequence length — the ceiling that makes
-    single-GPU evaluation past ~32-64K impossible at 170M without a
-    chunked-inference forward. The interleaved longterm-mem tokens count too:
-    the memory sees seq_len_with_longterm_mem(num_tokens) positions.
+    footprint is linear in the sequence length. The interleaved longterm-mem
+    tokens count too: the memory sees seq_len_with_longterm_mem(num_tokens)
+    positions. `memory_model_parameters` carries the head dimension only when
+    per_head_learned_parameters is on; otherwise init_weights repeats the
+    shared parameters `heads` times, so the state is `heads` times larger
+    than the parameter list suggests.
     """
     positions = model.seq_len_with_longterm_mem(num_tokens) if num_tokens > 0 else 0
     total = 0
     for mem in memory_layers(model):
         state_values = sum(p.numel() for p in mem.memory_model_parameters)
+        if not mem.per_head_learned_parameters:
+            state_values *= mem.heads
         elem_bytes = next(iter(mem.memory_model_parameters)).element_size()
         per_position = state_values * elem_bytes
         if mem.omega_context <= 1:
             per_position /= mem.store_chunk_size
         total += per_position * positions
     return int(total)
+
+
+def estimate_peak_memory_state_bytes(model, num_tokens):
+    """Estimated peak live storage of a no_grad whole-sequence forward at
+    `num_tokens` input tokens: the retrieve state times STORE_PATH_PEAK_FACTOR
+    (see the constant's note for the measurement and why it is an upper bound
+    for more than one memory layer)."""
+    return int(estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens) * STORE_PATH_PEAK_FACTOR)
 
 
 def length_label_to_tokens(length):
@@ -216,20 +260,24 @@ def length_label_to_tokens(length):
 
 
 def memory_ceiling_message(model, length, device, force):
-    """Return None when the estimated retrieve-state footprint fits the device,
-    else a message explaining the refusal (unless `force`, which downgrades
-    it to a warning printed by the caller)."""
+    """Return None when the estimated PEAK memory-state footprint (retrieve
+    state x STORE_PATH_PEAK_FACTOR) fits within 80% of the device, else a
+    message explaining the refusal (unless `force`, which downgrades it to a
+    warning printed by the caller)."""
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
     num_tokens = length_label_to_tokens(length)
-    estimate = estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens)
+    retrieve = estimate_retrieve_state_bytes(model=model, num_tokens=num_tokens)
+    peak = estimate_peak_memory_state_bytes(model=model, num_tokens=num_tokens)
     total = torch.cuda.get_device_properties(torch.device(device)).total_memory
-    if estimate <= 0.8 * total:
+    if peak <= 0.8 * total:
         return None
     return (
         f"context {length} (~{num_tokens:,} tokens): the whole-sequence forward would hold "
-        f"~{estimate / 1e9:.1f} GB of per-token memory-weight state for the final retrieve "
-        f"(device total {total / 1e9:.1f} GB). Single-GPU evaluation past ~32-64K needs a "
+        f"~{retrieve / 1e9:.1f} GB of per-token memory-weight state for the final retrieve and "
+        f"peak at ~{peak / 1e9:.1f} GB of live memory state (x{STORE_PATH_PEAK_FACTOR} store-path "
+        f"factor; device total {total / 1e9:.1f} GB). At 170M with two memory layers a 64 GB GPU "
+        f"fits roughly 7-9K tokens in bf16 and 3.5-4.7K in fp32; longer contexts need a "
         f"chunked-inference forward that does not exist yet; --bf16 halves the footprint. "
         + ("Running anyway (--force)." if force else "Skipping (pass --force to try).")
     )
@@ -239,13 +287,39 @@ def memory_ceiling_message(model, length, device, force):
 # Evaluation
 # ---------------------------------------------------------------------------
 
+JOINT_CHECK_WINDOW_CHARS = 256
+
+
+def _boundary_window(prompt_text):
+    """The suffix of the prompt used for the joint-tokenization check: cut at
+    a whitespace boundary at least JOINT_CHECK_WINDOW_CHARS from the end, or
+    the whole prompt when it is shorter than the window (or has no earlier
+    whitespace). SentencePiece/BPE segmentation is whitespace-local — a piece
+    never spans whitespace (T5's normalizer turns every whitespace run into
+    the '▁' word boundary) — so how the prompt's last words and the appended
+    candidate tokenize depends only on the text from the last boundary on.
+    Re-encoding a bounded suffix keeps the check O(window) per candidate
+    instead of O(prompt): at 64K tokens x 11 candidates the full re-encode
+    cost seconds per example."""
+    if len(prompt_text) <= JOINT_CHECK_WINDOW_CHARS:
+        return prompt_text
+    cut = prompt_text.rfind(" ", 0, len(prompt_text) - JOINT_CHECK_WINDOW_CHARS)
+    if cut < 0:
+        return prompt_text
+    return prompt_text[cut + 1:]
+
+
 def encode_prompt_and_candidates(tokenizer, prompt_text, candidates):
     """Tokenize the prompt and each candidate separately (no special tokens)
     and verify the two properties the scorer depends on:
 
       1. joint == separate: `encode(prompt + " " + cand)` must equal
          `prompt_ids + cand_ids`, otherwise the candidate's tokens would not be
-         the ones the model sees in context (boundary re-segmentation);
+         the ones the model sees in context (boundary re-segmentation). The
+         check runs on a bounded suffix of the prompt (see _boundary_window);
+         if that suffix does not itself tokenize as the tail of the full
+         prompt (a tokenizer whose segmentation is not whitespace-local), the
+         full-prompt check is used instead;
       2. no special token (T5's `</s>`) may reach the model — that is exactly
          how the pre-fix scorer ended up scoring `</s>` instead of the answer.
 
@@ -257,6 +331,15 @@ def encode_prompt_and_candidates(tokenizer, prompt_text, candidates):
     if any(t in specials for t in prompt_ids):
         raise ValueError("special token found in the prompt ids — encode with add_special_tokens=False")
 
+    window_text = _boundary_window(prompt_text)
+    window_ids = tokenizer.encode(window_text, add_special_tokens=False)
+    if window_text != prompt_text and (
+        len(window_ids) == 0 or prompt_ids[-len(window_ids):] != window_ids
+    ):
+        # the suffix does not reproduce the tail of the full tokenization —
+        # fall back to checking against the whole prompt
+        window_text, window_ids = prompt_text, prompt_ids
+
     cand_ids = {}
     for cand in candidates:
         ids = tokenizer.encode(" " + cand, add_special_tokens=False)
@@ -264,8 +347,8 @@ def encode_prompt_and_candidates(tokenizer, prompt_text, candidates):
             raise ValueError(f"candidate {cand!r} tokenizes to nothing")
         if any(t in specials for t in ids):
             raise ValueError(f"special token found in candidate ids for {cand!r}")
-        joint = tokenizer.encode(prompt_text + " " + cand, add_special_tokens=False)
-        if joint != prompt_ids + ids:
+        joint = tokenizer.encode(window_text + " " + cand, add_special_tokens=False)
+        if joint != window_ids + ids:
             raise ValueError(
                 f"joint tokenization of prompt + {cand!r} differs from prompt_ids + cand_ids "
                 f"at the boundary — the scored tokens would not be the in-context tokens"
@@ -280,7 +363,15 @@ def _candidate_rows_log_softmax(model, input_ids, rows, disable_flex_attn):
     the [L, vocab] logits tensor is never materialized (it was 8.4 GB fp32 at
     64K on its own)."""
     hidden = model.forward(input_ids, disable_flex_attn=disable_flex_attn, return_hidden=True)
-    logits = model.to_logits(hidden[:, rows])
+    rows_hidden = hidden[:, rows]
+    to_logits = model.to_logits
+    if isinstance(to_logits, torch.nn.Linear):
+        # project in fp32 even under --bf16: the candidate log-probs are the
+        # decision statistic, and a bf16 projection can flip close argmaxes
+        bias = None if to_logits.bias is None else to_logits.bias.float()
+        logits = F.linear(rows_hidden.float(), to_logits.weight.float(), bias)
+    else:
+        logits = to_logits(rows_hidden)
     return F.log_softmax(logits[0].float(), dim=-1)
 
 
@@ -304,8 +395,10 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
 
     Forward passes: when every candidate is a single token, ONE forward over
     the prompt scores all of them from the last row. Multi-token candidate
-    sets fall back to one forward per candidate over prompt + candidate.
-    Only the candidate rows are projected to logits (return_hidden).
+    sets fall back to one forward per candidate over prompt + candidate, with
+    every input PADDED to the same total length (pad token appended AFTER the
+    candidate — never inside a scored row's causal past). Only the candidate
+    rows are projected to logits (return_hidden).
 
     Why one forward is valid — and why "the last row depends only on the
     prompt" is NOT the reason: this model is not length-invariant. With the
@@ -316,11 +409,18 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
     (measured 0.8-2.1 nats at random init, only at length % chunk == chunk-1;
     zero for the memory-free trunk — see
     test_per_token_retrieve_tail_reads_last_complete_chunk_state). Scoring
-    all candidates from ONE forward keeps them consistent with each other;
-    scoring each with the candidate appended would also be consistent, at a
-    different chunk phase. Roughly 1/8 of prompts fall in the fresh-state
-    regime under either protocol — the same tail quirk training saw on the
-    last 4 of every 1084 positions.
+    all candidates from ONE forward keeps them consistent with each other.
+    In the multi-token branch, candidates of different token counts would get
+    forwards of different lengths and hence different chunk phases — the
+    shared prompt rows then read different memory states (measured 1.03 nats
+    on the first candidate token at 2/16 prompt lengths, test
+    test_mixed_length_candidates_padded_to_common_length), so every input is
+    padded to `prompt_len + max candidate length`: the padding sits after the
+    scored rows, which never see it (causal attention; a position's memory
+    state contains only tokens at or before it), while the chunk-completion
+    phase becomes identical for all candidates. Roughly 1/8 of prompts fall
+    in the fresh-state regime under either branch — the same tail quirk
+    training saw on the last 4 of every 1084 positions.
 
     Normalization: mean log-prob per candidate token. Residual asymmetry:
     where a candidate set mixes token counts (qa7's " ten" is 2 T5 tokens
@@ -367,8 +467,17 @@ def score_example(model, tokenizer, prompt_text, candidates, device="cuda", disa
             log_probs[cand] = lp
             details[cand] = {"sum": lp, "num_tokens": 1}
     else:
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError(
+                "mixed-length candidate set needs a pad token to equalize the input "
+                "lengths (chunk-phase consistency, see score_example) — the tokenizer has none"
+            )
+        common_len = prompt_len + max(len(ids) for ids in cand_ids.values())
         for cand, ids in cand_ids.items():
-            full_ids = prompt_ids + ids
+            # pad AFTER the candidate so every candidate's forward has the
+            # same length (same chunk phase); the scored rows never see it
+            full_ids = prompt_ids + ids + [pad_id] * (common_len - prompt_len - len(ids))
             input_ids = torch.tensor([full_ids], dtype=torch.long, device=device)
             # logits[:, i] predicts the token at position i+1: candidate token
             # at position prompt_len + j is scored by row prompt_len - 1 + j
@@ -459,8 +568,12 @@ def evaluate_task(model, tokenizer, task, length, max_examples=None, device="cud
         print(f"  {task}@{length}: {n_excluded} example(s) excluded — target not in the candidate set")
 
     accuracy = correct / total if total > 0 else 0.0
+    # official-protocol denominator: excluded examples (target unreachable by
+    # any candidate) count as failures
+    accuracy_all = correct / (total + n_excluded) if (total + n_excluded) > 0 else 0.0
     return {
         "accuracy": round(accuracy, 4),
+        "accuracy_all": round(accuracy_all, 4),
         "correct": correct,
         "total": total,
         "n_excluded": n_excluded,
@@ -509,9 +622,13 @@ def parse_args():
 
 
 def write_results(all_results, output_path):
+    """Atomic write: dump to a temp file, then os.replace — a kill mid-dump
+    leaves the previous complete file in place."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
+    tmp_path = output_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(all_results, f, indent=2)
+    os.replace(tmp_path, output_path)
 
 
 def main():
@@ -584,6 +701,7 @@ def main():
 
             all_results["tasks"][length][task] = {
                 "accuracy": result["accuracy"],
+                "accuracy_all": result["accuracy_all"],
                 "correct": result["correct"],
                 "total": result["total"],
                 "n_excluded": result["n_excluded"],
@@ -591,8 +709,11 @@ def main():
             }
             write_results(all_results=all_results, output_path=output_path)
 
-            print(f"  {task}: {result['accuracy']:.1%} ({result['correct']}/{result['total']}"
-                  + (f", {result['n_excluded']} excluded" if result["n_excluded"] else "") + ")")
+            line = f"  {task}: {result['accuracy']:.1%} ({result['correct']}/{result['total']} scored)"
+            if result["n_excluded"]:
+                line += (f"; {result['accuracy_all']:.1%} over all "
+                         f"{result['total'] + result['n_excluded']} ({result['n_excluded']} excluded)")
+            print(line)
 
     # Summary table
     print("\n=== Summary ===")

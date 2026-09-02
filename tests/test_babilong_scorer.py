@@ -16,14 +16,20 @@ not cached locally.
 
 import os
 import sys
+import weakref
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_flatten
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.babilong.evaluate import (
+    STORE_PATH_PEAK_FACTOR,
+    _candidate_rows_log_softmax,
     encode_prompt_and_candidates,
+    estimate_peak_memory_state_bytes,
     estimate_retrieve_state_bytes,
     score_example,
 )
@@ -139,8 +145,13 @@ def test_fake_multi_token_candidates_scored_over_exactly_their_positions():
 
     assert num_tokens == P
     assert len(stub.calls) == len(candidates), 'multi-token sets fall back to one forward per candidate'
+    longest = max(len(ids) for ids in cand_ids.values())
+    assert len({len(ids) for ids in stub.calls}) == 1, 'every candidate forward must have the same length'
     for cand, ids in zip(candidates, stub.calls):
-        assert ids == prompt_ids + cand_ids[cand], f'model input for {cand!r} is not prompt + candidate'
+        n_cand = len(cand_ids[cand])
+        assert ids[:P + n_cand] == prompt_ids + cand_ids[cand], f'model input for {cand!r} is not prompt + candidate'
+        # padding sits AFTER the candidate, never inside its scored rows
+        assert ids[P + n_cand:] == [tok.pad_token_id] * (longest - n_cand)
         assert tok.eos_token_id not in ids
         assert details[cand]["num_tokens"] == len(cand_ids[cand])
         assert abs(details[cand]["sum"] / details[cand]["num_tokens"] - log_probs[cand]) < 1e-9
@@ -211,50 +222,195 @@ def test_qa5_labels_use_in_context_surface_form():
     assert not any(label in TASK_LABELS["qa5"] for label in ("bill", "fred", "jeff", "mary"))
 
 
-def test_estimate_retrieve_state_bytes_matches_model_geometry():
-    """The eval memory ceiling estimate: per memory layer, one weight state
-    (all heads) per position the memory sees (interleaved longterm-mem tokens
-    included) when omega is on; one per store chunk otherwise."""
+def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head = 8, seed = 0):
+    """A tiny atlas-config MAC in the geometry the tail-quirk test uses
+    (store chunk 8, one neural-memory batch segment), memory-free when
+    mem_layers is empty."""
     from titans_pytorch import MemoryAsContextTransformer
     from titans_pytorch.neural_memory import NeuralMemory
 
-    def build(mem_kwargs):
-        return MemoryAsContextTransformer(
-            num_tokens = 64, dim = 32, depth = 2, segment_len = 16,
-            num_persist_mem_tokens = 2, num_longterm_mem_tokens = 2,
-            neural_memory_layers = (1, 2), neural_memory_segment_len = 4,
-            use_flex_attn = False, use_axial_pos_emb = False,
-            neural_memory_kwargs = mem_kwargs,
-        )
+    torch.manual_seed(seed)
+    mem_kwargs = NeuralMemory.atlas_config()
+    mem_kwargs.update(
+        dim_head = dim_head, heads = heads, use_sequential_scan = True,
+        per_head_learned_parameters = per_head,
+    )
+    return MemoryAsContextTransformer(
+        num_tokens = 256, dim = dim, depth = 4, segment_len = 64,
+        num_persist_mem_tokens = 4, num_longterm_mem_tokens = 4,
+        neural_memory_layers = mem_layers, neural_memory_segment_len = 8,
+        neural_memory_batch_size = 1024, use_flex_attn = False,
+        sliding_window_attn = True, neural_memory_kwargs = mem_kwargs,
+        use_axial_pos_emb = False,
+    ).eval()
 
-    atlas_kwargs = NeuralMemory.atlas_config()
-    atlas_kwargs.update(dim_head = 8, heads = 4)
-    model = build(atlas_kwargs)
+
+@pytest.mark.parametrize("per_head", [True, False])
+def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_head):
+    """The retrieve-state estimate is checked against the bytes the retrieve
+    actually receives on a real forward (not against a re-statement of the
+    formula). Both head-parameter modes: with per_head_learned_parameters
+    off, memory_model_parameters lacks the head dim and init_weights repeats
+    it `heads` times — an estimate reading the parameter list alone is 4x
+    low there (review, 2026-09-02)."""
+    from titans_pytorch import neural_memory as nm
+
+    model = _tiny_atlas_mac(mem_layers = (1, 4), per_head = per_head)
+    seen = []
+    orig = nm.NeuralMemory.retrieve_memories
+
+    def spy(self, seq, weights):
+        seen.append(sum(t.numel() * t.element_size() for t in weights.values()))
+        return orig(self, seq, weights)
+
+    monkeypatch.setattr(nm.NeuralMemory, "retrieve_memories", spy)
     num_tokens = 100
-    positions = model.seq_len_with_longterm_mem(num_tokens)
-    expected = 0
-    for layer in model.layers:
-        mem = layer[4]
-        if mem is None:
-            continue
-        values = sum(p.numel() for p in mem.memory_model_parameters)
-        expected += values * next(iter(mem.memory_model_parameters)).element_size() * positions
-    assert estimate_retrieve_state_bytes(model = model, num_tokens = num_tokens) == expected
-    assert expected > 0
+    with torch.no_grad():
+        model(torch.randint(0, 256, (1, num_tokens)), return_hidden = True)
 
-    # omega off (titans-like): per store chunk, not per token
-    titans_kwargs = dict(omega_context = 1, dim_head = 8, heads = 4)
-    model_t = build(titans_kwargs)
-    est_t = estimate_retrieve_state_bytes(model = model_t, num_tokens = num_tokens)
-    expected_t = 0
-    for layer in model_t.layers:
-        mem = layer[4]
-        if mem is None:
-            continue
-        values = sum(p.numel() for p in mem.memory_model_parameters)
-        expected_t += values * next(iter(mem.memory_model_parameters)).element_size() * positions / mem.store_chunk_size
-    assert est_t == int(expected_t)
-    assert est_t < estimate_retrieve_state_bytes(model = model, num_tokens = num_tokens)
+    assert len(seen) == 2, 'one retrieve per memory layer'
+    actual = sum(seen)
+    estimate = estimate_retrieve_state_bytes(model = model, num_tokens = num_tokens)
+    # the retrieve receives positions + 1 states (the initial state M_0 too)
+    positions = model.seq_len_with_longterm_mem(num_tokens)
+    expected_ratio = (positions + 1) / positions
+    assert abs(actual / estimate - expected_ratio) < 0.02, (actual, estimate, per_head)
+
+
+class LiveStorageTracker(TorchDispatchMode):
+    """Allocator-independent high-water mark: the bytes of tensor storages
+    created inside the mode that are still referenced, tracked per storage
+    (views share one entry) with a refcount released by weakref finalizers
+    on the Python tensor wrappers. Storages that already existed (parameters,
+    buffers, inputs) are excluded. Same instrument that produced
+    STORE_PATH_PEAK_FACTOR."""
+
+    def __init__(self, exclude_tensors):
+        super().__init__()
+        self.exclude = {t.untyped_storage().data_ptr() for t in exclude_tensors}
+        self.live = {}
+        self.peak = 0
+
+    def _release(self, ptr):
+        entry = self.live.get(ptr)
+        if entry is None:
+            return
+        nbytes, count = entry
+        if count <= 1:
+            del self.live[ptr]
+        else:
+            self.live[ptr] = (nbytes, count - 1)
+
+    def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+        out = func(*args, **(kwargs or {}))
+        for t in tree_flatten(out)[0]:
+            if not isinstance(t, torch.Tensor):
+                continue
+            storage = t.untyped_storage()
+            ptr = storage.data_ptr()
+            if ptr in self.exclude or storage.nbytes() == 0:
+                continue
+            nbytes, count = self.live.get(ptr, (storage.nbytes(), 0))
+            self.live[ptr] = (nbytes, count + 1)
+            weakref.finalize(t, self._release, ptr)
+        total = sum(nbytes for nbytes, _ in self.live.values())
+        self.peak = max(self.peak, total)
+        return out
+
+
+def _measured_peak(model, num_tokens):
+    ids = torch.randint(0, 256, (1, num_tokens))
+    exclude = list(model.parameters()) + list(model.buffers()) + [ids]
+    tracker = LiveStorageTracker(exclude_tensors = exclude)
+    with torch.no_grad(), tracker:
+        model(ids, return_hidden = True)
+    return tracker.peak
+
+
+def test_peak_memory_estimate_matches_live_storage():
+    """The ceiling guard must estimate what the forward PEAKS at, not the
+    retrieve tensor alone (a review measured the retrieve-only estimate ~6x
+    low — a guard that says 'fits' and then OOMs hours into a cluster eval).
+    Measured with the live-storage tracker: one memory layer peaks within
+    [0.7, 1.3]x the calibrated estimate and the peak grows linearly with n;
+    for two layers the flat factor is an upper bound (measured 4.6-4.7x the
+    combined retrieve state vs 6.4x assumed)."""
+    one_layer = _tiny_atlas_mac(mem_layers = (1,), dim = 64, heads = 4, dim_head = 16)
+    peaks = {}
+    for num_tokens in (256, 512):
+        peak = _measured_peak(model = one_layer, num_tokens = num_tokens)
+        estimate = estimate_peak_memory_state_bytes(model = one_layer, num_tokens = num_tokens)
+        ratio = peak / estimate
+        assert 0.7 <= ratio <= 1.3, f'n={num_tokens}: measured peak / estimate = {ratio:.2f}'
+        peaks[num_tokens] = peak
+    growth = peaks[512] / peaks[256]
+    assert 1.8 <= growth <= 2.2, f'peak must grow linearly with n, got x{growth:.2f} for 2x tokens'
+
+    # liveness of the instrument: the retrieve-only figure is far below the peak
+    retrieve_only = estimate_retrieve_state_bytes(model = one_layer, num_tokens = 512)
+    assert peaks[512] / retrieve_only > 4.0
+
+    two_layers = _tiny_atlas_mac(mem_layers = (1, 4), dim = 64, heads = 4, dim_head = 16)
+    peak2 = _measured_peak(model = two_layers, num_tokens = 256)
+    ratio2 = peak2 / estimate_peak_memory_state_bytes(model = two_layers, num_tokens = 256)
+    assert 0.6 <= ratio2 <= 1.0, f'two layers: flat factor {STORE_PATH_PEAK_FACTOR} must be an upper bound, got {ratio2:.2f}'
+
+
+def test_mixed_length_candidates_padded_to_common_length():
+    """Mixed-length candidate sets: every candidate's forward must have the
+    same total length. This model is not length-invariant (per-token
+    retrieve reads a stale state in an incomplete final store chunk), so
+    forwards of different lengths put the shared prompt rows at different
+    chunk phases — the first candidate token was scored on different memory
+    states depending on how many tokens the OTHER candidate has (review
+    measured 1.03 nats). With the pad appended after the candidate the
+    prompt-row distribution is identical across candidates at every prompt
+    length; without it the instrument shows the divergence."""
+    model = _tiny_atlas_mac(mem_layers = (1,))
+    tok = FakeTokenizer()
+    pad = tok.pad_token_id
+    a_ids = _fake_ids(tok, " a")
+    bc_ids = _fake_ids(tok, " b-c")
+    assert (len(a_ids), len(bc_ids)) == (1, 2)
+
+    padded_devs, raw_devs = [], []
+    for length in range(40, 56):
+        prompt = " ".join(f"w{i}" for i in range(length))
+        prompt_ids = _fake_ids(tok, prompt)
+        assert len(prompt_ids) == length
+        rows = slice(length - 1, length)          # the row predicting the first candidate token
+
+        def row(ids):
+            return _candidate_rows_log_softmax(
+                model = model, input_ids = torch.tensor([ids]), rows = rows, disable_flex_attn = True,
+            )
+
+        with torch.no_grad():
+            row_a_padded = row(prompt_ids + a_ids + [pad])   # the scorer's protocol
+            row_bc = row(prompt_ids + bc_ids)
+            row_a_raw = row(prompt_ids + a_ids)              # unpadded: one token shorter
+        padded_devs.append((row_a_padded - row_bc).abs().max().item())
+        raw_devs.append((row_a_raw - row_bc).abs().max().item())
+
+    assert max(padded_devs) < 1e-6, padded_devs
+    assert max(raw_devs) > 1e-3, 'instrument liveness: unpadded forwards of different length must diverge somewhere'
+
+    # end to end through the scorer on the real model
+    prompt = " ".join(f"w{i}" for i in range(47))
+    chosen, log_probs, num_tokens, details = score_example(
+        model = model, tokenizer = tok, prompt_text = prompt, candidates = ["a", "b-c"], device = "cpu",
+    )
+    assert num_tokens == 47 and set(log_probs) == {"a", "b-c"}
+    assert details["a"]["num_tokens"] == 1 and details["b-c"]["num_tokens"] == 2
+
+
+def test_mixed_length_candidates_require_a_pad_token():
+    class NoPad(FakeTokenizer):
+        pad_token_id = None
+
+    stub = StubModel(boosts = {})
+    with pytest.raises(ValueError, match = "pad token"):
+        score_example(model = stub, tokenizer = NoPad(), prompt_text = PROMPT, candidates = ["red", "hall-way"], device = "cpu")
 
 
 # ---------------------------------------------------------------------------

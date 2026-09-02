@@ -720,7 +720,8 @@ class MemoryAsContextTransformer(Module):
         return_hidden = False   # return the final-normed hidden states instead of logits — callers that need a few positions project them with `to_logits` themselves, avoiding the [L, vocab] logits tensor (the BABILong scorer's memory ceiling at long contexts)
     ):
 
-        assert not (return_hidden and return_loss), 'return_hidden returns pre-logit hidden states; it cannot be combined with return_loss'
+        if return_hidden and return_loss:
+            raise ValueError('return_hidden returns pre-logit hidden states; it cannot be combined with return_loss')
 
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]

@@ -1161,7 +1161,7 @@ def test_mac_return_hidden_matches_logits():
         assert torch.allclose(model.to_logits(hidden), logits, atol = 1e-6)
         # projecting a slice equals slicing the projection
         assert torch.allclose(model.to_logits(hidden[:, 10:13]), logits[:, 10:13], atol = 1e-6)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         model(ids, return_hidden = True, return_loss = True)
 
 def test_per_token_retrieve_tail_reads_last_complete_chunk_state():
