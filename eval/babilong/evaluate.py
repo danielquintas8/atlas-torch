@@ -270,9 +270,11 @@ def estimate_retrieve_state_bytes(model, num_tokens):
     final retrieve at `num_tokens` input tokens — the retrieve tensor ALONE.
     The forward peaks well above it; see estimate_peak_memory_state_bytes.
 
-    Every memory layer's decay scan emits one weight state per token when the
-    omega rule is on (per-token store granularity; the per-token retrieve
-    reads them all at once), or one per store chunk otherwise. The states for
+    Every memory layer's decay scan emits one weight state per token on the
+    per-token store path (`per_token_updates` — any omega_context; the omega
+    rule requires the path but the path does not require the rule, and the
+    retrieve receives every per-token state whatever its own granularity),
+    or one per store chunk on the chunk-wise path. The states for
     ALL tokens of the sequence are concatenated before the retrieve, so the
     footprint is linear in the sequence length. The interleaved longterm-mem
     tokens count too: the memory sees seq_len_with_longterm_mem(num_tokens)
@@ -287,13 +289,17 @@ def estimate_retrieve_state_bytes(model, num_tokens):
 
 def _per_position_state_bytes(mem):
     """Bytes of memory-weight state one memory layer emits per interleaved
-    position (per store chunk when the omega rule is off)."""
+    position (per store chunk on the chunk-wise path). Keyed on the store
+    path, not on omega_context: the no-omega ablation (omega_context=1 on the
+    per-token path) emits per-token states too — keying on the window
+    under-estimated it 8x and put the never-under guard at 0.66 of the
+    measured peak (adversarial review 2026-09-02)."""
     state_values = sum(p.numel() for p in mem.memory_model_parameters)
     if not mem.per_head_learned_parameters:
         state_values *= mem.heads
     elem_bytes = next(iter(mem.memory_model_parameters)).element_size()
     per_position = state_values * elem_bytes
-    if mem.omega_context <= 1:
+    if not mem.per_token_updates:
         per_position /= mem.store_chunk_size
     return per_position
 
