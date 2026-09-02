@@ -1135,3 +1135,87 @@ def test_mac_without_axial_pos_emb():
     default_model = build(use_axial_pos_emb = True)
     assert default_model.axial_pos_emb is not None
     assert any('axial_pos_emb' in name for name in default_model.state_dict())
+
+def test_mac_return_hidden_matches_logits():
+    """return_hidden hands back the final-normed hidden states; projecting them
+    with to_logits must reproduce the logits exactly. The BABILong scorer uses
+    this to project only the candidate rows instead of the full [L, vocab]
+    logits tensor (its memory ceiling at long contexts)."""
+    torch.manual_seed(0)
+    model = MemoryAsContextTransformer(
+        num_tokens = 256,
+        dim = 16,
+        depth = 2,
+        segment_len = 32,
+        num_persist_mem_tokens = 4,
+        num_longterm_mem_tokens = 4,
+        neural_mem_gate_attn_output = False,
+        use_axial_pos_emb = False,
+    )
+    model.eval()
+    ids = torch.randint(0, 256, (1, 70))
+    with torch.no_grad():
+        logits = model(ids)
+        hidden = model(ids, return_hidden = True)
+        assert hidden.shape == (1, 70, 16)
+        assert torch.allclose(model.to_logits(hidden), logits, atol = 1e-6)
+        # projecting a slice equals slicing the projection
+        assert torch.allclose(model.to_logits(hidden[:, 10:13]), logits[:, 10:13], atol = 1e-6)
+    with pytest.raises(AssertionError):
+        model(ids, return_hidden = True, return_loss = True)
+
+def test_per_token_retrieve_tail_reads_last_complete_chunk_state():
+    """Modeling quirk pinned for the eval harness (found 2026-09-02): with the
+    omega rule + per-token retrieve, positions inside an INCOMPLETE final store
+    chunk read the state after the last complete chunk (the remainder is
+    cached, never stored in a whole-sequence forward), so the logits at a fixed
+    position depend on the input length modulo store_chunk_size — appending
+    one token that completes the chunk changes what the previous positions
+    retrieve. A pure transformer (memory-free trunk) has no such dependence.
+    Consequence for the BABILong scorer: 'the last prompt row depends only on
+    the prompt' is FALSE here; scoring is consistent across candidates only
+    because every candidate is scored from the same forward (or the same
+    length). Never 'optimize' the scorer on the causal-invariance assumption."""
+
+    def build(mem_layers):
+        torch.manual_seed(0)
+        mem_kwargs = NeuralMemory.atlas_config()
+        mem_kwargs.update(dim_head = 8, heads = 4, use_sequential_scan = True)
+        return MemoryAsContextTransformer(
+            num_tokens = 256,
+            dim = 32,
+            depth = 2,
+            segment_len = 64,
+            num_persist_mem_tokens = 4,
+            num_longterm_mem_tokens = 4,
+            neural_memory_layers = mem_layers,
+            neural_memory_segment_len = 8,
+            neural_memory_batch_size = 1024,
+            use_flex_attn = False,
+            sliding_window_attn = True,
+            neural_memory_kwargs = mem_kwargs,
+            use_axial_pos_emb = False,
+        ).eval()
+
+    torch.manual_seed(1)
+    ids = torch.randint(0, 256, (1, 60))
+
+    def last_row_dev(model, length):
+        with torch.no_grad():
+            a = model(ids[:, :length])[0, length - 1]
+            b = model(ids[:, :length + 1])[0, length - 1]
+        return (a - b).abs().max().item()
+
+    vanilla = build(())
+    atlas = build((1,))
+
+    # control: the memory-free trunk is strictly causal at every length
+    assert all(last_row_dev(vanilla, length) < 1e-6 for length in range(40, 56))
+
+    # atlas: dependence appears exactly when the appended token completes a
+    # store chunk (length % 8 == 7), and nowhere else
+    deviations = {length: last_row_dev(atlas, length) for length in range(40, 56)}
+    completing = [length for length in deviations if length % 8 == 7]
+    others = [length for length in deviations if length % 8 != 7]
+    assert all(deviations[length] > 1e-3 for length in completing), deviations
+    assert all(deviations[length] < 1e-5 for length in others), deviations

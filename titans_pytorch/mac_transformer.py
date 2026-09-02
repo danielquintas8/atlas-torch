@@ -716,8 +716,11 @@ class MemoryAsContextTransformer(Module):
         disable_flex_attn = False,
         cache = None,
         return_cache = False,
-        factorized_pos_emb = None
+        factorized_pos_emb = None,
+        return_hidden = False   # return the final-normed hidden states instead of logits — callers that need a few positions project them with `to_logits` themselves, avoiding the [L, vocab] logits tensor (the BABILong scorer's memory ceiling at long contexts)
     ):
+
+        assert not (return_hidden and return_loss), 'return_hidden returns pre-logit hidden states; it cannot be combined with return_loss'
 
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
@@ -923,6 +926,12 @@ class MemoryAsContextTransformer(Module):
         # to logits
 
         x = self.norm(x)
+
+        if return_hidden:
+            if not return_cache:
+                return x
+
+            return x, next_cache
 
         logits = self.to_logits(x)
 
