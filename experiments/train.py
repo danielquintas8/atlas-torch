@@ -898,6 +898,7 @@ def main():
     yields_this_epoch = skip_chunks // (args.per_device_batch_size * num_gpus)
     running_loss = torch.zeros((), device=accelerator.device)
     loss_count = 0
+    last_grad_norm = float("nan")  # total norm before clipping, from the last full step
     t0 = time.time()
 
     while global_step < max_steps:
@@ -919,8 +920,10 @@ def main():
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    model.parameters(), train_cfg["grad_clip"]
+                # the pre-clip total norm is the earliest divergence signal
+                # (a spike precedes the loss blowing up); logged below
+                last_grad_norm = float(
+                    accelerator.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
                 )
 
             optimizer.step()
@@ -956,7 +959,8 @@ def main():
             accelerator.print(
                 f"step {global_step:>7d} | loss {avg_loss:.4f} | "
                 f"ppl {math.exp(min(avg_loss, 20)):.1f} | lr {lr:.2e} | "
-                f"{tok_per_sec / 1e3:.1f}k tok/s | {tokens_total / 1e9:.3f}B"
+                f"{tok_per_sec / 1e3:.1f}k tok/s | {tokens_total / 1e9:.3f}B | "
+                f"gnorm {last_grad_norm:.3f}"
             )
 
             if args.wandb:
@@ -967,6 +971,7 @@ def main():
                         "train/lr": lr,
                         "train/tokens_per_sec": tok_per_sec,
                         "train/tokens_seen": tokens_total,
+                        "train/grad_norm": last_grad_norm,
                     },
                     step=global_step,
                 )
