@@ -34,7 +34,7 @@
 #   done
 # (afterany, not afterok: a job killed at the wall limit exits non-zero.)
 # Every job in the chain must repeat the SAME env (ABLATION, VANILLA, RUN_SUFFIX,
-# MEMORY_KWARGS, PEAK_LR, SAVE_EVERY): the run name decides which checkpoint
+# MEMORY_KWARGS, PEAK_LR, TOTAL_TOKENS, SAVE_EVERY): the run name decides which checkpoint
 # `latest` finds, and train.py refuses a resume whose peak LR or memory
 # overrides differ from the checkpoint's meta.pt.
 #
@@ -104,6 +104,10 @@ WARMUP_FLAG=""
 if [ -n "${WARMUP_STEPS}" ]; then
     WARMUP_FLAG="--warmup-steps ${WARMUP_STEPS}"
 fi
+TOTAL_TOKENS_FLAG=""
+if [ -n "${TOTAL_TOKENS}" ]; then
+    TOTAL_TOKENS_FLAG="--total-tokens ${TOTAL_TOKENS}"   # cosine span = budget, e.g. 2e9 (recorded + validated on resume)
+fi
 
 # Checkpoints: SAVE_EVERY=100 writes ~300 checkpoints x ~2-3 GB over a full
 # 15B run (600-900 GB of GPFS). train.py's --keep-checkpoints N rotates,
@@ -137,6 +141,7 @@ singularity exec --nv \
                 ${RESUME_FLAG} \
                 ${MAX_STEPS_FLAG} \
                 ${WARMUP_FLAG} \
+                ${TOTAL_TOKENS_FLAG} \
                 ${VANILLA_FLAG} \
                 ${MEMORY_FLAGS} \
                 --data-dir ${DATA_DIR} \

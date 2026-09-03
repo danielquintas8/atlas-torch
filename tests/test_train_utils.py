@@ -604,3 +604,19 @@ def test_store_chunk_does_not_follow_omega_context():
     assert swept["model"]["neural_memory_kwargs"]["omega_context"] == 64
     overridden = apply_memory_kwargs(config = get_config(model_size = "170m", variant = "atlas-mac"), overrides = dict(omega_context = 64))
     assert overridden["model"]["neural_memory_segment_len"] == 8
+
+
+def test_total_tokens_override_scales_the_schedule_not_the_stop():
+    """--total-tokens sets the cosine's span (schedule_steps); --max-steps only
+    stops the run. Two runs with the same max_steps but different budgets
+    must get different schedule shapes, and the budget-sized run must end its
+    cosine at max_steps."""
+    base = dict(total_tokens = 15_000_000_000, batch_tokens = 500_000, seq_len = 1024, warmup_steps = 2000)
+    args = argparse.Namespace(grad_accum = None, max_steps = 4000, warmup_steps = None, per_device_batch_size = 1)
+    _, batch_tokens, schedule_15b, max_steps, _ = compute_schedule(train_cfg = dict(base), args = args, num_gpus = 4)
+    _, _, schedule_2b, max_steps_2b, _ = compute_schedule(train_cfg = {**base, "total_tokens": 2_000_000_000}, args = args, num_gpus = 4)
+    assert max_steps == max_steps_2b == 4000
+    assert schedule_15b == 15_000_000_000 // batch_tokens and schedule_2b == 2_000_000_000 // batch_tokens
+    # batch_tokens is rounded to whole micro-batches (122 x 4 x 1024 = 499,712), so the
+    # 2B cosine ends within a few steps of the 2B stop instead of 26,000 steps later
+    assert abs(schedule_2b - 4000) <= 3 and schedule_15b > 30_000

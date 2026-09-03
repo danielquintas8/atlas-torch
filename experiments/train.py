@@ -583,6 +583,13 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps")
     p.add_argument("--peak-lr", type=float, default=None, help="Override peak learning rate")
     p.add_argument(
+        "--total-tokens",
+        type=float,
+        default=None,
+        help="Override the schedule's token budget (the cosine spans it; e.g. 2e9). "
+        "Default is the config's paper budget; --max-steps only stops the run.",
+    )
+    p.add_argument(
         "--warmup-steps",
         type=int,
         default=None,
@@ -634,6 +641,13 @@ def main():
         train_cfg["seq_len"] = args.seq_len
     if args.peak_lr:
         train_cfg["peak_lr"] = args.peak_lr
+    if args.total_tokens:
+        # schedule SHAPE: the cosine spans this many tokens (default: the
+        # config's paper budget, 15B at 170M). A 2B run under the 15B cosine
+        # stops at 96% of peak LR; setting the budget here completes the
+        # decay inside the run. Recorded in meta.pt as schedule_steps and
+        # validated on resume like every other schedule field.
+        train_cfg["total_tokens"] = int(args.total_tokens)
     seq_len = train_cfg["seq_len"]
 
     run_name = args.run_name or (
