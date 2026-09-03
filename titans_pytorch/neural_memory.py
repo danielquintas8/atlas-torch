@@ -224,25 +224,48 @@ class _NewtonSchulzRecompute(torch.autograd.Function):
     matmuls) and is applied on plain tensors outside the torch.func region,
     so the checkpoint-vs-torch.func incompatibility does not apply. The
     ambient autocast state is captured and restored so the recomputed forward
-    matches the recorded one exactly."""
+    matches the recorded one exactly (hand-rolled rather than
+    torch.amp.custom_fwd/custom_bwd, which need the device type fixed at
+    decoration time — this runs on CPU in the tests and on CUDA on the
+    cluster).
+
+    Limits, by construction: no double backward (`once_differentiable`
+    raises instead of silently returning a detached gradient), and no use
+    under torch.func transforms (a custom Function without setup_context is
+    rejected there) — newtonschulz5 is called on plain tensors after the
+    per-token vmap/grad has returned, never inside it.
+
+    Peak, not just persistent memory, drops: measured on one H100 at the
+    launched geometry (atlas, 1024 tokens, batch 1) 66 GB (OOM) -> 32.2 GB
+    allocated, with the window change; the recompute itself re-materializes
+    the iteration chain transiently inside its own backward node."""
 
     @staticmethod
     def forward(ctx, t, steps, eps, coefs):
         ctx.save_for_backward(t)
         ctx.steps, ctx.eps, ctx.coefs = steps, eps, coefs
-        device_type = t.device.type
-        ctx.autocast = (device_type, torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type))
-        return _newtonschulz5_iterations(t, steps, eps, coefs)
+        ctx.autocast = _autocast_state(device_type = t.device.type)
+        return _newtonschulz5_iterations(t = t, steps = steps, eps = eps, coefs = coefs)
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx, grad_out):
         (t,) = ctx.saved_tensors
         device_type, enabled, dtype = ctx.autocast
         with torch.enable_grad(), torch.autocast(device_type = device_type, dtype = dtype, enabled = enabled):
             t_ = t.detach().requires_grad_(True)
-            out = _newtonschulz5_iterations(t_, ctx.steps, ctx.eps, ctx.coefs)
+            out = _newtonschulz5_iterations(t = t_, steps = ctx.steps, eps = ctx.eps, coefs = ctx.coefs)
         (grad_in,) = torch.autograd.grad(outputs = out, inputs = t_, grad_outputs = grad_out)
         return grad_in, None, None, None
+
+
+def _autocast_state(device_type):
+    """(device_type, enabled, dtype) of the ambient autocast, or disabled for
+    device types autocast does not know (e.g. meta, where the query raises)."""
+    try:
+        return device_type, torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type)
+    except RuntimeError:
+        return device_type, False, torch.float32
 
 
 def newtonschulz5(
@@ -268,9 +291,9 @@ def newtonschulz5(
     t, inv_pack = pack_one_with_inverse(t, '* i j')
 
     if recompute and torch.is_grad_enabled() and t.requires_grad:
-        t = _NewtonSchulzRecompute.apply(t, steps, eps, coefs)
+        t = _NewtonSchulzRecompute.apply(t, steps, eps, coefs)   # Function.apply takes positionals only
     else:
-        t = _newtonschulz5_iterations(t, steps, eps, coefs)
+        t = _newtonschulz5_iterations(t = t, steps = steps, eps = eps, coefs = coefs)
 
     if should_transpose:
         t = t.transpose(-1, -2)
@@ -320,9 +343,12 @@ def apply_omega_window(
                 continue
 
             # gamma_k: (bh, n_tokens), broadcast over all trailing weight dimensions
-            gamma_k = context_gates[..., k].reshape(context_gates.shape[:2] + (1,) * (g.ndim - 2))
+            gamma_k = context_gates[..., k]
+            gamma_k = gamma_k.reshape(gamma_k.shape + (1,) * (g.ndim - 2))
 
             if offset == 0:
+                # always the LAST tap (offsets descend), so the returned tensor is this
+                # out-of-place result, not the in-place accumulator below — keep it last
                 windowed = windowed + g * gamma_k
             else:
                 # position i receives gamma_k[i] * grad[i - offset], zero at the segment

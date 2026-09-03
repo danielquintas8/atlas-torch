@@ -463,8 +463,11 @@ def test_sequential_scan_unbind_matches_reference_and_has_no_slice_backward(remo
 
 def _saved_storage_bytes(fn):
     """Run `fn()` under saved-tensor hooks and return (total bytes saved for
-    backward, unique storages saved) — a deterministic memory instrument: it
-    counts what autograd will keep alive until backward, on any device."""
+    backward, {storage ptr: nbytes}, output) — a deterministic memory
+    instrument: it counts what autograd will keep alive until backward, on any
+    device. CAUTION: saved-tensor hooks disable autograd's version-counter
+    check, so never take value/gradient evidence from a hooked run — run the
+    function once unhooked for those and once hooked for the byte count."""
     from torch.autograd.graph import saved_tensors_hooks
 
     seen = {}
@@ -512,23 +515,37 @@ def test_newtonschulz_recompute_matches_plain_and_saves_only_its_input(shape):
     weight = torch.randn(*shape, dtype = torch.float64)
 
     def run(fn):
+        # values and gradients from an UNHOOKED run (hooks disable the version-counter check)
         t = base.clone().requires_grad_()
-        saved_bytes, storages, out = _saved_storage_bytes(lambda: fn(t))
+        out = fn(t)
         (out * weight).sum().backward()
+        # the byte count from a separate hooked run
+        saved_bytes, _, _ = _saved_storage_bytes(lambda: fn(base.clone().requires_grad_()))
         return out.detach(), t.grad, saved_bytes
 
     out_plain, grad_plain, saved_plain = run(_newtonschulz5_plain)
     out_rc, grad_rc, saved_rc = run(newtonschulz5)
-    assert torch.equal(out_plain, out_rc)
+    out_norc, grad_norc, _ = run(lambda t: newtonschulz5(t, recompute = False))
+    assert torch.equal(out_plain, out_rc) and torch.equal(out_plain, out_norc)
     assert torch.allclose(grad_plain, grad_rc, atol = 1e-12, rtol = 0), (grad_plain - grad_rc).abs().max().item()
+    assert torch.equal(grad_plain, grad_norc), 'recompute=False must be the plain path, gradients included'
     full = base.nbytes
     assert saved_plain >= 5 * full, f'instrument: the plain path must retain the iteration temporaries (saved {saved_plain / full:.1f}x)'
     assert saved_rc <= 1.5 * full, f'the recompute path still saves {saved_rc / full:.1f}x the input'
 
-    # <= 3-D passes through untouched, and recompute=False is the plain path
+    # <= 3-D passes through untouched; no_grad / inference_mode / non-grad inputs take the plain path
     small = torch.randn(3, 7, 8, dtype = torch.float64)
     assert newtonschulz5(small) is small
-    assert torch.equal(newtonschulz5(base.clone().requires_grad_(), recompute = False).detach(), out_plain)
+    with torch.no_grad():
+        assert torch.equal(newtonschulz5(base.clone()), out_plain)
+    with torch.inference_mode():
+        assert torch.equal(newtonschulz5(base.clone()), out_plain)
+
+    # double backward is refused loudly, never a silently detached gradient
+    t = base.clone().requires_grad_()
+    (grad,) = torch.autograd.grad(outputs = (newtonschulz5(t) * weight).sum(), inputs = t, create_graph = True)
+    with pytest.raises(RuntimeError, match = 'once_differentiable|does not require grad'):
+        torch.autograd.grad(outputs = grad.sum(), inputs = t)
 
 
 def test_newtonschulz_recompute_under_autocast_matches_plain():
@@ -591,15 +608,22 @@ def test_omega_window_slice_accumulation_matches_padded_and_saves_no_copies(num_
     gates_base = torch.rand(2, num_tokens, c, dtype = torch.float64)
     weights = {k: torch.randn(*v, dtype = torch.float64) for k, v in shapes.items()}
 
-    def run(fn):
-        g = {k: v.clone().requires_grad_() for k, v in base.items()}
-        gates = gates_base.clone().requires_grad_()
-        saved_bytes, storages, out = _saved_storage_bytes(lambda: fn(TensorDict(g), gates, c))
+    def run(fn, grad_g = True, grad_gates = True):
+        # values and gradients from an UNHOOKED run (the version-counter check stays live —
+        # the in-place slice accumulation is exactly what it guards)
+        g = {k: v.clone().requires_grad_(grad_g) for k, v in base.items()}
+        gates = gates_base.clone().requires_grad_(grad_gates)
+        out = fn(grads = TensorDict(g), context_gates = gates, omega_context = c)
         sum((out[k] * weights[k]).sum() for k in shapes).backward()
-        own = {v.untyped_storage().data_ptr() for v in g.values()} | {gates.untyped_storage().data_ptr()}
-        full_sizes = {v.nbytes for v in base.values()}
-        extra_full = sum(1 for ptr, nbytes in storages.items() if ptr not in own and nbytes in full_sizes)
-        return {k: out[k].detach() for k in shapes}, {k: g[k].grad for k in shapes}, gates.grad, extra_full
+        # bytes autograd keeps for backward, from a separate hooked run: everything
+        # beyond the inputs' own storages, whatever its size (an exact-size filter let
+        # near-full-size per-tap copies through — review 2026-09-03)
+        g2 = {k: v.clone().requires_grad_(grad_g) for k, v in base.items()}
+        gates2 = gates_base.clone().requires_grad_(grad_gates)
+        _, storages, _ = _saved_storage_bytes(lambda: fn(grads = TensorDict(g2), context_gates = gates2, omega_context = c))
+        own = {v.untyped_storage().data_ptr() for v in g2.values()} | {gates2.untyped_storage().data_ptr()}
+        extra_bytes = sum(nbytes for ptr, nbytes in storages.items() if ptr not in own)
+        return {k: out[k].detach() for k in shapes}, {k: g[k].grad for k in shapes}, gates.grad, extra_bytes
 
     out_pad, grad_pad, ggrad_pad, extra_pad = run(_apply_omega_window_padded)
     out_new, grad_new, ggrad_new, extra_new = run(apply_omega_window)
@@ -607,9 +631,21 @@ def test_omega_window_slice_accumulation_matches_padded_and_saves_no_copies(num_
         assert torch.equal(out_pad[k], out_new[k]), k
         assert torch.allclose(grad_pad[k], grad_new[k], atol = 1e-12, rtol = 0), k
     assert torch.allclose(ggrad_pad, ggrad_new, atol = 1e-12, rtol = 0)
+    full = sum(v.nbytes for v in base.values())
     taps_in_range = sum(1 for k in range(c) if 0 < c - 1 - k < num_tokens)
-    assert extra_pad >= taps_in_range, f'instrument: the padded version must keep a full copy per shifted tap (kept {extra_pad})'
-    assert extra_new == 0, f'the slice version still keeps {extra_new} full-size copies for backward'
+    assert extra_pad >= taps_in_range * 0.5 * full, f'instrument: the padded version must keep ~one full copy per shifted tap (kept {extra_pad / full:.1f}x)'
+    assert extra_new <= 0.1 * full, f'the slice version still keeps {extra_new / full:.2f}x the inputs for backward'
+
+    # one-sided gradients: only g, only the gates
+    for grad_g, grad_gates in ((True, False), (False, True)):
+        o_pad, gr_pad, gg_pad, _ = run(_apply_omega_window_padded, grad_g = grad_g, grad_gates = grad_gates)
+        o_new, gr_new, gg_new, _ = run(apply_omega_window, grad_g = grad_g, grad_gates = grad_gates)
+        for k in shapes:
+            assert torch.equal(o_pad[k], o_new[k])
+            if grad_g:
+                assert torch.allclose(gr_pad[k], gr_new[k], atol = 1e-12, rtol = 0)
+        if grad_gates:
+            assert torch.allclose(gg_pad, gg_new, atol = 1e-12, rtol = 0)
 
 
 @pytest.mark.parametrize('use_accelerated', (True, False))
