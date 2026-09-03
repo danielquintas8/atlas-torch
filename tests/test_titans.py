@@ -461,6 +461,157 @@ def test_sequential_scan_unbind_matches_reference_and_has_no_slice_backward(remo
         sequential_scan(gates = gates[:, :-1], inputs = inputs)
 
 
+def _saved_storage_bytes(fn):
+    """Run `fn()` under saved-tensor hooks and return (total bytes saved for
+    backward, unique storages saved) — a deterministic memory instrument: it
+    counts what autograd will keep alive until backward, on any device."""
+    from torch.autograd.graph import saved_tensors_hooks
+
+    seen = {}
+
+    def pack(t):
+        seen[t.untyped_storage().data_ptr()] = t.untyped_storage().nbytes()
+        return t
+
+    with saved_tensors_hooks(pack, lambda t: t):
+        out = fn()
+    return sum(seen.values()), seen, out
+
+
+def _newtonschulz5_plain(t, steps = 5, eps = 1e-7, coefs = (3.4445, -4.7750, 2.0315)):
+    """The pre-2026-09-03 implementation, kept as the value/gradient reference."""
+    from titans_pytorch.neural_memory import pack_one_with_inverse
+    if t.ndim <= 3:
+        return t
+    should_transpose = t.shape[-2] > t.shape[-1]
+    if should_transpose:
+        t = t.transpose(-1, -2)
+    t, inv_pack = pack_one_with_inverse(t, '* i j')
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+    a, b, c = coefs
+    for _ in range(steps):
+        A = t @ t.transpose(-1, -2)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+    if should_transpose:
+        t = t.transpose(-1, -2)
+    return inv_pack(t)
+
+
+@pytest.mark.parametrize('shape', ((3, 7, 8, 24), (3, 7, 24, 8), (2, 5, 8, 8)))
+def test_newtonschulz_recompute_matches_plain_and_saves_only_its_input(shape):
+    """newtonschulz5 recomputes its iterations in backward: values and
+    gradients equal the plain implementation (fp64), while the tensors kept
+    alive for backward drop from every iteration's A / B / t to the single
+    input — 28 GB of the 66 GB peak at the launched geometry (2026-09-03).
+    Both orientations (the transpose branch) and the square case."""
+    from titans_pytorch.neural_memory import newtonschulz5
+
+    torch.manual_seed(0)
+    base = torch.randn(*shape, dtype = torch.float64)
+    weight = torch.randn(*shape, dtype = torch.float64)
+
+    def run(fn):
+        t = base.clone().requires_grad_()
+        saved_bytes, storages, out = _saved_storage_bytes(lambda: fn(t))
+        (out * weight).sum().backward()
+        return out.detach(), t.grad, saved_bytes
+
+    out_plain, grad_plain, saved_plain = run(_newtonschulz5_plain)
+    out_rc, grad_rc, saved_rc = run(newtonschulz5)
+    assert torch.equal(out_plain, out_rc)
+    assert torch.allclose(grad_plain, grad_rc, atol = 1e-12, rtol = 0), (grad_plain - grad_rc).abs().max().item()
+    full = base.nbytes
+    assert saved_plain >= 5 * full, f'instrument: the plain path must retain the iteration temporaries (saved {saved_plain / full:.1f}x)'
+    assert saved_rc <= 1.5 * full, f'the recompute path still saves {saved_rc / full:.1f}x the input'
+
+    # <= 3-D passes through untouched, and recompute=False is the plain path
+    small = torch.randn(3, 7, 8, dtype = torch.float64)
+    assert newtonschulz5(small) is small
+    assert torch.equal(newtonschulz5(base.clone().requires_grad_(), recompute = False).detach(), out_plain)
+
+
+def test_newtonschulz_recompute_under_autocast_matches_plain():
+    """The backward recomputes the forward under the same autocast state it
+    ran with, so a bf16 training step gets the same values and gradients as
+    the plain path did (CPU autocast here; the same code path runs on CUDA)."""
+    from titans_pytorch.neural_memory import newtonschulz5
+
+    torch.manual_seed(0)
+    base = torch.randn(2, 6, 8, 24)
+    weight = torch.randn(2, 6, 8, 24)
+
+    def run(fn):
+        t = base.clone().requires_grad_()
+        with torch.autocast(device_type = 'cpu', dtype = torch.bfloat16):
+            out = fn(t)
+        (out.float() * weight).sum().backward()
+        return out.detach().float(), t.grad
+
+    out_plain, grad_plain = run(_newtonschulz5_plain)
+    out_rc, grad_rc = run(newtonschulz5)
+    assert out_rc.dtype == out_plain.dtype and torch.equal(out_plain, out_rc)
+    assert torch.allclose(grad_plain, grad_rc, atol = 1e-6, rtol = 1e-5), (grad_plain - grad_rc).abs().max().item()
+
+
+def _apply_omega_window_padded(grads, context_gates, omega_context):
+    """The pre-2026-09-03 implementation (one zero-padded copy of g per tap)."""
+    import torch.nn.functional as F
+    from titans_pytorch.neural_memory import TensorDict
+    out = TensorDict()
+    for name, g in grads.items():
+        windowed = torch.zeros_like(g)
+        for k in range(omega_context):
+            offset = omega_context - 1 - k
+            if offset >= g.shape[1]:
+                continue
+            gamma = context_gates[..., k]
+            shifted = g if offset == 0 else F.pad(g[:, :-offset], (0,) * (2 * (g.ndim - 2)) + (offset, 0))
+            for _ in range(g.ndim - 2):
+                gamma = gamma.unsqueeze(-1)
+            windowed = windowed + shifted * gamma
+        out[name] = windowed
+    return out
+
+
+@pytest.mark.parametrize('num_tokens', (37, 5))
+def test_omega_window_slice_accumulation_matches_padded_and_saves_no_copies(num_tokens):
+    """apply_omega_window accumulates each tap into the shifted slice instead
+    of building a zero-padded copy of the gradient per tap: identical values
+    (bitwise) and gradients w.r.t. the gradients and the gates, and no
+    full-size tensor besides g itself is kept for backward (the padded version
+    kept omega_context - 1 of them: 20 GB at the launched geometry). The
+    5-token case has taps reaching before the segment start."""
+    from titans_pytorch.neural_memory import TensorDict, apply_omega_window
+
+    torch.manual_seed(0)
+    c = 8
+    shapes = dict(w1 = (2, num_tokens, 4, 6), b1 = (2, num_tokens, 6))
+    base = {k: torch.randn(*v, dtype = torch.float64) for k, v in shapes.items()}
+    gates_base = torch.rand(2, num_tokens, c, dtype = torch.float64)
+    weights = {k: torch.randn(*v, dtype = torch.float64) for k, v in shapes.items()}
+
+    def run(fn):
+        g = {k: v.clone().requires_grad_() for k, v in base.items()}
+        gates = gates_base.clone().requires_grad_()
+        saved_bytes, storages, out = _saved_storage_bytes(lambda: fn(TensorDict(g), gates, c))
+        sum((out[k] * weights[k]).sum() for k in shapes).backward()
+        own = {v.untyped_storage().data_ptr() for v in g.values()} | {gates.untyped_storage().data_ptr()}
+        full_sizes = {v.nbytes for v in base.values()}
+        extra_full = sum(1 for ptr, nbytes in storages.items() if ptr not in own and nbytes in full_sizes)
+        return {k: out[k].detach() for k in shapes}, {k: g[k].grad for k in shapes}, gates.grad, extra_full
+
+    out_pad, grad_pad, ggrad_pad, extra_pad = run(_apply_omega_window_padded)
+    out_new, grad_new, ggrad_new, extra_new = run(apply_omega_window)
+    for k in shapes:
+        assert torch.equal(out_pad[k], out_new[k]), k
+        assert torch.allclose(grad_pad[k], grad_new[k], atol = 1e-12, rtol = 0), k
+    assert torch.allclose(ggrad_pad, ggrad_new, atol = 1e-12, rtol = 0)
+    taps_in_range = sum(1 for k in range(c) if 0 < c - 1 - k < num_tokens)
+    assert extra_pad >= taps_in_range, f'instrument: the padded version must keep a full copy per shifted tap (kept {extra_pad})'
+    assert extra_new == 0, f'the slice version still keeps {extra_new} full-size copies for backward'
+
+
 @pytest.mark.parametrize('use_accelerated', (True, False))
 def test_assoc_scan(
     use_accelerated

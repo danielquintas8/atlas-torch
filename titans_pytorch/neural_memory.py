@@ -201,12 +201,61 @@ def softclamp_grad_norm(t, max_value):
 # spectral norming the surprise update w/ newton schulz matrix iter
 # Keller Jordan et al. from OSS w/ nanogpt, now being used for two works, Atlas and 'TTT done right'
 
+def _newtonschulz5_iterations(t, steps, eps, coefs):
+    """Normalize and run the quintic Newton-Schulz iterations on a (*, i, j)
+    batch with i <= j (the caller transposes and packs)."""
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+    a, b, c = coefs
+    for _ in range(steps):
+        A = t @ t.transpose(-1, -2)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+    return t
+
+
+class _NewtonSchulzRecompute(torch.autograd.Function):
+    """Newton-Schulz with recompute-in-backward: the forward saves only its
+    input; the backward re-runs the iterations under autograd and
+    differentiates them. Plain autograd keeps every iteration's A, B and t for
+    backward — on the per-token store path that was ~20 full copies of the
+    per-token weight states across the two memory layers, 28 GB of the 66 GB
+    peak at 1084 positions (allocator snapshot 2026-09-03). The recompute
+    costs one extra NS forward per backward (a handful of small batched
+    matmuls) and is applied on plain tensors outside the torch.func region,
+    so the checkpoint-vs-torch.func incompatibility does not apply. The
+    ambient autocast state is captured and restored so the recomputed forward
+    matches the recorded one exactly."""
+
+    @staticmethod
+    def forward(ctx, t, steps, eps, coefs):
+        ctx.save_for_backward(t)
+        ctx.steps, ctx.eps, ctx.coefs = steps, eps, coefs
+        device_type = t.device.type
+        ctx.autocast = (device_type, torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type))
+        return _newtonschulz5_iterations(t, steps, eps, coefs)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (t,) = ctx.saved_tensors
+        device_type, enabled, dtype = ctx.autocast
+        with torch.enable_grad(), torch.autocast(device_type = device_type, dtype = dtype, enabled = enabled):
+            t_ = t.detach().requires_grad_(True)
+            out = _newtonschulz5_iterations(t_, ctx.steps, ctx.eps, ctx.coefs)
+        (grad_in,) = torch.autograd.grad(outputs = out, inputs = t_, grad_outputs = grad_out)
+        return grad_in, None, None, None
+
+
 def newtonschulz5(
     t,
     steps = 5,
     eps = 1e-7,
-    coefs = (3.4445, -4.7750, 2.0315)
+    coefs = (3.4445, -4.7750, 2.0315),
+    recompute = True
 ):
+    """Muon's Newton-Schulz orthogonalization on the last two dims of a >= 4-D
+    tensor (<= 3-D passes through). `recompute` (default) saves only the input
+    for backward and recomputes the iterations there — same values and
+    gradients, a fraction of the autograd memory."""
     if t.ndim <= 3:
         return t
 
@@ -217,14 +266,11 @@ def newtonschulz5(
         t = t.transpose(-1, -2)
 
     t, inv_pack = pack_one_with_inverse(t, '* i j')
-    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
 
-    a, b, c = coefs
-
-    for _ in range(steps):
-        A = t @ t.transpose(-1, -2)
-        B = b * A + c * A @ A
-        t = a * t + B @ t
+    if recompute and torch.is_grad_enabled() and t.requires_grad:
+        t = _NewtonSchulzRecompute.apply(t, steps, eps, coefs)
+    else:
+        t = _newtonschulz5_iterations(t, steps, eps, coefs)
 
     if should_transpose:
         t = t.transpose(-1, -2)
@@ -273,24 +319,19 @@ def apply_omega_window(
                 # window tap reaches entirely before the segment start — contributes nothing
                 continue
 
-            gamma_k = context_gates[..., k]  # (bh, n_tokens)
+            # gamma_k: (bh, n_tokens), broadcast over all trailing weight dimensions
+            gamma_k = context_gates[..., k].reshape(context_gates.shape[:2] + (1,) * (g.ndim - 2))
 
             if offset == 0:
-                shifted = g
+                windowed = windowed + g * gamma_k
             else:
-                # shift right by `offset` along the token (time) axis: position i receives
-                # grad[i - offset], zero-padded at the segment start
-                shifted = F.pad(
-                    g[:, :-offset],
-                    (0,) * (2 * (g.ndim - 2)) + (offset, 0)
-                )
-
-            # broadcast gamma over all trailing weight dimensions
-            gamma_expanded = gamma_k
-            for _ in range(g.ndim - 2):
-                gamma_expanded = gamma_expanded.unsqueeze(-1)
-
-            windowed = windowed + shifted * gamma_expanded
+                # position i receives gamma_k[i] * grad[i - offset], zero at the segment
+                # start: accumulate straight into the shifted slice. The previous
+                # F.pad(g[:, :-offset]) built one full zero-padded copy of g per tap and
+                # autograd kept all of them — 7 taps x 2 layers x 1.28 GB = 20 GB, 30% of
+                # the 66 GB peak at 1084 positions (allocator snapshot 2026-09-03). The
+                # multiply saves only views of g and of the gates.
+                windowed[:, offset:] = windowed[:, offset:] + g[:, :-offset] * gamma_k[:, offset:]
 
         windowed_grads[name] = windowed
 
