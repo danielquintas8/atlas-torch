@@ -150,6 +150,6 @@ singularity exec --nv \
                 --wandb \
                 --per-device-batch-size 1 \
                 --save-every ${SAVE_EVERY:-100} \
-                --validate-every 1000 \
+                --validate-every ${VALIDATE_EVERY:-1000} \
                 --seq-len 1024 \
                 --log-every 10"
