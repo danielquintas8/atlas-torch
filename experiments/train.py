@@ -968,7 +968,10 @@ def main():
 
         # Log
         if global_step % args.log_every == 0:
-            avg_loss = (running_loss / loss_count).item()
+            # mean over ALL ranks (every rank saw loss_count micro-batches this
+            # interval): the logged loss is the global batch loss, not rank 0's
+            # quarter of it. One small collective per log interval.
+            avg_loss = (accelerator.reduce(running_loss, reduction="mean") / loss_count).item()
             running_loss.zero_()
             loss_count = 0
 
@@ -982,8 +985,11 @@ def main():
             gnorm_max = float(grad_norm_max) if grad_norm_max is not None else float("nan")
             grad_norm_max = None
 
-            accelerator.print(format_train_line(step=global_step, loss=avg_loss, lr=lr, tok_per_sec=tok_per_sec,
-                                                tokens_total=tokens_total, grad_norm_max=gnorm_max))
+            # accelerator.print prints once PER NODE ("once per server"); the monitor
+            # parses these lines, so they must appear exactly once per step
+            if accelerator.is_main_process:
+                print(format_train_line(step=global_step, loss=avg_loss, lr=lr, tok_per_sec=tok_per_sec,
+                                        tokens_total=tokens_total, grad_norm_max=gnorm_max))
 
             if args.wandb:
                 accelerator.log(
@@ -1040,7 +1046,8 @@ def main():
 
             avg_val = sum(val_losses) / max(1, len(val_losses))
             avg_near_certain = sum(near_certain_fracs) / max(1, len(near_certain_fracs))
-            accelerator.print(format_val_line(step=global_step, val_loss=avg_val, frac_near_certain=avg_near_certain))
+            if accelerator.is_main_process:
+                print(format_val_line(step=global_step, val_loss=avg_val, frac_near_certain=avg_near_certain))
 
             if args.wandb:
                 accelerator.log(
