@@ -231,6 +231,48 @@ class SegmentedAttention(Module):
         self.segment_len = segment_len
         self.num_persist_mem_tokens = num_persist_mem_tokens
 
+    def project_qkv(self, seq, value_residual = None):
+        """Shared prologue of every path: pre-norm, q / k / v projections split
+        into heads, and the learned value-residual mix. Returns (q, k, v,
+        orig_v) with orig_v the pre-mix values (the residual handed to the
+        next layers)."""
+        assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
+
+        seq = self.norm(seq)
+
+        q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        orig_v = v
+
+        if exists(self.to_learned_v_mix):
+            mix = self.to_learned_v_mix(seq)
+            v = v.lerp(value_residual, mix)
+
+        return q, k, v, orig_v
+
+    def prepend_persistent_memory(self, k, v):
+        """Persistent memory keys / values in front of `k` / `v` (cast to their
+        dtype: the Parameter stays fp32 under bf16 autocast)."""
+        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
+
+        k = cat((pmk.to(k.dtype), k), dim = -2)
+        v = cat((pmv.to(v.dtype), v), dim = -2)
+
+        return k, v
+
+    def project_out(self, out, output_gating = None):
+        """Shared epilogue: merge heads, output projection, optional gating by
+        the retrieved memories."""
+        out = self.merge_heads(out)
+
+        out = self.to_out(out)
+
+        if exists(output_gating):
+            out = out * output_gating
+
+        return out
+
     def forward_inference(
         self,
         token,
@@ -238,22 +280,7 @@ class SegmentedAttention(Module):
         value_residual = None,
         output_gating = None,
     ):
-        batch = token.shape[0]
-
-        # attention
-
-        token = self.norm(token)
-
-        q, k, v = self.to_qkv(token).chunk(3, dim = -1)
-        q, k, v = map(self.split_heads, (q, k, v))
-
-        # value residual
-
-        orig_v = v
-
-        if exists(self.to_learned_v_mix):
-            mix = self.to_learned_v_mix(token)
-            v = v.lerp(value_residual, mix)
+        q, k, v, orig_v = self.project_qkv(token, value_residual = value_residual)
 
         # caching
 
@@ -267,29 +294,15 @@ class SegmentedAttention(Module):
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-        # fold
+        # persistent memory
 
-        q, k, v = tuple(rearrange(t, 'b h n d -> b h n d') for t in (q, k, v))
-
-        # take care of persistent memory key / values
-
-        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
-
-        # persistent memory (cast to match q/k dtype for bf16 autocast compatibility)
-
-        k = cat((pmk.to(k.dtype), k), dim = -2)
-        v = cat((pmv.to(v.dtype), v), dim = -2)
+        k, v = self.prepend_persistent_memory(k, v)
 
         # attention
 
         out, _ = self.attend(q, k, v)
 
-        out = self.merge_heads(out)
-
-        out = self.to_out(out)
-
-        if exists(output_gating):
-            out = out * output_gating
+        out = self.project_out(out, output_gating = output_gating)
 
         return out, AttnIntermediates(orig_v, next_cache)
 
@@ -302,41 +315,21 @@ class SegmentedAttention(Module):
         cache = None
     ):
 
-        assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
+        seq_len = seq.shape[1]
 
-        batch, seq_len = seq.shape[:2]
-
-        # attention
-
-        seq = self.norm(seq)
-
-        q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
-        q, k, v = map(self.split_heads, (q, k, v))
-
-        # value residual
-
-        orig_v = v
-
-        if exists(self.to_learned_v_mix):
-            mix = self.to_learned_v_mix(seq)
-            v = v.lerp(value_residual, mix)
+        q, k, v, orig_v = self.project_qkv(seq, value_residual = value_residual)
 
         # caching
 
         next_cache = (k, v)
 
-        # take care of persistent memory key / values
-
-        pmk, pmv = repeat(self.persistent_memory, 'kv h n d -> kv b h n d', b = batch)
-
         # relative positions
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-        # persistent memory (cast to match q/k dtype for bf16 autocast compatibility)
+        # persistent memory
 
-        k = cat((pmk.to(k.dtype), k), dim = -2)
-        v = cat((pmv.to(v.dtype), v), dim = -2)
+        k, v = self.prepend_persistent_memory(k, v)
 
         # prep flex attention
 
@@ -349,12 +342,7 @@ class SegmentedAttention(Module):
 
         out = flex_attn_fn(q, k, v)
 
-        out = self.merge_heads(out)
-
-        out = self.to_out(out)
-
-        if exists(output_gating):
-            out = out * output_gating
+        out = self.project_out(out, output_gating = output_gating)
 
         return out, AttnIntermediates(orig_v, next_cache)
 
@@ -365,8 +353,24 @@ class SegmentedAttention(Module):
         flex_attn_fn: Callable | None = None,
         disable_flex_attn = False,
         output_gating = None,
-        cache = None
+        cache = None,
+        prev_kv = None,
     ):
+        """`prev_kv` (chunked inference, MemoryAsContextTransformer.
+        iter_chunked_hidden): the un-rotated keys / values, each (b, h, m, d),
+        of the m interleaved positions immediately before `seq`, sliced from
+        the cache this method returned for the previous chunk. The joint
+        sequence [prev ∥ seq] must start on an attention segment boundary
+        (the caller slices the cache so that it does); it is then folded into
+        segments exactly as the whole-sequence forward folds the full
+        sequence, so `seq`'s rows see the same keys under the same mask — the
+        previous segment plus the head of their own (sliding) or their own
+        segment only (block). The prev rows get zero queries and their
+        outputs are dropped; memory is O(len(seq)). Returns the outputs of
+        `seq`'s rows and, as the next cache, the un-rotated keys / values of
+        [prev ∥ seq] (the caller keeps the last 2 x total_segment_len).
+        Non-flex path only.
+        """
         is_inferencing = exists(cache)
 
         if is_inferencing:
@@ -374,39 +378,44 @@ class SegmentedAttention(Module):
             return self.forward_inference(seq, cache, value_residual, output_gating = output_gating)
 
         if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
+            assert not exists(prev_kv), 'prev_kv (chunked inference) needs the non-flex path: pass disable_flex_attn = True'
             return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache)
 
-        assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
-
-        segment_len, num_longterm_mem_tokens = self.segment_len, self.num_longterm_mem_tokens
-        total_segment_len = segment_len + num_longterm_mem_tokens
+        total_segment_len = self.total_segment_len
 
         batch, seq_len = seq.shape[:2]
 
-        # auto pad to multiple
+        q, k, v, orig_v = self.project_qkv(seq, value_residual = value_residual)
 
-        seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len, fold_into_batch = False)
+        # chunked inference: the carried keys / values of the positions right
+        # before this chunk join with zero queries (rows computed, then dropped)
 
-        # attention
+        prev_len = 0
 
-        seq = self.norm(seq)
+        if exists(prev_kv):
+            prev_k, prev_v = prev_kv
+            prev_len = prev_k.shape[-2]
+            k = cat((prev_k, k), dim = -2)
+            v = cat((prev_v, v), dim = -2)
+            q = pad_at_dim(q, (prev_len, 0), dim = -2)
 
-        q, k, v = self.to_qkv(seq).chunk(3, dim = -1)
-        q, k, v = map(self.split_heads, (q, k, v))
+        # caching — un-rotated, without the segment padding below
 
-        # value residual
+        next_cache = (k, v)
 
-        orig_v = v
+        # pad to a multiple of the segment length. Zero rows after the
+        # projections equal projecting zero-padded input rows (RMSNorm(0) = 0
+        # and the projections have no bias), and let the cached rows join
+        # without being re-projected.
 
-        if exists(self.to_learned_v_mix):
-            mix = self.to_learned_v_mix(seq)
-            v = v.lerp(value_residual, mix)
+        total_len = q.shape[-2]
+        padded_len = round_up_multiple(total_len, total_segment_len)
 
-        # caching
+        if padded_len > total_len:
+            q, k, v = tuple(pad_at_dim(t, (0, padded_len - total_len), dim = -2) for t in (q, k, v))
 
-        next_cache = tuple(map(inverse_segment, (k, v)))
-
-        # relative positions
+        # relative positions — offsets from the start of [prev ∥ seq]; only
+        # the differences matter and they equal the whole-sequence forward's
 
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
@@ -427,7 +436,7 @@ class SegmentedAttention(Module):
 
             # take care of masking
 
-            idx = torch.arange(seq.shape[-2], device = seq.device)
+            idx = torch.arange(padded_len, device = seq.device)
             q_idx = rearrange(idx, '(w n) -> w n', n = total_segment_len)
             k_idx = pad_at_dim(q_idx, (1, 0), dim = 0, value = -1e4)
             k_idx = cat((k_idx[:-1], k_idx[1:]), dim = -1)
@@ -441,14 +450,9 @@ class SegmentedAttention(Module):
             sliding_mask = repeat(sliding_mask, 'w i j -> (b w) 1 i j', b = batch)
             attend_kwargs.update(mask = sliding_mask)
 
-        # take care of persistent memory key / values
+        # persistent memory (per window)
 
-        pmk, pmv = repeat(self.persistent_memory, 'kv ... -> kv b ...', b = k.shape[0])
-
-        # persistent memory
-
-        k = cat((pmk, k), dim = -2)
-        v = cat((pmv, v), dim = -2)
+        k, v = self.prepend_persistent_memory(k, v)
 
         # attention
 
@@ -460,7 +464,9 @@ class SegmentedAttention(Module):
 
         out = rearrange(out, '(b w) n d -> b (w n) d', b = batch)
 
-        out = inverse_segment(out)
+        # drop the prev rows and the segment padding
+
+        out = out[:, prev_len:prev_len + seq_len]
 
         if exists(output_gating):
             out = out * output_gating
@@ -533,11 +539,17 @@ class MemoryAsContextTransformer(Module):
 
         # hyper connection
 
+        self.num_residual_streams = num_residual_streams
+
         init_hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
 
         self.layers = ModuleList([])
 
         self.neural_memory_segment_len = default(neural_memory_segment_len, num_longterm_mem_tokens + segment_len)
+
+        # kept for chunked inference: chunk boundaries must coincide with the
+        # neural memory's batch (segment) boundaries — see iter_chunked_hidden
+        self.neural_memory_batch_size = neural_memory_batch_size
 
         layers = tuple(range(1, depth + 1))
 
@@ -607,6 +619,10 @@ class MemoryAsContextTransformer(Module):
                 attn,
                 ff,
             ]))
+
+        # layer slot 4 is the neural memory (None on attention-only layers)
+
+        self.has_neural_memory = any(exists(layer[4]) for layer in self.layers)
 
         self.norm = nn.RMSNorm(dim)
 
@@ -708,6 +724,284 @@ class MemoryAsContextTransformer(Module):
 
         return out[..., prompt_seq_len:]
 
+    def chunked_inference_alignment(self, chunk_len):
+        """Validate a chunk length for iter_chunked_hidden; raise ValueError with
+        the reason otherwise. `chunk_len` is measured in INTERLEAVED positions
+        (tokens plus the longterm-mem tokens inserted after every segment) —
+        the neural memory's own axis, on which its batch (segment) boundaries
+        lie. Chunk boundaries must coincide with those boundaries: a boundary
+        inside a memory segment would add an omega-window truncation the
+        parallel forward does not have, and a chunk that is not a multiple of
+        the store chunk would leave remainder tokens reading a stale state
+        mid-sequence. Original tokens per chunk therefore vary (e.g. 1024
+        interleaved positions = 964 tokens + 60 mem tokens at segment_len 64
+        with 4 mem tokens); the generator reports the token offsets."""
+        if chunk_len <= 0:
+            raise ValueError(f'chunk_len must be positive, got {chunk_len}')
+
+        # attention-only models: any positive chunk length aligns (the
+        # attention fold is aligned by the carried cache, not by the chunk)
+
+        if self.has_neural_memory:
+            if not divisible_by(chunk_len, self.neural_memory_segment_len):
+                raise ValueError(
+                    f'chunk_len ({chunk_len}) must be a multiple of the neural memory store chunk '
+                    f'({self.neural_memory_segment_len}) — remainder positions would read a stale memory state'
+                )
+
+            if not exists(self.neural_memory_batch_size):
+                raise ValueError(
+                    'chunked inference needs neural_memory_batch_size: without it the parallel forward '
+                    'treats the whole sequence as one memory segment, so any chunk boundary would add an '
+                    'omega-window truncation and the chunked output could not match it'
+                )
+
+            if not divisible_by(chunk_len, self.neural_memory_batch_size):
+                raise ValueError(
+                    f'chunk_len ({chunk_len} interleaved positions) must be a multiple of '
+                    f'neural_memory_batch_size ({self.neural_memory_batch_size}) so chunk boundaries '
+                    f'coincide with the memory segment boundaries of the parallel forward'
+                )
+
+        if self.neural_mem_weight_residual:
+            raise ValueError('chunked inference does not support neural_mem_weight_residual')
+
+        # gated_transition: the whole-sequence forward's segment concatenation
+        # drops each non-final segment's last entry and substitutes the next
+        # segment's first entry — the GATED lerp(weights, last_update, gate)
+        # state — so the last token of every segment retrieves with the gated
+        # state, while a chunk boundary there retrieves with the un-gated one
+        # (measured 2-3 max deviation from the first boundary onward,
+        # 2026-09-02). Replicating that boundary semantics chunkwise is
+        # possible but out of scope; refuse the config instead.
+
+        for layer in self.layers:
+            mem = layer[4]
+            if exists(mem) and exists(mem.transition_gate):
+                raise ValueError(
+                    'chunked inference does not support gated_transition: the parallel forward '
+                    'retrieves the last token of each memory segment with the gated state, which '
+                    'a chunk boundary cannot reproduce'
+                )
+
+    @torch.no_grad()
+    def iter_chunked_hidden(
+        self,
+        x,
+        chunk_len,
+    ):
+        """Chunked inference: process token ids `x` (batch, seq_len) in chunks
+        of `chunk_len` INTERLEAVED positions, carrying only state across chunk
+        boundaries — the neural memory state (weights, momentum, store
+        remainder, query-conv context) and each attention layer's un-rotated
+        keys/values for the last two attention segments — so memory is
+        O(chunk) instead of O(L).
+
+        Yields (start, hidden): final-normed hidden states for the ORIGINAL
+        token positions [start, start + hidden.shape[1]) covered by the chunk,
+        longterm-mem tokens excised. Equal to the whole-sequence forward's
+        hidden states (parity-tested: same interleave, same axial positional
+        embedding at global positions when enabled, same memory segmentation
+        because chunk boundaries coincide with memory segment boundaries —
+        see chunked_inference_alignment — and the same segment fold in the
+        attention: a chunk may start mid-segment, so each layer is handed
+        the cached keys/values back to the previous segment boundary and
+        folds [cache ∥ chunk] exactly as the whole-sequence forward folds
+        the full sequence, see SegmentedAttention.forward's `prev_kv`).
+
+        The last chunk may be shorter. Not a decoding path: it is the
+        parallel forward split along the sequence, for likelihood-style
+        evaluation past the whole-sequence memory ceiling.
+        """
+        self.chunked_inference_alignment(chunk_len)
+
+        batch, seq_len = x.shape
+        segment_len, total_segment_len = self.segment_len, self.attn_window_size
+        device = x.device
+
+        num_positions = self.seq_len_with_longterm_mem(seq_len)
+
+        # global interleaved position -> (segment, offset): offsets below
+        # segment_len are tokens, the rest are that segment's mem tokens
+
+        positions = torch.arange(num_positions, device = device)
+        segment_index, offset = positions // total_segment_len, positions % total_segment_len
+        is_token = offset < segment_len
+        token_index = segment_index * segment_len + offset
+        mem_index = offset - segment_len
+
+        kv_caches = [None] * len(self.layers)
+        mem_states = [None] * len(self.layers)
+
+        for pos_start in range(0, num_positions, chunk_len):
+            pos_end = min(pos_start + chunk_len, num_positions)
+
+            chunk_is_token = is_token[pos_start:pos_end]
+            chunk_token_index = token_index[pos_start:pos_end][chunk_is_token]
+
+            # one method call per chunk, so its transients (activations, the
+            # per-token memory states) die on return — before the next chunk
+            # allocates its own
+
+            h = self._chunk_hidden(
+                x = x,
+                chunk_positions = positions[pos_start:pos_end],
+                chunk_is_token = chunk_is_token,
+                chunk_token_index = chunk_token_index,
+                chunk_mem_index = mem_index[pos_start:pos_end][~chunk_is_token],
+                kv_caches = kv_caches,
+                mem_states = mem_states,
+            )
+
+            if h.shape[1] == 0:
+                continue
+
+            yield int(chunk_token_index[0]), h
+
+    def _chunk_hidden(
+        self,
+        x,
+        chunk_positions,
+        chunk_is_token,
+        chunk_token_index,
+        chunk_mem_index,
+        kv_caches,
+        mem_states,
+    ):
+        """One chunk of iter_chunked_hidden: every layer over the interleaved
+        positions `chunk_positions`, advancing the carried attention caches
+        and memory states IN PLACE (lists indexed by layer), returning the
+        final-normed hidden states of the chunk's original tokens."""
+        batch = x.shape[0]
+        total_segment_len = self.attn_window_size
+        pos_start = int(chunk_positions[0])
+        # the chunk's interleaved embeddings — the same layout the parallel
+        # forward builds with pad_and_segment + pack, assembled directly.
+        # dtype taken from the embedded tokens themselves (token_emb may be
+        # any module, not necessarily an nn.Embedding with a `.weight`)
+
+        token_embeds = self.token_emb(x[:, chunk_token_index])
+        emb_dtype = token_embeds.dtype
+
+        emb = torch.empty((batch, chunk_positions.shape[0], self.longterm_mems.shape[-1]), device = x.device, dtype = emb_dtype)
+        emb[:, chunk_is_token] = token_embeds
+        emb[:, ~chunk_is_token] = self.longterm_mems[chunk_mem_index].to(emb_dtype)
+
+        if exists(self.axial_pos_emb):
+            emb = emb + self.axial_pos_emb.forward_with_pos(chunk_positions, (self.neural_memory_segment_len,))
+
+        h = self.expand_streams(emb)
+
+        value_residual = None
+        mem_input_layers = []
+
+        for layer_index, (mem_hyper_conn, attn_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, attn, ff) in enumerate(self.layers):
+
+            attn_out_gates = None
+
+            if exists(mem):
+                mem_input, add_residual = mem_hyper_conn(h)
+
+                if not exists(mem_qkv_layer_selector):
+                    qkv_mem_input = stack((mem_input, mem_input, mem_input))
+                else:
+                    layers_to_choose_from = stack((mem_input, *mem_input_layers))
+                    selected = mem_qkv_layer_selector(mem_input)
+                    qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
+
+                retrieved, next_mem_state = mem.forward(
+                    seq = qkv_mem_input,
+                    state = mem_states[layer_index],
+                )
+
+                # carry the compact state only: the per-token weight states
+                # (`updates`, O(chunk)) are this chunk's retrieve inputs and
+                # are never read by the next call — drop the local too, or
+                # they would stay alive through the rest of this chunk
+                mem_states[layer_index] = next_mem_state._replace(updates = None)
+                del next_mem_state
+
+                if self.gate_attn_output:
+                    attn_out_gates = retrieved.sigmoid()
+                else:
+                    h = add_residual(retrieved)
+
+            attn_in, add_residual = attn_hyper_conn(h)
+
+            mem_input_layers.append(attn_in)
+
+            # the cached rows the attention fold needs so that [prev ∥ chunk]
+            # starts on a segment boundary: the head of the segment this
+            # chunk starts in, plus the previous whole segment for sliding
+            # windows (the cache holds everything since position 0 while
+            # that is shorter)
+
+            need = pos_start % total_segment_len + (total_segment_len if attn.sliding else 0)
+            prev_kv = kv_caches[layer_index]
+
+            if exists(prev_kv):
+                prev_kv = tuple(t[..., -need:, :] for t in prev_kv) if need > 0 else None
+
+            attn_out, (values, next_kv_cache) = attn(
+                attn_in,
+                value_residual = value_residual,
+                disable_flex_attn = True,
+                output_gating = attn_out_gates,
+                prev_kv = prev_kv,
+            )
+
+            # a view would keep the whole chunk's keys / values alive: copy the
+            # last two segments
+            kv_caches[layer_index] = tuple(t[..., -2 * total_segment_len:, :].clone() for t in next_kv_cache)
+            del next_kv_cache
+
+            mem_input_layers.append(attn_out)
+
+            value_residual = default(value_residual, values)
+
+            h = add_residual(attn_out)
+
+            ff_in, add_ff_residual = ff_hyper_conn(h)
+
+            mem_input_layers.append(ff_in)
+
+            ff_out = ff(ff_in)
+
+            mem_input_layers.append(ff_out)
+
+            h = add_ff_residual(ff_out)
+
+        h = self.reduce_streams(h)
+
+        # excise the mem tokens, final norm
+
+        return self.norm(h[:, chunk_is_token])
+
+    def forward_chunked(
+        self,
+        x,
+        chunk_len,
+        return_hidden = False,
+    ):
+        """Whole output of iter_chunked_hidden concatenated: logits (batch,
+        seq_len, num_tokens) by default, or the hidden states with
+        return_hidden=True. Peak memory is O(chunk_len), but the returned
+        tensor is O(seq_len) — for a few positions, consume the generator."""
+        pieces = [h for _, h in self.iter_chunked_hidden(x, chunk_len = chunk_len)]
+
+        if len(pieces) == 0:
+            raise ValueError(f'forward_chunked needs at least one token, got input shape {tuple(x.shape)}')
+
+        hidden = cat(pieces, dim = 1)
+
+        if hidden.shape[1] != x.shape[1]:
+            raise RuntimeError(f'chunked forward yielded {hidden.shape[1]} rows for {x.shape[1]} tokens')
+
+        if return_hidden:
+            return hidden
+
+        return self.to_logits(hidden)
+
     def forward(
         self,
         x,
@@ -716,8 +1010,12 @@ class MemoryAsContextTransformer(Module):
         disable_flex_attn = False,
         cache = None,
         return_cache = False,
-        factorized_pos_emb = None
+        factorized_pos_emb = None,
+        return_hidden = False   # return the final-normed hidden states instead of logits — callers that need a few positions project them with `to_logits` themselves, avoiding the [L, vocab] logits tensor (the BABILong scorer's memory ceiling at long contexts)
     ):
+
+        if return_hidden and return_loss:
+            raise ValueError('return_hidden returns pre-logit hidden states; it cannot be combined with return_loss')
 
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
@@ -923,6 +1221,12 @@ class MemoryAsContextTransformer(Module):
         # to logits
 
         x = self.norm(x)
+
+        if return_hidden:
+            if not return_cache:
+                return x
+
+            return x, next_cache
 
         logits = self.to_logits(x)
 
