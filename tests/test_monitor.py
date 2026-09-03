@@ -153,3 +153,37 @@ def test_cli_exit_codes_and_json(tmp_path, capsys):
     assert main(argv = [str(tmp_path / "missing.log"), "--json"]) == 3, "a monitor that cannot judge escalates, never reads as ok"
     assert json.loads(capsys.readouterr().out)["status"] == "monitor_error"
     assert main(argv = [str(log), "--window", "0", "--json"]) == 3
+
+
+def test_per_node_duplicate_lines_collapse_to_one_step():
+    """A 4-node run prints four lines per step (one per node, local losses); the
+    rules must see ONE log line per step: four copies of a single grad-norm
+    spike are not two consecutive spikes, and the loss is the mean of the
+    node-local values. A step re-logged later (resume) is a new row."""
+    lines = []
+    for step in range(10, 310, 10):
+        for node_loss in (3.30, 3.32, 3.28, 3.31):
+            lines.append(_train(step, node_loss, gnorm = 0.9))
+    parsed = parse_log(text = "\n".join(lines))
+    assert [t["step"] for t in parsed["train"]] == list(range(10, 310, 10))
+    assert parsed["train"][0]["loss"] == pytest.approx(3.3025)
+    assert "_n" not in parsed["train"][0] and "_n" not in parsed["train"][-1]
+
+    spike = lines + [_train(310, 3.3, gnorm = 45.0)] * 4        # one spiking interval, four nodes
+    verdict = assess(parsed = parse_log(text = "\n".join(spike)), rules = RULES)
+    assert verdict.status == "ok", verdict
+    sustained = spike + [_train(320, 3.3, gnorm = 45.0)] * 4    # a second spiking interval: now it is sustained
+    assert assess(parsed = parse_log(text = "\n".join(sustained)), rules = RULES).status == "alarm"
+
+    # a nan on one node poisons the step (the rules must see it)
+    poisoned = lines + [_train(310, 3.3), _train(310, float("nan")), _train(310, 3.3), _train(310, 3.3)]
+    assert math.isnan(parse_log(text = "\n".join(poisoned))["train"][-1]["loss"])
+
+    # validation lines duplicate the same way
+    vals = "\n".join(lines + [_val(300, 3.40), _val(300, 3.42), _val(300, 3.41), _val(300, 3.41)])
+    parsed = parse_log(text = vals)
+    assert len(parsed["val"]) == 1 and parsed["val"][0]["val"] == pytest.approx(3.41)
+
+    # a resumed run re-logging the same step later is a separate row, not a duplicate
+    resumed = lines + [_train(400, 3.2)] + lines[-4:]
+    assert [t["step"] for t in parse_log(text = "\n".join(resumed))["train"]][-2:] == [400, 300]

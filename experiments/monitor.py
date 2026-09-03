@@ -119,7 +119,36 @@ def parse_lines(lines: Iterable[str]) -> dict:
             failures.append(line.strip()[:200])
         if line.startswith(DONE_MARKER):
             done = True
-    return dict(train=train, val=val, failures=failures, timeout=timeout, done=done)
+    return dict(train=_dedupe_by_step(train, value_keys=("loss",)), val=_dedupe_by_step(val, value_keys=("val", "frac")),
+                failures=failures, timeout=timeout, done=done)
+
+
+def _dedupe_by_step(rows, value_keys):
+    """Multi-node runs print one line per node per step (accelerator.print is
+    once per server), each with that node's LOCAL loss; the rules count log
+    lines, so four copies of one step read as four intervals and a single
+    grad-norm spike became "sustained" (false alarm on the first 4-node run,
+    2026-09-03). Consecutive rows with the same step collapse into one, the
+    listed values averaged, the rest (identical across nodes) taken from the
+    first. A step seen again later (a resumed run re-logging) starts a new row."""
+    out = []
+    for row in rows:
+        if out and out[-1]["step"] == row["step"]:
+            group = out[-1]
+            n = group.pop("_n", 1) + 1
+            for key in value_keys:
+                if math.isfinite(row[key]) and math.isfinite(group[key]):
+                    group[key] = group[key] + (row[key] - group[key]) / n
+                elif not math.isfinite(row[key]):
+                    group[key] = row[key]
+            group["_n"] = n
+        else:
+            if out:
+                out[-1].pop("_n", None)
+            out.append(dict(row))
+    if out:
+        out[-1].pop("_n", None)
+    return out
 
 
 def parse_log(text: str) -> dict:
