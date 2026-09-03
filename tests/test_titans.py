@@ -539,11 +539,122 @@ def test_omega_context_partial_window():
     assert seq.shape == retrieved.shape
     retrieved.sum().backward()
 
-def test_omega_context_exceeds_chunk_raises():
-    """omega_context > chunk_size must raise assertion error"""
-    import pytest
-    with pytest.raises(AssertionError):
-        NeuralMemory(dim = 16, chunk_size = 4, omega_context = 8)
+def _omega_window_reference(g, gates, c):
+    """Brute-force reference for the omega window (paper Section 3.2, Eq 9):
+    G_i = sum_{k=0}^{c-1} gamma_k^(i) * grad[i - (c-1-k)], zero outside the segment.
+    g: (B, T, *weight_shape), gates: (B, T, c). Loop implementation on purpose —
+    any vectorization shortcut could share a bug with the code under test."""
+    out = torch.zeros_like(g)
+    seq_len = g.shape[1]
+    for i in range(seq_len):
+        for k in range(c):
+            j = i - (c - 1 - k)
+            if j < 0:
+                continue
+            gamma = gates[:, i, k].reshape(-1, *([1] * (g.ndim - 2)))
+            out[:, i] += g[:, j] * gamma
+    return out
+
+def test_omega_window_matches_reference():
+    """apply_omega_window must equal the brute-force paper equation exactly.
+    Value-level regression for the non-sliding-window bug (found 2026-09-01):
+    the pre-fix slice direction returned every gradient to its original index,
+    reducing the omega rule to a per-position gate-sum LR multiplier with zero
+    cross-token mixing. Shape tests cannot catch this class of bug."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    torch.manual_seed(0)
+    c = 8
+    g = torch.randn(3, 20, 4, 5, dtype = torch.float64)
+    gates = torch.rand(3, 20, c, dtype = torch.float64)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+    ref = _omega_window_reference(g = g, gates = gates, c = c)
+
+    assert torch.allclose(out, ref, atol = 1e-12)
+
+def test_omega_window_impulse_slides():
+    """An impulse gradient at token 0 with all-ones gates must appear in the
+    window of every one of the next c positions — the defining property of a
+    sliding window. The pre-fix code produced [1, 0, ..., 0]."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    c = 8
+    g = torch.zeros(1, c, 1, 1)
+    g[0, 0] = 1.
+    gates = torch.ones(1, c, c)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+
+    assert torch.allclose(out.flatten(), torch.ones(c)), (
+        f'impulse at token 0 must reach all {c} window positions, got {out.flatten().tolist()}'
+    )
+
+def test_omega_window_crosses_chunk_boundary():
+    """The window must mix gradients across vmap-chunk boundaries — all chunks in
+    a store segment share the same segment-start base weights (exactness holds
+    because accept_weight_residual, which would give chunks different base
+    points, is asserted off for omega). Also asserts store_memories hands
+    apply_omega_window the full segment token axis, not per-chunk blocks."""
+    from tensordict import TensorDict
+    import titans_pytorch.neural_memory as nm
+
+    # unit level: impulse at position 3 with c=4 must propagate into positions
+    # 4, 5, 6 (the old chunk_size=4 boundary sat between 3 and 4)
+    c = 4
+    g = torch.zeros(1, 8, 1, 1)
+    g[0, 3] = 1.
+    gates = torch.ones(1, 8, c)
+    out = nm.apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w'].flatten()
+    assert torch.allclose(out[3:7], torch.ones(4)), 'impulse must appear in the next c-1 positions across the chunk boundary'
+    assert torch.allclose(out[[0, 1, 2, 7]], torch.zeros(4))
+
+    # integration level: grads reach the window with the full token axis
+    seen_token_dims = []
+    orig = nm.apply_omega_window
+
+    def spy(grads, context_gates, omega_context):
+        seen_token_dims.append(next(iter(grads.values())).shape[1])
+        return orig(grads = grads, context_gates = context_gates, omega_context = omega_context)
+
+    nm.apply_omega_window = spy
+    try:
+        mem = NeuralMemory(dim = 16, chunk_size = 4, omega_context = 4)
+        seq = torch.randn(2, 32, 16)
+        retrieved, _ = mem(seq)
+    finally:
+        nm.apply_omega_window = orig
+
+    assert seen_token_dims == [32], (
+        f'expected the window to see the full 32-token segment axis, got {seen_token_dims}'
+    )
+
+def test_omega_context_exceeds_chunk_size():
+    """omega_context may exceed the vmap chunk size — the window lives on the
+    segment token axis, not the chunk axis. Previously asserted out."""
+    mem = NeuralMemory(dim = 16, chunk_size = 4, omega_context = 8)
+    seq = torch.randn(2, 32, 16)
+    retrieved, _ = mem(seq)
+    assert seq.shape == retrieved.shape
+    retrieved.sum().backward()
+
+def test_omega_window_context_longer_than_segment():
+    """Window size c larger than the segment token count: taps reaching before
+    the segment start contribute zeros (the offset >= num_tokens guard)."""
+    from tensordict import TensorDict
+    from titans_pytorch.neural_memory import apply_omega_window
+
+    torch.manual_seed(1)
+    c, seq_len = 16, 8
+    g = torch.randn(2, seq_len, 3, dtype = torch.float64)
+    gates = torch.rand(2, seq_len, c, dtype = torch.float64)
+
+    out = apply_omega_window(grads = TensorDict({'w': g}), context_gates = gates, omega_context = c)['w']
+    ref = _omega_window_reference(g = g, gates = gates, c = c)
+
+    assert torch.allclose(out, ref, atol = 1e-12)
 
 def test_omega_with_momentum_backward():
     """omega rule + momentum must support gradient flow"""
@@ -827,3 +938,164 @@ def test_atlas_adaptive_lr_affects_muon_update_magnitude():
         'cancelled by the scale-invariant Newton-Schulz normalization. η must be applied '
         'OUTSIDE NS-5 (paper Section 5, Eq (32)), not folded into the surprise as the grad loss weight.'
     )
+
+def test_value_conv_in_atlas_config():
+    """Paper Section 5 architectural backbone: keys, VALUES, and queries all get a
+    short causal conv (size 4) after their projections. The repo previously conv'd
+    only keys and queries — values went straight from projection to storage
+    (2026-09-01 audit)."""
+    config = NeuralMemory.atlas_config()
+    mem = NeuralMemory(dim = 16, chunk_size = 8, **config)
+    assert mem.value_conv is not None, 'atlas_config (short_conv_size=4) must construct a value conv'
+
+    mem_no_conv = NeuralMemory(dim = 16, chunk_size = 8, **NeuralMemory.atlas_config(short_conv_size = 0))
+    assert mem_no_conv.value_conv is None
+
+    seq = torch.randn(2, 64, 16)
+    retrieved, _ = mem(seq)
+    assert retrieved.shape == seq.shape
+    retrieved.sum().backward()
+    assert mem.value_conv.conv.weight.grad is not None, 'value conv must participate in the store path'
+
+def test_store_path_receives_outer_loop_grads_in_mac_geometry():
+    """N1 regression guard (2026-09-01 audit): in the shipped 170M geometry the
+    interleaved sequence (train ctx + longterm mem tokens) exceeded
+    neural_memory_batch_size, splitting storage into two segments, and
+    detach_segment_memory=True detached the first — so the learned memory init
+    (W0) received ZERO outer-loop gradient for the whole run (frozen at random
+    init; DDP find_unused_parameters=True masked the symptom) and store-side
+    params trained on only the trailing ~5% of tokens. The atlas config now
+    ships detach_segment_memory=False. This test reproduces the trigger
+    geometry at reduced size (interleaved 268 > batch_size 256 -> segments
+    [256, 12]) and pins both halves of the behavior."""
+    from titans_pytorch.mac_transformer import MemoryAsContextTransformer
+
+    def build_and_backward(detach):
+        torch.manual_seed(42)
+        mem_kwargs = NeuralMemory.atlas_config()
+        mem_kwargs.update(
+            dim_head = 8,
+            heads = 4,
+            use_sequential_scan = True,
+            default_step_transform_max_lr = 1e-1,
+            detach_segment_memory = detach,
+        )
+        model = MemoryAsContextTransformer(
+            num_tokens = 256,
+            dim = 32,
+            depth = 2,
+            segment_len = 64,
+            num_persist_mem_tokens = 4,
+            num_longterm_mem_tokens = 4,
+            neural_memory_layers = (1,),
+            neural_memory_segment_len = 8,
+            neural_memory_batch_size = 256,
+            use_flex_attn = False,
+            sliding_window_attn = True,
+            neural_memory_kwargs = mem_kwargs,
+        )
+        mem = next(layer[4] for layer in model.layers if layer[4] is not None)
+        x = torch.randint(0, 256, (1, 257))
+        loss = model(x, return_loss = True)
+        loss.backward()
+        return mem
+
+    # shipped config (detach off): the learned init and store-side params train
+
+    mem = build_and_backward(detach = False)
+    w0_grad = mem.memory_model_parameters[0].grad
+    assert w0_grad is not None, (
+        'learned memory init (W0) must receive outer-loop gradient with '
+        'detach_segment_memory=False — if this fails, the store path is starved again'
+    )
+    assert w0_grad.abs().sum() > 0, 'W0 gradient exists but is identically zero — starved by another route'
+    to_keys_weight = mem.to_keys.weight if isinstance(mem.to_keys, nn.Linear) else mem.to_keys[0].weight
+    assert to_keys_weight.grad is not None
+    assert to_keys_weight.grad.abs().sum() > 0
+
+    # characterization: detach=True in this geometry silently freezes W0 —
+    # the reason the atlas training config must not re-enable it
+
+    mem_detached = build_and_backward(detach = True)
+    assert mem_detached.memory_model_parameters[0].grad is None, (
+        'expected detach_segment_memory=True to cut all outer-loop gradient to the '
+        'learned memory init in the two-segment geometry — if it now receives '
+        'gradient, the detach semantics changed and this guard needs re-derivation'
+    )
+
+def test_no_muon_omega_eta_affects_output():
+    """Single-variable ablation guard (2026-09-01 review round): the adaptive lr
+    eta is applied per target position OUTSIDE the momentum for ALL omega paths,
+    with or without Newton-Schulz — so the no-muon ablation differs from atlas by
+    exactly Newton-Schulz, not by eta placement too. Before the window fix the two
+    placements were equivalent (no cross-token mixing); after it they diverge, and
+    leaving eta as the grad loss weight in the no-muon path would have made the
+    ablation change two variables at once."""
+    config = NeuralMemory.atlas_config(spectral_norm_surprises = False)
+
+    torch.manual_seed(42)
+    mem_small_lr = NeuralMemory(dim = 16, chunk_size = 8, default_step_transform_max_lr = 0.1, **config)
+    seq = torch.randn(2, 64, 16)
+
+    # placement probe: the grad fn must receive a RAW loss weight (all ones — the
+    # store mask), not eta. eta folded in as the loss weight is the pre-fix
+    # two-variable-ablation regression: without allclose(ones) here, eta rides
+    # inside the windowed gradients instead of scaling per target position.
+    seen_loss_weights = []
+    orig_grad_fn = mem_small_lr.per_token_grad_fn
+
+    def spy(params, keys, loss_weights, values):
+        seen_loss_weights.append(loss_weights.detach().clone())
+        return orig_grad_fn(params, keys, loss_weights, values)
+
+    mem_small_lr.per_token_grad_fn = spy
+    out_small, _ = mem_small_lr(seq)
+    mem_small_lr.per_token_grad_fn = orig_grad_fn
+
+    assert len(seen_loss_weights) > 0, 'spy never fired — instrument dead'
+    assert torch.allclose(seen_loss_weights[0], torch.ones_like(seen_loss_weights[0])), (
+        'the no-muon omega path fed eta to the grad fn as the loss weight — eta '
+        'placement has regressed inside the windowed gradient, making the no-muon '
+        'ablation a two-variable change (Newton-Schulz AND eta placement)'
+    )
+
+    torch.manual_seed(42)
+    mem_large_lr = NeuralMemory(dim = 16, chunk_size = 8, default_step_transform_max_lr = 1.0, **config)
+    out_large, _ = mem_large_lr(seq)
+
+    assert out_small.isfinite().all() and out_large.isfinite().all(), 'non-finite memory output'
+    assert not torch.allclose(out_small, out_large, atol = 1e-6), (
+        'adaptive lr has no effect on the no-muon omega path — eta is being dropped entirely'
+    )
+
+def test_shipped_atlas_memory_config_pins():
+    """Pin the shipped atlas memory config. Mutation testing (2026-09-01 review
+    round) showed nothing guarded it: flipping detach_segment_memory back to True
+    left the entire 9,839-test suite green, because the mechanism tests build
+    their own kwargs. These values are the decision surface of the 2026-09-01
+    audit — change them deliberately or not at all."""
+    from experiments.configs import MEMORY_CONFIGS
+
+    atlas = MEMORY_CONFIGS['atlas']
+    assert atlas['detach_segment_memory'] is False, 'detach starves the store path in the trained geometry'
+    assert atlas['short_conv_size'] == 4, 'paper Section 5 backbone: conv on keys/values/queries'
+    assert atlas['omega_context'] == 8
+    assert atlas['per_token_retrieve'] is True
+    assert atlas['spectral_norm_surprises'] is True
+    assert atlas['polynomial_degree'] == 2
+
+def test_omega_weight_residual_asserts():
+    """omega + accept_weight_residual must refuse to construct: prev_weights are
+    sliced per chunk, giving chunks different base weights, and the omega window
+    would mix gradients taken at different base points (the paper's chunked form
+    evaluates all window gradients at the same chunk-start state)."""
+    with pytest.raises(AssertionError):
+        NeuralMemory(dim = 16, chunk_size = 8, omega_context = 8, accept_weight_residual = True)
+
+def test_omega_context_exceeding_batch_size_warns():
+    """omega_context > neural memory batch_size is valid (windows truncate at
+    segment boundaries) but wasteful — taps beyond the segment length can never
+    fire and their to_context_gates parameters are dead. Construction should
+    warn, not fail."""
+    with pytest.warns(UserWarning, match = 'omega_context'):
+        NeuralMemory(dim = 16, chunk_size = 8, batch_size = 8, omega_context = 16)
