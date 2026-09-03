@@ -948,6 +948,8 @@ def main():
                 continue
 
         all_results["tasks"][length] = {}
+        if args.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
 
         for task in args.tasks:
             result = evaluate_task(
@@ -988,6 +990,14 @@ def main():
                 line += (f"; {result['accuracy_all']:.1%} over all "
                          f"{result['total'] + result['n_excluded']} ({result['n_excluded']} excluded)")
             print(line)
+
+        if args.device == "cuda":
+            # the measured peak next to the estimate the guard used: PEAK_FACTOR was
+            # calibrated on CPU, and this is what the first GPU runs calibrate it with
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9
+            all_results.setdefault("memory", {})[length] = dict(measured_peak_gb=peak_gb, chunk_len=args.chunk_len, bf16=bool(args.bf16))
+            print(f"  measured CUDA peak: {peak_gb:.2f} GB")
+            write_results(all_results=all_results, output_path=output_path)
 
     # Summary table
     print("\n=== Summary ===")
