@@ -228,7 +228,7 @@ def test_qa5_labels_use_in_context_surface_form():
     assert not any(label in TASK_LABELS["qa5"] for label in ("bill", "fred", "jeff", "mary"))
 
 
-def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head = 8, seed = 0, batch_size = 1024):
+def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head = 8, seed = 0, batch_size = 1024, **mem_overrides):
     """A tiny atlas-config MAC in the geometry the tail-quirk test uses
     (store chunk 8, one neural-memory batch segment of `batch_size`
     interleaved positions), memory-free when mem_layers is empty."""
@@ -241,6 +241,7 @@ def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head =
         dim_head = dim_head, heads = heads, use_sequential_scan = True,
         per_head_learned_parameters = per_head,
     )
+    mem_kwargs.update(mem_overrides)
     return MemoryAsContextTransformer(
         num_tokens = 256, dim = dim, depth = 4, segment_len = 64,
         num_persist_mem_tokens = 4, num_longterm_mem_tokens = 4,
@@ -251,8 +252,9 @@ def _tiny_atlas_mac(mem_layers, per_head = True, dim = 32, heads = 4, dim_head =
     ).eval()
 
 
+@pytest.mark.parametrize("omega_context", [8, 1])
 @pytest.mark.parametrize("per_head", [True, False])
-def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_head):
+def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_head, omega_context):
     """The retrieve-state estimate is checked against the bytes the retrieve
     actually receives on a real forward (not against a re-statement of the
     formula). Both head-parameter modes: with per_head_learned_parameters
@@ -261,7 +263,7 @@ def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_
     low there (review, 2026-09-02)."""
     from titans_pytorch import neural_memory as nm
 
-    model = _tiny_atlas_mac(mem_layers = (1, 4), per_head = per_head)
+    model = _tiny_atlas_mac(mem_layers = (1, 4), per_head = per_head, omega_context = omega_context)
     seen = []
     orig = nm.NeuralMemory.retrieve_memories
 
@@ -280,7 +282,7 @@ def test_retrieve_state_estimate_matches_actual_retrieve_bytes(monkeypatch, per_
     # the retrieve receives positions + 1 states (the initial state M_0 too)
     positions = model.seq_len_with_longterm_mem(num_tokens)
     expected_ratio = (positions + 1) / positions
-    assert abs(actual / estimate - expected_ratio) < 0.02, (actual, estimate, per_head)
+    assert abs(actual / estimate - expected_ratio) < 0.02, (actual, estimate, per_head, omega_context)
 
 
 class LiveStorageTracker(TorchDispatchMode):
@@ -342,9 +344,13 @@ def _measured_peak(model, num_tokens, chunk_len = None):
 
 
 NEVER_UNDER_GEOMETRIES = {
-    'one memory layer': (1,),
-    'two memory layers': (1, 4),
-    'memory-free trunk': (),
+    'one memory layer': dict(mem_layers = (1,)),
+    'two memory layers': dict(mem_layers = (1, 4)),
+    'memory-free trunk': dict(mem_layers = ()),
+    # the no-omega ablation: per-token store path without the window. keying the
+    # estimator on omega_context put it at 0.66 of the measured chunked peak here
+    # (adversarial review 2026-09-02); the state is per token on this path too
+    'one memory layer, no-omega (c=1, per-token path)': dict(mem_layers = (1,), omega_context = 1),
 }
 
 
@@ -360,7 +366,7 @@ def test_peak_memory_estimate_never_under_measured(geometry):
     one memory layer). Bounded loose above (2.5x) so the guard cannot become
     absurdly conservative either."""
     model = _tiny_atlas_mac(
-        mem_layers = NEVER_UNDER_GEOMETRIES[geometry], dim = 64, heads = 4, dim_head = 16, batch_size = 256,
+        **NEVER_UNDER_GEOMETRIES[geometry], dim = 64, heads = 4, dim_head = 16, batch_size = 256,
     )
     measured, estimate = {}, {}
     for num_tokens in (256, 1024, 2048):

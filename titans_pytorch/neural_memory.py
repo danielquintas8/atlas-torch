@@ -529,6 +529,14 @@ class NeuralMemory(Module):
         rank-≤dim_head compression of φ(k), so Proposition 2's O(d_k^p)
         capacity bound does not apply on this path. Treat project_back=False
         as a Phase 3+ scaling question (see GitHub issue #17).
+        per_token_updates=True: the per-token store path is selected explicitly,
+        not by the window size. Before 2026-09-02 it was implied by
+        omega_context > 1, so omega_context=1 silently ran lucidrains'
+        chunk-wise path and the no-omega ablation changed the gradient, gate,
+        eta-placement, scan and retrieve granularity along with the window.
+        With the flag, omega_context=1 is the paper's c = 1 ablation row and
+        differs from the shipped stack by the window and its gates only.
+
         per_token_retrieve=True: the paper has no standalone retrieval
         equation for Atlas — the appendix defines write recurrences only. The
         DOT sections read with the post-update state (y_t = M_t(q_t)), and
@@ -545,6 +553,7 @@ class NeuralMemory(Module):
             polynomial_degree = 2,
             poly_project_back = True,
             omega_context = 8,
+            per_token_updates = True,
             per_token_retrieve = True,
             short_conv_size = 4,
             qk_rmsnorm = True,
@@ -587,8 +596,9 @@ class NeuralMemory(Module):
         muon_ns_eps = 1e-7,
         polynomial_degree: int | None = None,
         poly_project_back = True,
-        omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = Titans. window truncates at neural-memory batch (segment) boundaries.
-        per_token_retrieve: bool = False,  # per-token retrieve: each y_t reads the post-update per-token weight state (our convention; the paper has no standalone Atlas retrieval equation). requires ~chunk_size× more memory. default False uses per-chunk approximation. enable when hardware allows (multi-GPU or smaller model).
+        omega_context: int = 1,  # sliding window size c (paper Section 3.2). 1 = no window (Titans' per-token rule). window truncates at neural-memory batch (segment) boundaries. this value selects the WINDOW only — the store path is selected by per_token_updates.
+        per_token_updates: bool | None = None,  # per-token store path: one gradient per token at the segment-start weights, per-token momentum / decay / eta gates, eta per target position outside momentum and Newton-Schulz, per-position scan; the omega window is applied on top when omega_context > 1. None = True iff omega_context > 1. explicit True at omega_context = 1 is the paper's c = 1 ablation row (Table 'ablation'; Section 3.2: c = 1 with gamma = 1 recovers Titans' memory, which is why no context gates exist at c = 1) — Titans' rule inside Atlas's machinery, at the per-token path's memory cost and at this path's base point (every gradient in a neural_memory_batch_size segment is taken at the segment-start weights, the paper's parallel form with b = that segment). False = lucidrains' chunk-wise path: one summed gradient per store chunk at the SAME segment-start weights, chunk-pooled gates, per-chunk scan and retrieve (incompatible with omega_context > 1 and with per_token_retrieve).
+        per_token_retrieve: bool = False,  # per-token retrieve: each y_t reads the post-update per-token weight state (our convention; the paper has no standalone Atlas retrieval equation). requires ~chunk_size× more memory and the per-token store path (per_token_updates). default False uses the per-chunk approximation.
         short_conv_size: int = 0,  # causal depthwise conv on keys/values/queries (paper Section 5 architectural backbone, kernel size). 0 = disabled.
         detach_segment_memory: bool = False,  # detach intermediate segment updates to reduce autograd memory from O(segments) to O(1). outer-loop gradients for store-side params come only from last segment. enable when GPU memory is constrained.
         use_sequential_scan: bool = False,  # use sequential scan for momentum/decay instead of parallel associative scan. O(1) forward memory vs O(n log n). slower but drastically reduces GPU memory for large sequences.
@@ -606,17 +616,35 @@ class NeuralMemory(Module):
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
-        # omega rule incompatibilities
-        if omega_context > 1:
-            assert num_kv_per_token == 1, 'omega rule requires num_kv_per_token == 1 (per-token context gates live on the segment token axis and cannot address (n u) keys — shapes mismatch)'
-            assert not store_with_lookahead_value, 'omega rule is incompatible with store_with_lookahead_value (lookahead trims keys to chunk_size - 1, mismatching context gate dimensions)'
-            assert not accept_weight_residual, (
-                'omega rule is incompatible with accept_weight_residual: prev_weights are '
-                'sliced per chunk, giving chunks different base weights, and the omega window '
-                'would mix gradients taken at different base points. the paper\'s chunked form '
-                '(Section 3.3) evaluates all window gradients at the same chunk-start state.'
+        # store path: the omega window is a sum over per-token gradients, so it needs the
+        # per-token path; the per-token path itself is independent of the window size.
+        # deriving the path from omega_context > 1 was the 2026-09-02 ablation confound:
+        # omega_context=1 silently switched to the chunk-wise path (per-chunk gradients,
+        # chunk-pooled gates, per-chunk retrieve, eta inside the gradient), so 'no-omega'
+        # changed five things at once. now explicit.
+        if per_token_updates is None:
+            per_token_updates = omega_context > 1
+        elif omega_context > 1 and not per_token_updates:
+            raise ValueError(
+                f'omega_context={omega_context} requires per_token_updates=True: the omega window '
+                f'is a gamma-gated sum over per-token gradients, which the chunk-wise path never computes'
             )
 
+        self.per_token_updates = per_token_updates
+
+        # per-token path incompatibilities
+        if per_token_updates:
+            assert num_kv_per_token == 1, 'per-token store path requires num_kv_per_token == 1 (per-token gates and context gates live on the segment token axis and cannot address (n u) keys — shapes mismatch)'
+            assert not store_with_lookahead_value, 'per-token store path is incompatible with store_with_lookahead_value (lookahead trims keys to chunk_size - 1, mismatching the per-token gate dimensions)'
+            assert not accept_weight_residual, (
+                'per-token store path is incompatible with accept_weight_residual: prev_weights are '
+                'sliced per chunk, giving chunks different base weights, while the per-token path '
+                'evaluates every gradient in a segment at the same segment-start weights (and the '
+                'omega window would mix gradients taken at different base points). the paper\'s '
+                'chunked form (Section 3.3) evaluates all window gradients at the same chunk-start state.'
+            )
+
+        if omega_context > 1:
             if exists(batch_size) and omega_context > batch_size:
                 import warnings
                 warnings.warn(
@@ -626,14 +654,20 @@ class NeuralMemory(Module):
                     f'truncation is valid but wasteful — consider omega_context <= batch_size.'
                 )
 
-        # omega rule produces per-token weight updates (M_t = M_{t-1} + S'_t recurrence).
+        # the per-token path produces per-token weight states (M_t = M_{t-1} + S'_t recurrence).
         # per-token retrieve (retrieve_chunk_size=1) reads each y_t from the post-update
         # per-token state — our convention; the paper has no standalone Atlas retrieval eq.
-        # however, it requires ~chunk_size× more autograd memory (one weight set per token in the
-        # computation graph, held for backward across all layers). defaults to per-chunk approximation
-        # (subsample at chunk boundaries, same as Titans) which works on single GPU.
-        # enable per_token_retrieve=True when hardware supports it (multi-GPU, model parallelism).
-        if omega_context > 1 and per_token_retrieve:
+        # it requires ~chunk_size× more autograd memory (one weight set per token in the
+        # computation graph, held for backward across all layers); the default per-chunk
+        # approximation subsamples the per-token states at chunk boundaries. the chunk-wise
+        # path has one weight state per store chunk, so per-token retrieve cannot exist there —
+        # refuse loudly rather than fall back (the silent fallback was the 2026-09-02 confound).
+        if per_token_retrieve:
+            if not per_token_updates:
+                raise ValueError(
+                    'per_token_retrieve=True requires per_token_updates=True: per-token weight states '
+                    'exist only on the per-token store path (the chunk-wise path keeps one state per store chunk)'
+                )
             self.retrieve_chunk_size = 1
 
         # batch size
@@ -791,10 +825,11 @@ class NeuralMemory(Module):
 
         self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
 
-        # per-token gradient function for Omega Rule (Atlas Section 3.3)
-        # computes one gradient per token within each chunk, all w.r.t. same chunk-start weights
+        # per-token gradient function for the per-token store path (Atlas Section 3.3)
+        # computes one gradient per token within each vmap chunk, all w.r.t. the same segment-start
+        # weights (repeated per chunk; the chunk-wise path uses the same base point)
 
-        if omega_context > 1:
+        if per_token_updates:
             def single_token_forward_and_loss(params, single_input, single_lr, single_target):
                 pred = functional_call(self.memory_model, params, single_input.unsqueeze(0))
                 loss = self.store_memory_loss_fn(pred, single_target.unsqueeze(0))
@@ -1075,12 +1110,13 @@ class NeuralMemory(Module):
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
-        use_omega = self.omega_context > 1
+        per_token = self.per_token_updates       # store path (gradients, gates, eta placement, scan)
+        use_omega = self.omega_context > 1       # the window, applied on the per-token path only
 
         # derive per-chunk or per-token representations for momentum/decay/lr params
-        # omega rule requires per-token granularity (Section 5.1, Eqs (34)-(39))
+        # the per-token path (and so the omega rule) requires per-token granularity (Section 5.1, Eqs (34)-(39))
 
-        if use_omega:
+        if per_token:
             chunked_seq = seq  # per-token: no pooling
         else:
             chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
@@ -1164,9 +1200,10 @@ class NeuralMemory(Module):
                 prev_weights = prev_weights.apply(lambda t: t[:, :num_chunks])
 
             if exists(self.to_learned_weight_residual_mix):
-                # weight residual operates at chunk granularity (prev_weights is per-chunk)
-                chunked_seq_for_mix = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size) if use_omega else chunked_seq
-                mix = self.to_learned_weight_residual_mix(chunked_seq_for_mix)
+                # weight residual operates at chunk granularity (prev_weights is per-chunk);
+                # only reachable on the chunk-wise path, where chunked_seq is already pooled
+                # (the per-token path asserts accept_weight_residual off)
+                mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 
@@ -1184,25 +1221,28 @@ class NeuralMemory(Module):
             values = values[..., 1:, :]
 
         # The adaptive learning rate η is applied per TARGET position, outside the momentum
-        # scan and (when Muon is on) outside Newton-Schulz, for ALL omega paths. Paper basis:
+        # scan and (when Muon is on) outside Newton-Schulz, for the whole per-token path (any omega_context). Paper basis:
         # the chunked form (Section 3.3) has η_n multiplying the windowed gradient G_t
         # outside the inner window sum, and the Muon form (Section 5, Eq (32)) is
         # M_t = α M_{t-1} − η_t·NS-5(S_t) with the raw windowed gradient inside S_t. NS-5
         # normalizes its input by norm and is scale-invariant, so folding η into the
         # surprise (as the grad loss weight) would cancel it there. η-outside must also be
-        # uniform across omega paths for the no-muon ablation to stay single-variable:
+        # uniform across the per-token path for the no-muon and no-omega ablations to stay single-variable:
         # before the window fix the two placements were equivalent (no cross-token mixing,
         # so source-token η ≡ target-position η); after it they diverge, and keeping η as
         # the loss weight when Muon is off would have made the ablation change Muon AND η
         # placement at once. We feed the grad fn the store mask only (raw, masked gradient)
         # and apply η per output token after the momentum (and NS-5 when enabled).
         #
-        # NOTE: a non-omega + Muon config would still wash η out (η stays the loss weight on
-        # the per-chunk path), but no shipped config hits it (Muon always travels with omega
-        # here) and a per-chunk η has no clean paper form, so we do not apply η-outside
-        # there. Only test_muon_custom_steps exercises that combination, for NS-step plumbing.
+        # NOTE: on the chunk-wise path η stays the per-token loss weight inside the summed chunk
+        # gradient, so with Muon its overall magnitude is normalized away on the MATRIX
+        # parameters (NS-5 skips vectors, which keep it, and the per-token relative weights
+        # inside a chunk survive in any case — measured 2026-09-02). No shipped config runs
+        # Muon on that path: the no-omega ablation runs the per-token path at omega_context=1.
+        # A per-chunk η has no clean paper form, so η-outside is not applied there. Only
+        # test_muon_custom_steps exercises the combination, for NS-step plumbing.
 
-        apply_eta_outside = use_omega
+        apply_eta_outside = per_token
         eta_for_update = None
 
         if apply_eta_outside:
@@ -1211,9 +1251,11 @@ class NeuralMemory(Module):
 
         # get grads and extra auxiliary loss
 
-        if use_omega:
-            # omega rule: per-token gradients within each vmap chunk, all w.r.t. the same
-            # segment-start weights, then the gamma-weighted sliding window (Sections 3.2-3.3)
+        if per_token:
+            # per-token path: per-token gradients within each vmap chunk, all w.r.t. the same
+            # segment-start weights, then — when omega_context > 1 — the gamma-weighted
+            # sliding window (Sections 3.2-3.3). at omega_context = 1 the window is the identity
+            # and there are no context gates: Titans' per-token rule on Atlas's machinery.
 
             grads, unweighted_mem_model_loss = self.per_token_grad_fn(dict(weights_for_surprise), keys, store_mask_weight if apply_eta_outside else adaptive_lr, values)
 
@@ -1228,12 +1270,13 @@ class NeuralMemory(Module):
             # per-position (Eqs (34)-(39))
             grads = rearrange_dict_values(grads, '(b n) c ... -> b (n c) ...', b = batch * heads)
 
-            # gamma gates: c learned weights per position, input-dependent
-            omega_c = self.omega_context
-            context_gates = self.to_context_gates(seq).sigmoid()  # (bh, num_tokens, c)
+            if use_omega:
+                # gamma gates: c learned weights per position, input-dependent
+                omega_c = self.omega_context
+                context_gates = self.to_context_gates(seq).sigmoid()  # (bh, num_tokens, c)
 
-            # apply the gamma-weighted sliding window (Section 3.2, Eq 9)
-            grads = apply_omega_window(grads = grads, context_gates = context_gates, omega_context = omega_c)
+                # apply the gamma-weighted sliding window (Section 3.2, Eq 9)
+                grads = apply_omega_window(grads = grads, context_gates = context_gates, omega_context = omega_c)
 
             # surprises
             adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
@@ -1343,7 +1386,7 @@ class NeuralMemory(Module):
             if apply_eta_outside:
                 # η per target position, outside momentum and NS-5 (Section 3.3 chunked form;
                 # Section 5, Eq (32)). with Muon on this is the only place η can take effect
-                # at all — NS-5 is scale-invariant. applied uniformly on omega paths so the
+                # at all — NS-5 is scale-invariant. applied uniformly on the per-token path so the
                 # no-muon ablation differs from atlas by exactly Newton-Schulz.
                 update = einx.multiply('bh m, bh m ... -> bh m ...', eta_for_update, update)
 
@@ -1469,7 +1512,7 @@ class NeuralMemory(Module):
         # fetch values from memory model
 
         if weights_have_expanded_shape:
-            if self.omega_context > 1:
+            if self.per_token_updates:
                 if chunk_size == 1:
                     # per-token retrieve: use full per-token weights, no subsampling.
                     # pad for remainder tokens (those not processed by store_memories due
