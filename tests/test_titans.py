@@ -397,6 +397,55 @@ def test_flex(
 
     assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
 
+
+def _sequential_scan_reference(gates, inputs, prev = None, remove_prev = True):
+    """The pre-2026-09-03 slice-based loop, kept as the value/gradient reference."""
+    state = prev if prev is not None else torch.zeros_like(inputs[:, 0])
+    outputs = [] if remove_prev else [state]
+    extra = inputs.ndim - gates.ndim
+    for i in range(inputs.shape[1]):
+        g = gates[:, i].reshape(gates[:, i].shape + (1,) * extra) if extra else gates[:, i]
+        state = g * state + inputs[:, i]
+        outputs.append(state)
+    return torch.stack(outputs, dim = 1)
+
+
+@pytest.mark.parametrize('remove_prev', (True, False))
+@pytest.mark.parametrize('with_prev', (True, False))
+def test_sequential_scan_unbind_matches_reference_and_has_no_slice_backward(remove_prev, with_prev):
+    """sequential_scan must be value- and gradient-identical to the slice loop
+    it replaces, and its backward must not contain SliceBackward: the old loop
+    sliced `inputs[:, i]` per position, and autograd materializes a full-size
+    zero tensor for every slice in backward — O(n^2) traffic that made the
+    backward 24 s at 1084 positions on H100 (profile 2026-09-03). The
+    reference copy above proves the instrument fires on the old shape."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from titans_pytorch.neural_memory import sequential_scan
+
+    torch.manual_seed(0)
+    gates = torch.rand(2, 37, dtype = torch.float64)
+    inputs = torch.randn(2, 37, 4, 5, dtype = torch.float64)
+    prev = torch.randn(2, 4, 5, dtype = torch.float64) if with_prev else None
+
+    def run(fn):
+        g, x = gates.clone().requires_grad_(), inputs.clone().requires_grad_()
+        p = prev.clone().requires_grad_() if prev is not None else None
+        out = fn(g, x, prev = p, remove_prev = remove_prev)
+        with profile(activities = [ProfilerActivity.CPU]) as prof:
+            out.pow(2).sum().backward()
+        slice_backwards = sum(e.count for e in prof.key_averages() if any(k in e.key for k in ('SliceBackward', 'slice_backward', 'SelectBackward', 'select_backward')))
+        return out.detach(), g.grad, x.grad, (p.grad if p is not None else None), slice_backwards
+
+    ref = run(_sequential_scan_reference)
+    new = run(sequential_scan)
+    assert torch.equal(ref[0], new[0]) and torch.equal(ref[1], new[1]) and torch.equal(ref[2], new[2])
+    if with_prev:
+        assert torch.equal(ref[3], new[3])
+    assert ref[4] > 0, 'instrument: the slice-based reference must show SliceBackward in its backward'
+    assert new[4] == 0, f'the unbind scan still has {new[4]} SliceBackward ops in backward'
+
+
 @pytest.mark.parametrize('use_accelerated', (True, False))
 def test_assoc_scan(
     use_accelerated

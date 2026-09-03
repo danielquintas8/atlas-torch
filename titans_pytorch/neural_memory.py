@@ -145,11 +145,19 @@ def sequential_scan(gates, inputs, prev = None, remove_prev = True):
     gate_expand = gates.ndim < inputs.ndim
     extra_dims = inputs.ndim - gates.ndim
 
-    for i in range(seq_len):
-        g = gates[:, i]
+    # unbind once instead of slicing inside the loop: `inputs[:, i]` gives every
+    # position its own SliceBackward, which materializes a FULL-size zero tensor
+    # per position in backward — O(n^2) memory traffic (measured 2026-09-03 on
+    # H100 at 1084 positions: 19.8 s of a 24 s backward). unbind's backward is a
+    # single stack, so the loop costs O(n) in both directions; the values and
+    # gradients are identical.
+    gates_t = gates.unbind(dim = 1)
+    inputs_t = inputs.unbind(dim = 1)
+
+    for g, x in zip(gates_t, inputs_t):
         if gate_expand:
             g = g.reshape(g.shape + (1,) * extra_dims)
-        state = g * state + inputs[:, i]
+        state = g * state + x
         outputs.append(state)
 
     return stack(outputs, dim = 1)
