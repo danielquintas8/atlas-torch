@@ -27,6 +27,15 @@ MODELS = {
 # ---------------------------------------------------------------------------
 # Per-size training hyperparams (Appendix E + Table 7)
 # ---------------------------------------------------------------------------
+# NOTE: peak LRs follow Atlas Table 7 for BOTH variants. The Titans paper's
+# own recipe is AdamW 4e-4 (verified against its arXiv source: "learning
+# rate of 4e-4", Experiments section) — running the titans baseline at 3e-3
+# is a deliberate same-LR-comparison choice, not the Titans paper's recipe.
+# Any headline Titans-vs-Atlas claim should either sweep LR per condition
+# or state this choice.
+# Second documented baseline-recipe deviation: the Titans paper trained on
+# FineWeb-Edu; this project uses FineWeb (per the Atlas paper, Appendix E)
+# for BOTH variants.
 
 TRAINING = {
     "170m": dict(peak_lr=3e-3,    total_tokens=15_000_000_000),
@@ -66,6 +75,17 @@ MAC_DEFAULTS = dict(
                                     # shapes eval-time semantics at long contexts. NOTE: with
                                     # detach_segment_memory the retained store graph is the LAST
                                     # segment, so larger batch_size = MORE retained memory, not less.
+    use_axial_pos_emb=False,        # absolute axial positional embedding OFF (2026-09-02). Rotary
+                                    # inside the sliding-window attention already carries within-
+                                    # window position, the neural memory is position-free, and the
+                                    # paper's MAC specifies no absolute embedding. lucidrains' axial
+                                    # embedding feeds raw integer segment indices into a SiLU MLP with
+                                    # no normalization, so every eval beyond the training length was
+                                    # out of distribution: trained at 1K (indices 0-135), the tail
+                                    # embedding norm at random init is 7.6x the trained range at 4K,
+                                    # 30x at 16K, 243x at 128K, ~1950x at 1M (and 6.7x the token
+                                    # embedding norm even in-range). Any model trained with it ON is
+                                    # incompatible with this setting.
 )
 
 # ---------------------------------------------------------------------------

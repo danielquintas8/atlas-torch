@@ -4,6 +4,13 @@ Pre-tokenize FineWeb for offline training.
 Tokenizes with T5, saves as memory-mapped binary files (uint16).
 Can run locally (downloads from HuggingFace) or on BSC (from local parquet).
 
+Tokenizer property worth knowing (same tokenizer as the Atlas paper, Appendix E):
+T5's SentencePiece model has NO byte fallback — characters outside its vocab
+(`{ } < \\`, CJK, emoji, ...) become `<unk>` (id 2) — and its normalizer deletes
+all newlines and tabs, so document structure is gone after tokenization. The
+audit counters below record the cost on the corpus actually tokenized
+(meta.json: unk_tokens / unk_rate / docs_with_unk / newlines_dropped).
+
 Usage:
     # Local (downloads from HF):
     python experiments/data/prepare.py --output /tmp/fineweb-t5
@@ -62,6 +69,35 @@ def load_tokenizer(tokenizer_dir=None):
     return tokenizer
 
 
+def write_train_val_split(shard_paths, train_tokens, train_path, val_path):
+    """Concatenate shards into train.bin / val.bin, splitting at train_tokens.
+
+    The boundary may fall anywhere, including across multiple shards: per
+    shard, the first `clamp(train_tokens - train_written, 0, len(shard))`
+    tokens go to train and the remainder to val. (The previous inline loop
+    sliced `shard[split:]` with a NEGATIVE split once the boundary had been
+    passed, silently dropping all but the last tokens of any later shard —
+    token loss whenever the val overhang spanned 2+ shards; found
+    2026-09-01.) Shards are deleted as they are consumed.
+
+    Returns (train_written, val_written).
+    """
+    train_written = 0
+    val_written = 0
+    with open(train_path, "wb") as ft, open(val_path, "wb") as fv:
+        for sp in shard_paths:
+            shard = np.fromfile(sp, dtype=np.uint16)
+            split = min(max(train_tokens - train_written, 0), len(shard))
+            if split > 0:
+                shard[:split].tofile(ft)
+                train_written += split
+            if split < len(shard):
+                shard[split:].tofile(fv)
+                val_written += len(shard) - split
+            os.remove(sp)
+    return train_written, val_written
+
+
 def main():
     p = argparse.ArgumentParser(description="Pre-tokenize FineWeb for training")
     p.add_argument("--output", required=True, help="Output directory")
@@ -92,9 +128,24 @@ def main():
     buffer = []
     shard_paths = []
 
+    # inherited-tokenizer audit counters (see module docstring). Counted over
+    # every document tokenized, including the final buffer whether or not it
+    # is flushed, so they describe the tokenizer's behaviour on the corpus.
+    unk_id = tokenizer.unk_token_id
+    n_docs = 0
+    unk_tokens = 0
+    docs_with_unk = 0
+    newlines_dropped = 0
+
     for example in tqdm(dataset, desc="Tokenizing", unit=" docs"):
         tokens = tokenizer.encode(example["text"])
         buffer.extend(tokens)
+
+        n_docs += 1
+        n_unk = tokens.count(unk_id)
+        unk_tokens += n_unk
+        docs_with_unk += n_unk > 0
+        newlines_dropped += example["text"].count("\n")
 
         while len(buffer) >= args.shard_size:
             chunk = buffer[: args.shard_size]
@@ -130,20 +181,31 @@ def main():
 
     train_path = os.path.join(args.output, "train.bin")
     val_path = os.path.join(args.output, "val.bin")
-    written = 0
 
-    with open(train_path, "wb") as ft, open(val_path, "wb") as fv:
-        for sp in shard_paths:
-            shard = np.fromfile(sp, dtype=np.uint16)
-            if written + len(shard) <= train_tokens:
-                shard.tofile(ft)
-            else:
-                split = train_tokens - written
-                if split > 0:
-                    shard[:split].tofile(ft)
-                shard[split:].tofile(fv)
-            written += len(shard)
-            os.remove(sp)
+    train_written, val_written = write_train_val_split(
+        shard_paths=shard_paths,
+        train_tokens=train_tokens,
+        train_path=train_path,
+        val_path=val_path,
+    )
+
+    # every token lands in exactly one of the two files (uint16 = 2 bytes)
+    assert train_written == train_tokens, (
+        f"train split short: wrote {train_written:,}, wanted {train_tokens:,}"
+    )
+    assert os.path.getsize(train_path) + os.path.getsize(val_path) == total_tokens * 2, (
+        f"token loss in split: train.bin {os.path.getsize(train_path)}B + "
+        f"val.bin {os.path.getsize(val_path)}B != {total_tokens:,} tokens * 2B"
+    )
+
+    # a 0-byte val.bin would crash np.memmap at train startup; remove it and
+    # let train.py print "validation disabled" instead
+    if val_written == 0:
+        os.remove(val_path)
+        print("val split empty — removed val.bin (validation will be disabled)")
+
+    tokens_seen = total_tokens + (len(buffer) if args.max_tokens and total_tokens >= args.max_tokens else 0)
+    unk_rate = unk_tokens / max(1, tokens_seen)
 
     meta = dict(
         vocab_size=tokenizer.vocab_size,
@@ -151,15 +213,28 @@ def main():
         train_tokens=train_tokens,
         val_tokens=val_tokens,
         dtype="uint16",
+        # tokenizer audit (T5: no byte fallback, newlines/tabs deleted)
+        docs=n_docs,
+        unk_tokens=unk_tokens,
+        unk_rate=unk_rate,
+        docs_with_unk=docs_with_unk,
+        newlines_dropped=newlines_dropped,
     )
     with open(os.path.join(args.output, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
     print(f"\nDone → {args.output}/")
     print(f"  train.bin  {os.path.getsize(train_path) / 1e9:.2f} GB")
-    print(f"  val.bin    {os.path.getsize(val_path) / 1e6:.1f} MB")
+    if os.path.exists(val_path):
+        print(f"  val.bin    {os.path.getsize(val_path) / 1e6:.1f} MB")
     print(f"  tokenizer/")
     print(f"  meta.json")
+    print(
+        f"\nTokenizer audit (T5, no byte fallback): {n_docs:,} docs, "
+        f"{unk_tokens:,} <unk> tokens ({unk_rate * 100:.3f}%), "
+        f"{docs_with_unk:,} docs with <unk>, "
+        f"{newlines_dropped:,} newlines in source text deleted by the normalizer"
+    )
 
 
 if __name__ == "__main__":

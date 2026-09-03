@@ -15,7 +15,8 @@
 # committing to a 5-day Atlas 8B retrain.
 #
 # Goals (per phase2-retrain-plan.md follow-up):
-#   1. Training memory fits H100 with the asymmetric MLP path (poly_project_back=False)
+#   1. Training memory fits H100 with the shipped config (poly_project_back=True,
+#      full store-graph backprop now that detach_segment_memory is off)
 #   2. val_loss drops smoothly in first ~50 steps
 #   3. Newton-Schulz fires on matrix surprises (regression-tested in test_atlas_muon_*;
 #      this run also prints peak GPU memory at the end)
@@ -25,7 +26,9 @@
 #   VARIANT=atlas-mac sbatch experiments/slurm/smoke.sh
 #   VARIANT=titans-mac sbatch experiments/slurm/smoke.sh   # baseline reference
 #
-# Default: 200 steps × 0.5M tokens/step = 100M tokens, ~30 min wall on 1x H100.
+# Default: 200 steps × 1,024 tokens/step (--grad-accum 1, batch 1) ≈ 0.2M tokens,
+# well under 30 min wall on 1x H100. (An earlier header claimed 0.5M tokens/step
+# = 100M total — wrong under --grad-accum 1; see the note at the bottom.)
 # Single GPU for cleaner memory accounting (4-GPU DDP changes the per-rank budget).
 
 ml singularity/4.1.5
@@ -47,7 +50,7 @@ export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 # Defaults — overridable via env
 MODEL=${MODEL:-170m}
 VARIANT=${VARIANT:-atlas-mac}
-MAX_STEPS=${MAX_STEPS:-200}    # 200 * 0.5M tok/step = 100M tokens
+MAX_STEPS=${MAX_STEPS:-200}    # 200 * 1024 tok/step (grad-accum 1) ~= 0.2M tokens
 SEQ_LEN=${SEQ_LEN:-1024}
 
 # Optional ablation: no-muon, no-poly, no-omega (passes through to train.py).

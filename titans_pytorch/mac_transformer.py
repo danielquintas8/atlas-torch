@@ -495,6 +495,7 @@ class MemoryAsContextTransformer(Module):
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
         token_emb: Module | None = None,
+        use_axial_pos_emb = True,  # lucidrains default kept for library users; the experiment config turns it off (see experiments/configs.py)
     ):
         super().__init__()
 
@@ -503,9 +504,18 @@ class MemoryAsContextTransformer(Module):
 
         self.token_emb = token_emb
 
-        # absolute positions
+        # absolute positions — optional. the continuous axial embedding feeds raw
+        # integer segment indices (arange(ceil(seq_len / neural_mem_segment_len)))
+        # into a SiLU MLP with no normalization, so at any sequence length beyond
+        # the training length the outer-axis inputs are out of distribution and
+        # the embedding norm grows roughly linearly with position (measured at
+        # random init, 3 seeds: 7.6x the trained range at 4K for a 1K-trained
+        # model, 30x at 16K, 243x at 128K, ~1950x at 1M; 2026-09-02). rotary
+        # inside the windowed attention already carries within-window position
+        # and the neural memory is position-free, so the experiment config
+        # disables it.
 
-        self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
+        self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2) if use_axial_pos_emb else None
 
         # long term mem tokens
 
@@ -657,9 +667,9 @@ class MemoryAsContextTransformer(Module):
         cache = None
         factorized_pos_emb = None
 
-        # precompute factorized pos emb
+        # precompute factorized pos emb (only when the absolute embedding is enabled)
 
-        if use_cache:
+        if use_cache and exists(self.axial_pos_emb):
             seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
 
             axial_dims = self.axial_pos_emb.maybe_derive_outer_dim(seq_len_with_mem, (self.neural_memory_segment_len,))
@@ -735,12 +745,14 @@ class MemoryAsContextTransformer(Module):
 
         x = x[:, :seq_len_with_mem]
 
-        # apply axial positional embedding
+        # maybe apply axial positional embedding
         # so intra and inter segment can be more easily discerned by the network
+        # (disabled in the experiment config — see the constructor note)
 
-        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
+        if exists(self.axial_pos_emb):
+            pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
 
-        x = x + pos_emb
+            x = x + pos_emb
 
         # prep flex attention
 
