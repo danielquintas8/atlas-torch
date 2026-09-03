@@ -33,6 +33,7 @@ from eval.babilong.evaluate import (
     _candidate_rows_log_softmax,
     encode_prompt_and_candidates,
     estimate_peak_memory_state_bytes,
+    check_model_config_drift,
     estimate_retrieve_state_bytes,
     evaluate_task,
     memory_ceiling_for_tokens,
@@ -605,6 +606,28 @@ def test_attention_path_estimate_accepts_custom_token_emb():
     model.token_emb = torch.nn.Sequential(torch.nn.Embedding(256, 32), torch.nn.Identity())
     assert not hasattr(model.token_emb, "weight")
     assert estimate_peak_memory_state_bytes(model = model, num_tokens = 512) == reference
+
+
+def test_memory_kwarg_checkpoint_round_trips_through_the_drift_guard(tmp_path):
+    """A checkpoint trained with --memory-kwarg records the override in
+    model_config.json; the eval side must be able to build the same config
+    (its own --memory-kwarg) or every such checkpoint is unevaluable
+    (review 2026-09-02). Instrument: without the override the guard refuses."""
+    import json
+    from experiments.configs import get_config
+    from experiments.train import apply_memory_kwargs
+
+    overrides = dict(use_sequential_scan = False, omega_context = 4)
+    trained = apply_memory_kwargs(config = get_config(model_size = "170m", variant = "atlas-mac"), overrides = overrides)
+    with open(tmp_path / "model_config.json", "w") as f:
+        json.dump(trained["model"], f, indent = 2, sort_keys = True, default = str)
+
+    evaluated = apply_memory_kwargs(config = get_config(model_size = "170m", variant = "atlas-mac"), overrides = overrides)
+    check_model_config_drift(checkpoint_dir = str(tmp_path), model_config = evaluated["model"])
+
+    plain = get_config(model_size = "170m", variant = "atlas-mac")
+    with pytest.raises(ValueError, match = "drift"):
+        check_model_config_drift(checkpoint_dir = str(tmp_path), model_config = plain["model"])
 
 
 def test_actual_length_ceiling_fires_when_nominal_label_passes():

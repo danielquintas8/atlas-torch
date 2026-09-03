@@ -94,6 +94,8 @@ MAC_DEFAULTS = dict(
 
 _ATLAS_DEFAULTS = NeuralMemory.atlas_config()
 
+NEURAL_MEMORY_STORE_CHUNK = 8   # tokens per store chunk (vmap tile); see get_config
+
 MEMORY_CONFIGS = {
     # lucidrains' chunk-wise Titans memory: one gradient per store chunk (per-token losses
     # summed, at the same segment-start weights the per-token path uses), chunk-pooled
@@ -219,8 +221,11 @@ def get_config(
     # Derived params
     depth = model_arch["depth"]
     dim_head = model_arch["dim"] // model_arch["heads"]
-    omega_context = memory_kwargs.get("omega_context", 1)
-    neural_memory_segment_len = max(8, omega_context)
+    # store chunk (vmap tile / per-token-retrieve remainder granularity). It no
+    # longer needs to cover omega_context: the window lives on the segment axis
+    # (neural_memory_batch_size) since the 2026-09-01 window fix, so an
+    # omega_context sweep keeps this fixed and changes one knob only.
+    neural_memory_segment_len = NEURAL_MEMORY_STORE_CHUNK
 
     memory_kwargs["dim_head"] = dim_head
     memory_kwargs["heads"] = model_arch["heads"]  # Table 7: same heads for attention and memory
