@@ -13,6 +13,12 @@
 # Usage:
 #   MODEL=170m VARIANT=atlas-mac sbatch experiments/slurm/train.sh
 #
+# More nodes (data parallel, 4 GPUs per node; the 500K-token batch is split
+# across all ranks, so steps get faster and GPU-hours stay the same). The node
+# count is an sbatch flag, not an env var, and a chain must keep it (train.py
+# refuses a resume with a different world size):
+#   MODEL=170m VARIANT=atlas-mac sbatch --nodes=4 experiments/slurm/train.sh
+#
 # Resume from checkpoint:
 #   MODEL=170m VARIANT=atlas-mac RESUME=runs/170m-atlas-mac/step-1000 sbatch experiments/slurm/train.sh
 #
@@ -57,9 +63,13 @@ export OMP_NUM_THREADS=20
 export CC=gcc
 export CXX=g++
 
-# Multi-GPU (single node)
-export MASTER_ADDR=localhost
+# Multi-GPU: one accelerate launcher per node (srun below), 4 processes each,
+# rendezvous on the first node of the allocation
+export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
 export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
+NUM_MACHINES=${SLURM_NNODES:-1}
+NUM_PROCESSES=$((4 * NUM_MACHINES))
+export NCCL_DEBUG=WARN
 
 # Defaults
 MODEL=${MODEL:-170m}
@@ -120,7 +130,10 @@ scontrol update jobid=${SLURM_JOB_ID} name=${RUN_NAME} 2>/dev/null || true
 cd ${PROJECT_ROOT}
 mkdir -p runs
 
-singularity exec --nv \
+# srun starts one task per node; each task's SLURM_NODEID is its machine rank
+# (escaped so the task shell expands it, not this one)
+srun --ntasks=${NUM_MACHINES} --ntasks-per-node=1 --cpus-per-task=${SLURM_CPUS_PER_TASK:-80} \
+    singularity exec --nv \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
     --bind ${DATA_DIR}:${DATA_DIR} \
     ${CONTAINER} \
@@ -129,9 +142,10 @@ singularity exec --nv \
         WANDB_MODE=offline \
         accelerate launch \
             --mixed_precision bf16 \
-            --num_machines 1 \
-            --num_processes 4 \
-            --main_process_ip localhost \
+            --num_machines ${NUM_MACHINES} \
+            --num_processes ${NUM_PROCESSES} \
+            --machine_rank \${SLURM_NODEID} \
+            --main_process_ip ${MASTER_ADDR} \
             --main_process_port ${MASTER_PORT} \
             experiments/train.py \
                 --model ${MODEL} \
