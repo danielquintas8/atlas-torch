@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from titans_pytorch import MemoryAsContextTransformer
 from experiments.configs import get_config
+from experiments.monitor import format_train_line, format_val_line
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +583,13 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=None, help="Override gradient accumulation steps")
     p.add_argument("--peak-lr", type=float, default=None, help="Override peak learning rate")
     p.add_argument(
+        "--total-tokens",
+        type=float,
+        default=None,
+        help="Override the schedule's token budget (the cosine spans it; e.g. 2e9). "
+        "Default is the config's paper budget; --max-steps only stops the run.",
+    )
+    p.add_argument(
         "--warmup-steps",
         type=int,
         default=None,
@@ -633,6 +641,13 @@ def main():
         train_cfg["seq_len"] = args.seq_len
     if args.peak_lr:
         train_cfg["peak_lr"] = args.peak_lr
+    if args.total_tokens:
+        # schedule SHAPE: the cosine spans this many tokens (default: the
+        # config's paper budget, 15B at 170M). A 2B run under the 15B cosine
+        # stops at 96% of peak LR; setting the budget here completes the
+        # decay inside the run. Recorded in meta.pt as schedule_steps and
+        # validated on resume like every other schedule field.
+        train_cfg["total_tokens"] = int(args.total_tokens)
     seq_len = train_cfg["seq_len"]
 
     run_name = args.run_name or (
@@ -898,6 +913,8 @@ def main():
     yields_this_epoch = skip_chunks // (args.per_device_batch_size * num_gpus)
     running_loss = torch.zeros((), device=accelerator.device)
     loss_count = 0
+    grad_norm_max = None       # largest pre-clip total norm over the log interval (0-d tensor; read on the host only when logging)
+    interval_t0, interval_tokens0 = time.time(), 0
     t0 = time.time()
 
     while global_step < max_steps:
@@ -919,9 +936,15 @@ def main():
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    model.parameters(), train_cfg["grad_clip"]
-                )
+                # the pre-clip total norm is the earliest divergence signal (a
+                # spike precedes the loss blowing up). Kept on device as a running
+                # max over the log interval — a single last-step value misses 9 of
+                # 10 spikes at log_every=10, and float() here would add a host sync
+                # per optimizer step. DeepSpeed's wrapper may return None.
+                norm = accelerator.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
+                if norm is not None:
+                    norm = torch.as_tensor(norm, device=accelerator.device).detach()
+                    grad_norm_max = norm if grad_norm_max is None else torch.maximum(grad_norm_max, norm)
 
             optimizer.step()
             optimizer.zero_grad()
@@ -945,19 +968,28 @@ def main():
 
         # Log
         if global_step % args.log_every == 0:
-            avg_loss = (running_loss / loss_count).item()
+            # mean over ALL ranks (every rank saw loss_count micro-batches this
+            # interval): the logged loss is the global batch loss, not rank 0's
+            # quarter of it. One small collective per log interval.
+            avg_loss = (accelerator.reduce(running_loss, reduction="mean") / loss_count).item()
             running_loss.zero_()
             loss_count = 0
 
-            elapsed = time.time() - t0
-            tok_per_sec = tokens_this_run / elapsed if elapsed > 0 else 0
+            now = time.time()
+            # interval rate (since the previous log line), not the cumulative
+            # average: a slowdown 24 h into a job must show within one interval
+            tok_per_sec = (tokens_this_run - interval_tokens0) / max(now - interval_t0, 1e-9)
+            tok_per_sec_avg = tokens_this_run / max(now - t0, 1e-9)
+            interval_t0, interval_tokens0 = now, tokens_this_run
             lr = scheduler.get_last_lr()[0]
+            gnorm_max = float(grad_norm_max) if grad_norm_max is not None else float("nan")
+            grad_norm_max = None
 
-            accelerator.print(
-                f"step {global_step:>7d} | loss {avg_loss:.4f} | "
-                f"ppl {math.exp(min(avg_loss, 20)):.1f} | lr {lr:.2e} | "
-                f"{tok_per_sec / 1e3:.1f}k tok/s | {tokens_total / 1e9:.3f}B"
-            )
+            # accelerator.print prints once PER NODE ("once per server"); the monitor
+            # parses these lines, so they must appear exactly once per step
+            if accelerator.is_main_process:
+                print(format_train_line(step=global_step, loss=avg_loss, lr=lr, tok_per_sec=tok_per_sec,
+                                        tokens_total=tokens_total, grad_norm_max=gnorm_max))
 
             if args.wandb:
                 accelerator.log(
@@ -966,7 +998,9 @@ def main():
                         "train/perplexity": math.exp(min(avg_loss, 20)),
                         "train/lr": lr,
                         "train/tokens_per_sec": tok_per_sec,
+                        "train/tokens_per_sec_avg": tok_per_sec_avg,
                         "train/tokens_seen": tokens_total,
+                        "train/grad_norm_max": gnorm_max,
                     },
                     step=global_step,
                 )
@@ -1012,11 +1046,8 @@ def main():
 
             avg_val = sum(val_losses) / max(1, len(val_losses))
             avg_near_certain = sum(near_certain_fracs) / max(1, len(near_certain_fracs))
-            accelerator.print(
-                f"step {global_step:>7d} | val_loss {avg_val:.4f} | "
-                f"val_ppl {math.exp(min(avg_val, 20)):.1f} | "
-                f"val_frac_near_certain {avg_near_certain:.4f}"
-            )
+            if accelerator.is_main_process:
+                print(format_val_line(step=global_step, val_loss=avg_val, frac_near_certain=avg_near_certain))
 
             if args.wandb:
                 accelerator.log(
