@@ -397,6 +397,70 @@ def test_flex(
 
     assert torch.allclose(out_flex, out_non_flex, atol = 1e-5)
 
+
+def _sequential_scan_reference(gates, inputs, prev = None, remove_prev = True):
+    """The pre-2026-09-03 slice-based loop (including its empty-sequence early
+    return), kept as the value/gradient reference."""
+    if inputs.shape[1] == 0:
+        return prev.unsqueeze(1) if (not remove_prev and prev is not None) else inputs[:, :0]
+    state = prev if prev is not None else torch.zeros_like(inputs[:, 0])
+    outputs = [] if remove_prev else [state]
+    extra = inputs.ndim - gates.ndim
+    for i in range(inputs.shape[1]):
+        g = gates[:, i].reshape(gates[:, i].shape + (1,) * extra) if extra else gates[:, i]
+        state = g * state + inputs[:, i]
+        outputs.append(state)
+    return torch.stack(outputs, dim = 1)
+
+
+@pytest.mark.parametrize('gate_shape', ('fewer dims', 'same ndim'))
+@pytest.mark.parametrize('remove_prev', (True, False))
+@pytest.mark.parametrize('with_prev', (True, False))
+def test_sequential_scan_unbind_matches_reference_and_has_no_slice_backward(remove_prev, with_prev, gate_shape):
+    """sequential_scan must be value- and gradient-identical to the slice loop
+    it replaces, and its backward must not contain Select/SliceBackward: the
+    old loop sliced `inputs[:, i]` per position, and autograd materializes a
+    full-size zero tensor for every slice in backward — O(n^2) traffic that
+    made the backward 24 s at 1084 positions on H100 (profile 2026-09-03). The
+    reference copy above proves the instrument fires on the old shape."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from titans_pytorch.neural_memory import sequential_scan
+
+    torch.manual_seed(0)
+    inputs = torch.randn(2, 37, 4, 5, dtype = torch.float64)
+    # the shipped forward hits both shapes: (bh, n) gates against matrix params, and
+    # (bh, n, 1) gates against vector params (same ndim, broadcast on the last dim)
+    gates = torch.rand(2, 37, dtype = torch.float64) if gate_shape == 'fewer dims' else torch.rand(2, 37, 1, 1, dtype = torch.float64)
+    prev = torch.randn(2, 4, 5, dtype = torch.float64) if with_prev else None
+
+    def run(fn):
+        g, x = gates.clone().requires_grad_(), inputs.clone().requires_grad_()
+        p = prev.clone().requires_grad_() if prev is not None else None
+        out = fn(gates = g, inputs = x, prev = p, remove_prev = remove_prev)
+        with profile(activities = [ProfilerActivity.CPU]) as prof:
+            out.pow(2).sum().backward()
+        # only the *_backward nodes count: the unbind path legitimately still has
+        # forward aten::select ops (from StackBackward), which must not match
+        slice_backwards = sum(e.count for e in prof.key_averages() if any(k in e.key for k in ('SliceBackward', 'slice_backward', 'SelectBackward', 'select_backward')))
+        return dict(out = out.detach(), gates = g.grad, inputs = x.grad, prev = (p.grad if p is not None else None), slice_backwards = slice_backwards)
+
+    ref = run(_sequential_scan_reference)
+    new = run(sequential_scan)
+    for key in ('out', 'gates', 'inputs') + (('prev',) if with_prev else ()):
+        assert torch.equal(ref[key], new[key]), f'{key} differs from the slice-loop reference'
+    assert ref['slice_backwards'] > 0, 'instrument: the slice-based reference must show Select/SliceBackward in its backward'
+    assert new['slice_backwards'] == 0, f"the unbind scan still has {new['slice_backwards']} Select/SliceBackward ops in backward"
+
+    # empty sequence: both early returns agree
+    empty = inputs[:, :0]
+    assert torch.equal(sequential_scan(gates = gates[:, :0], inputs = empty, prev = prev, remove_prev = remove_prev),
+                       _sequential_scan_reference(gates = gates[:, :0], inputs = empty, prev = prev, remove_prev = remove_prev))
+    # a gates/inputs length mismatch is refused, not silently truncated
+    with pytest.raises(AssertionError, match = 'positions'):
+        sequential_scan(gates = gates[:, :-1], inputs = inputs)
+
+
 @pytest.mark.parametrize('use_accelerated', (True, False))
 def test_assoc_scan(
     use_accelerated
